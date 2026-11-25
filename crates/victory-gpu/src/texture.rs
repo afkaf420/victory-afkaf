@@ -238,7 +238,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     if !first && before.is_none() {
         return true;
     }
-    card_writes(list, placed, to, None);
+    card_writes(list, placed, to, None, true);
     crate::list::ensure_state(list, placed, COPY_DEST);
     let part = |texture: &ID3D12Resource, index: usize| D3D12_TEXTURE_COPY_LOCATION {
         // SAFETY: a borrowed pointer the location never releases.
@@ -747,7 +747,33 @@ impl Drop for Claimed {
 /// shortcut: two lists that write the same new level, submitted in the
 /// other order than recorded, lose the first one's write under the zeros
 /// of the other; so does an upload recorded and not yet submitted.
-pub(crate) fn card_writes(list: &HostList, resource: This, texture: &ID3D12Resource, level: Option<u32>) {
+/// Computes the bitmask of newly-claimed tiled mip levels that still need an
+/// upfront zero-fill copy before the card's own write:
+/// - When `full_overwrite` is false (partial box or non-zero destination offset),
+///   every freshly claimed level in `fresh` must be zeroed first.
+/// - When `full_overwrite` is true and `level` is `None` (whole-resource copy),
+///   no level needs zeroing because the caller overwrites all levels immediately.
+/// - When `full_overwrite` is true and `level` is `Some(lvl)`, `lvl` itself is
+///   overwritten whole immediately and skips zeroing; only sibling packed mips
+///   sharing the same 64 KiB packed tile (`fresh & !(1 << lvl)`) are zeroed.
+pub(crate) fn card_writes_zero_mask(fresh: u32, level: Option<u32>, full_overwrite: bool) -> u32 {
+    if !full_overwrite {
+        return fresh;
+    }
+    match level {
+        None => 0,
+        Some(lvl) if lvl < 32 => fresh & !(1u32 << lvl),
+        Some(_) => fresh,
+    }
+}
+
+pub(crate) fn card_writes(
+    list: &HostList,
+    resource: This,
+    texture: &ID3D12Resource,
+    level: Option<u32>,
+    full_overwrite: bool,
+) {
     let Some(on_demand) = crate::resource::host_tiled(resource) else {
         return;
     };
@@ -762,16 +788,17 @@ pub(crate) fn card_writes(list: &HostList, resource: This, texture: &ID3D12Resou
         return;
     }
     let fresh = tiled.claim(levels);
+    let to_zero = card_writes_zero_mask(fresh, level, full_overwrite);
     // Of them, the ones whose zeros could not be recorded.
-    let mut unzeroed = if host().is_none() { fresh } else { 0 };
-    if fresh != 0
+    let mut unzeroed = if host().is_none() { to_zero } else { 0 };
+    if to_zero != 0
         && let Some(host) = host()
     {
         const COPY_DEST: u32 = 0x400;
         crate::list::ensure_state(list, resource, COPY_DEST);
         // SAFETY: a live resource.
         let d = unsafe { texture.GetDesc() };
-        for level in (0..u32::from(d.MipLevels).min(32)).filter(|&level| fresh & (1u32 << level) != 0) {
+        for level in (0..u32::from(d.MipLevels).min(32)).filter(|&level| to_zero & (1u32 << level) != 0) {
             let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
             let mut bytes = 0u64;
             // SAFETY: outputs for one subresource.

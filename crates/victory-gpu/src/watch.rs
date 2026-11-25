@@ -25,6 +25,45 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Monotonic epoch incremented whenever any guarded `MEM_MAPPED` block leaves
+/// the clean state (write fault, alias open, `writing`, `views_mapped`,
+/// `title_memory_remapped`, `wrote`, or `guard` reporting newly dirty blocks).
+/// Enables O(1) clean steady-state skipping in `sparse_uma`.
+static GUARD_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+/// Current monotonic guard epoch (`Acquire` pairs with `Release` bumps).
+pub(crate) fn guard_epoch() -> u64 {
+    GUARD_EPOCH.load(Ordering::Acquire)
+}
+
+#[inline]
+fn bump_guard_epoch() {
+    GUARD_EPOCH.fetch_add(1, Ordering::Release);
+}
+
+#[cfg(test)]
+thread_local! {
+    static THREAD_MIXED_VQS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn mixed_virtual_queries() -> u64 {
+    THREAD_MIXED_VQS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_mixed_virtual_queries() {
+    THREAD_MIXED_VQS.with(|c| c.set(0));
+}
+
+/// Whether `VICTORY_GUARD_ASK=1` forces Windows `VirtualQuery` checks on
+/// every guarded range query instead of trusting `GUARDS`.
+fn guard_ask() -> bool {
+    static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1"))
+}
 
 /// The unit tracked and copied: 64 KiB, the console's page (the kernel's
 /// 4 KiB pages fold into it). Finer units made the checks of the world's
@@ -230,6 +269,7 @@ pub(crate) fn wrote(at: usize, len: usize) {
     for page in at / PAGE..at.saturating_add(len).div_ceil(PAGE) {
         j.written.insert(page, now);
     }
+    bump_guard_epoch();
 }
 
 /// One kernel asking for `pieces` (page ranges in order); by halves if it
@@ -356,14 +396,149 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     }
     j.asked += 1;
     let now = j.asked;
+    let any_guarded = !guarded.is_empty();
     let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
     for page in pages.collect::<Vec<_>>() {
         j.written.insert(page, now);
+    }
+    if any_guarded {
+        bump_guard_epoch();
     }
     Some((
         now,
         j.written
             .range(first..last)
+            .map(|(&p, &w)| (p, w))
+            .collect(),
+    ))
+}
+
+/// Fast-path variant of [`writes`] for spans already known to be committed
+/// `MEM_MAPPED` views (`sparse_uma::RegionKind::MappedView`):
+/// - Skips the guaranteed-failing `GetWriteWatch` syscall and `writes_mixed`'s
+///   per-view `VirtualQuery` walk, calling [`guard`] directly.
+/// - Shares `JOURNAL` with [`writes`] (`Shadow` / `texture`) and returns only
+///   journal entries with `asking > min_seq`, avoiding copying thousands of
+///   unchanged historical entries on clean or sparsely dirty spans.
+/// - Returns `None` if `guard` rejects the range (signaling the caller to
+///   re-classify).
+pub(crate) fn writes_guarded_since(
+    start: usize,
+    end: usize,
+    min_seq: u64,
+) -> Option<(u64, Vec<(usize, u64)>)> {
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    if first >= last {
+        return Some((min_seq, Vec::new()));
+    }
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let j = &mut *j;
+    if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+        let now = j.ahead_asked;
+        if now <= min_seq {
+            return Some((now, Vec::new()));
+        }
+        return Some((
+            now,
+            j.written
+                .range(first..last)
+                .filter(|&(_, &w)| w > min_seq)
+                .map(|(&p, &w)| (p, w))
+                .collect(),
+        ));
+    }
+    let guarded = guard(first * PAGE, last * PAGE)?;
+    if !guarded.is_empty() {
+        j.asked += 1;
+        let now = j.asked;
+        for page in guarded {
+            j.written.insert(page, now);
+        }
+        bump_guard_epoch();
+    }
+    let now = j.asked;
+    if now <= min_seq {
+        return Some((now, Vec::new()));
+    }
+    Some((
+        now,
+        j.written
+            .range(first..last)
+            .filter(|&(_, &w)| w > min_seq)
+            .map(|(&p, &w)| (p, w))
+            .collect(),
+    ))
+}
+
+/// Fast-path variant of [`writes`] for spans already known to be a single
+/// `AllocationBase` of `MEM_WRITE_WATCH` private memory
+/// (`sparse_uma::RegionKind::PrivateWriteWatch`):
+/// - Runs one `GetWriteWatch(WRITE_WATCH_FLAG_RESET)` syscall; returns `None`
+///   immediately on failure (e.g. after lazy `MEM_PRIVATE` -> `MEM_MAPPED`
+///   promotion) so the caller reclassifies without falling into `writes_mixed`.
+/// - Shares `JOURNAL` with [`writes`] (`Shadow`) and returns only journal
+///   entries with `asking > min_seq` (zero allocations when clean).
+pub(crate) fn writes_private_since(
+    start: usize,
+    end: usize,
+    min_seq: u64,
+) -> Option<(u64, Vec<(usize, u64)>)> {
+    use windows_sys::Win32::System::Memory::GetWriteWatch;
+    const WRITE_WATCH_FLAG_RESET: u32 = 1;
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    if first >= last {
+        return Some((min_seq, Vec::new()));
+    }
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let j = &mut *j;
+    if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+        let now = j.ahead_asked;
+        if now <= min_seq {
+            return Some((now, Vec::new()));
+        }
+        return Some((
+            now,
+            j.written
+                .range(first..last)
+                .filter(|&(_, &w)| w > min_seq)
+                .map(|(&p, &w)| (p, w))
+                .collect(),
+        ));
+    }
+    let mut count = (last - first) * PAGE / KERNEL_PAGE;
+    j.found.resize(count.max(j.found.len()), 0);
+    let mut granularity = 0;
+    // SAFETY: `j.found` holds `count` entries for `[first * PAGE, last * PAGE)`.
+    let failed = unsafe {
+        GetWriteWatch(
+            WRITE_WATCH_FLAG_RESET,
+            (first * PAGE) as *const _,
+            (last - first) * PAGE,
+            j.found.as_mut_ptr().cast(),
+            &mut count,
+            &mut granularity,
+        )
+    } != 0;
+    if failed {
+        return None;
+    }
+    if count > 0 {
+        j.asked += 1;
+        let now = j.asked;
+        for k in 0..count {
+            let page = j.found[k] / PAGE;
+            j.written.insert(page, now);
+        }
+    }
+    let now = j.asked;
+    if now <= min_seq {
+        return Some((now, Vec::new()));
+    }
+    Some((
+        now,
+        j.written
+            .range(first..last)
+            .filter(|&(_, &w)| w > min_seq)
             .map(|(&p, &w)| (p, w))
             .collect(),
     ))
@@ -381,15 +556,24 @@ fn writes_mixed(j: &mut Journal, start: usize, end: usize, guarded: bool) -> Opt
         GetWriteWatch, MEM_COMMIT, MEM_MAPPED, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery,
     };
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
-    // Fast path: if `guarded` and the first block is already held by `GUARDS`
-    // (a known `MEM_MAPPED`/placeholder range), check whether the whole range
-    // is a pure guarded view without splitting it.
+    // Fast path: if `guarded` and every block in `[start, end)` is already held
+    // clean in `GUARDS` (known guarded `MEM_MAPPED` views), nothing was written,
+    // mapped, or unmapped since the last check — zero `VirtualQuery` syscalls!
+    if guarded && !guard_ask() {
+        let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
+        let g = guards();
+        if first < last && g.clean.range(first..last).count() == last - first {
+            return Some(Vec::new());
+        }
+    }
     let mut at = start;
     let mut dirty = Vec::new();
     let mut any = false;
     while at < end {
         // SAFETY: plain VirtualQuery into a zeroed struct.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        #[cfg(test)]
+        THREAD_MIXED_VQS.with(|c| c.set(c.get() + 1));
         // SAFETY: valid out pointer.
         let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
         if n == 0 {
@@ -434,6 +618,8 @@ fn writes_mixed(j: &mut Journal, start: usize, end: usize, guarded: bool) -> Opt
             while guard_end < end {
                 // SAFETY: plain VirtualQuery probe.
                 let mut next_info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+                #[cfg(test)]
+                THREAD_MIXED_VQS.with(|c| c.set(c.get() + 1));
                 // SAFETY: valid out pointer.
                 let m = unsafe {
                     VirtualQuery(guard_end as *const _, &mut next_info, size_of_val(&next_info))
@@ -507,8 +693,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     // pages: 0.6 ms for the title's 174 MB heap, 16 times a frame, and most
     // of the 68 ms a frame of "guards" (run 58).
     // `VICTORY_GUARD_ASK=1` asks every time, as before.
-    static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let known = !*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1")) && {
+    let known = !guard_ask() && {
         let g = guards();
         let first = start / BLOCK;
         g.protected.contains(&first) || g.absent.contains(&first)
@@ -521,16 +706,18 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     let mut written = Vec::new();
     let mut run: Option<usize> = None;
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
+    // Fast zero-allocation clean check: when every block in `[first, last)` is
+    // still clean, return immediately without allocating a `Vec`.
+    if g.clean.range(first..last).count() == last - first {
+        // Nothing written, mapped or new since the range was last taken.
+        return Some(written);
+    }
     // The range's clean blocks, in order: read off the set in one pass,
     // not looked up one block at a time. A frame asks about some 10 GB of
     // view memory, 150,000 blocks, nearly all clean: the lookups were most
     // of the 60-90 ms a frame of "guards" (run 54). What the loop adds to
     // the set meanwhile is the block it stands at or ones before it.
     let clean: Vec<usize> = g.clean.range(first..last).copied().collect();
-    if clean.len() == last - first {
-        // Nothing written, mapped or new since the range was last taken.
-        return Some(written);
-    }
     let mut next_clean = 0;
     let mut uncommitted_until = first;
     for block in first..=last {
@@ -762,14 +949,22 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
         .range(start / BLOCK..end.div_ceil(BLOCK))
         .copied()
         .collect();
+    if blocks.is_empty() {
+        return false;
+    }
     for &block in &blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
+    }
+    // Bump epoch BEFORE making pages writable so any concurrent reader's
+    // O(1) epoch check observes the invalidation before a store can land.
+    bump_guard_epoch();
+    for &block in &blocks {
         let mut old = 0;
         // SAFETY: a block we made read-only.
         unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
     }
-    !blocks.is_empty()
+    true
 }
 
 /// Evicts `[at, at + len)` from `JOURNAL.written` and invalidates overlapping
@@ -803,6 +998,9 @@ pub fn writing(at: usize, len: usize) {
     wrote(at, len);
     // The length is the title's (`fread`'s size times count, saturated).
     open(&mut guards(), at, at.saturating_add(len));
+    if len > 0 {
+        bump_guard_epoch();
+    }
     // A placed texture there changes with no descriptor written.
     crate::descriptor::host::remapped(at, len);
 }
@@ -979,6 +1177,9 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     let aliased: Vec<usize> = g.aliased.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).copied().collect();
     for block in aliased {
         g.aliased.remove(&block);
+    }
+    if len > 0 {
+        bump_guard_epoch();
     }
 }
 
@@ -1669,6 +1870,166 @@ mod tests {
         assert!(after.is_empty(), "journal must not retain evicted pages");
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// Multiple adjacent single-page `MapViewOfFile3` `MEM_MAPPED` views (the
+    /// exact layout produced by `xmem` GPU page mappings) must take the `g.clean`
+    /// fast path in `writes_mixed()` with ZERO `VirtualQuery` syscalls on
+    /// untouched repeat submits, while `guard_epoch()` and `writes_guarded_since`
+    /// still detect CPU writes, alias writes, `writing()` (`kernel_will_write`),
+    /// and `title_memory_remapped()`.
+    #[test]
+    fn writes_mixed_clean_mapped_views_zero_vq_and_guard_epoch_coherency() {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER,
+            MEM_RESERVE_PLACEHOLDER, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+            MapViewOfFile3, FILE_MAP_WRITE, PAGE_NOACCESS, SEC_COMMIT, UnmapViewOfFile,
+            UnmapViewOfFile2, VirtualAlloc2,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+        const VIEWS: usize = 8;
+        const TOTAL: usize = VIEWS * BLOCK;
+        let proc = unsafe { GetCurrentProcess() };
+        let (base, section, alias) = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE | SEC_COMMIT,
+                0,
+                TOTAL as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let base = VirtualAlloc2(
+                proc,
+                std::ptr::null(),
+                TOTAL,
+                MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                PAGE_NOACCESS,
+                std::ptr::null_mut(),
+                0,
+            ) as usize;
+            assert_ne!(base, 0);
+            // Map 8 separate 64 KiB views back-to-back inside the placeholder.
+            for i in 0..VIEWS {
+                let va = base + i * BLOCK;
+                if i + 1 < VIEWS {
+                    assert_ne!(
+                        VirtualFree(va as *mut _, BLOCK, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER),
+                        0
+                    );
+                }
+                let v = MapViewOfFile3(
+                    section,
+                    proc,
+                    va as *const _,
+                    (i * BLOCK) as u64,
+                    BLOCK,
+                    MEM_REPLACE_PLACEHOLDER,
+                    PAGE_READWRITE,
+                    std::ptr::null_mut(),
+                    0,
+                );
+                assert_eq!(v.Value as usize, va);
+                crate::inplace::title_memory_view(va, BLOCK, section as usize, (i * BLOCK) as u64);
+            }
+            // Also map an external alias of view #3 (`offset = 3 * BLOCK`).
+            let alias = MapViewOfFile(section, FILE_MAP_WRITE, 0, (3 * BLOCK) as u32, BLOCK).Value
+                as usize;
+            assert_ne!(alias, 0);
+            crate::inplace::title_memory_view(alias, BLOCK, section as usize, (3 * BLOCK) as u64);
+            (base, section, alias)
+        };
+
+        struct MultiViewGuard {
+            base: usize,
+            alias: usize,
+            section: windows_sys::Win32::Foundation::HANDLE,
+        }
+        impl Drop for MultiViewGuard {
+            fn drop(&mut self) {
+                title_memory_remapped(self.base, TOTAL);
+                title_memory_remapped(self.alias, BLOCK);
+                unsafe {
+                    let proc = GetCurrentProcess();
+                    for i in 0..VIEWS {
+                        UnmapViewOfFile2(
+                            proc,
+                            MEMORY_MAPPED_VIEW_ADDRESS {
+                                Value: (self.base + i * BLOCK) as *mut _,
+                            },
+                            0,
+                        );
+                    }
+                    UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                        Value: self.alias as *mut _,
+                    });
+                    CloseHandle(self.section);
+                }
+            }
+        }
+        let _guard = MultiViewGuard {
+            base,
+            alias,
+            section,
+        };
+
+        // 1. Initial `writes(..., true)` guards all 8 views (and the alias of view #3).
+        let (t0, _) = writes(base, base + TOTAL, true).expect("mapped views guarded");
+
+        // 2. Untouched repeat calls to `writes(..., true)` MUST take the `g.clean`
+        //    fast path with ZERO `VirtualQuery` syscalls!
+        reset_mixed_virtual_queries();
+        for _ in 0..5 {
+            let (t, _) = writes(base, base + TOTAL, true).expect("clean fast path");
+            assert!(t > t0);
+        }
+        assert_eq!(
+            mixed_virtual_queries(),
+            0,
+            "clean guarded MEM_MAPPED views must issue 0 VirtualQueries in writes_mixed"
+        );
+
+        // 3. `writes_guarded_since` on clean span returns empty vec & 0 VQs.
+        let (seq0, initial_since) =
+            writes_guarded_since(base, base + TOTAL, t0).expect("guarded_since clean");
+        assert!(initial_since.is_empty());
+        assert_eq!(mixed_virtual_queries(), 0);
+
+        // 4. Direct CPU write to view #5 bumps `guard_epoch()` and reports ONLY page #5.
+        let ep_before_cpu = guard_epoch();
+        unsafe { ((base + 5 * BLOCK + 16) as *mut u32).write_volatile(0x1111_2222) };
+        assert_ne!(guard_epoch(), ep_before_cpu, "CPU write fault must bump GUARD_EPOCH");
+        let (seq1, after_cpu) =
+            writes_guarded_since(base, base + TOTAL, seq0).expect("after cpu write");
+        assert_eq!(after_cpu, vec![((base + 5 * BLOCK) / PAGE, seq1)]);
+
+        // 5. Write through external alias of view #3 bumps `guard_epoch()` and reports ONLY page #3.
+        let ep_before_alias = guard_epoch();
+        unsafe { ((alias + 32) as *mut u32).write_volatile(0x3333_4444) };
+        assert_ne!(guard_epoch(), ep_before_alias, "alias write fault must bump GUARD_EPOCH");
+        let (seq2, after_alias) =
+            writes_guarded_since(base, base + TOTAL, seq1).expect("after alias write");
+        assert_eq!(after_alias, vec![((base + 3 * BLOCK) / PAGE, seq2)]);
+
+        // 6. `writing()` (`kernel_will_write`) on view #1 bumps `guard_epoch()` and reports ONLY page #1.
+        let ep_before_kw = guard_epoch();
+        writing(base + BLOCK + 64, 128);
+        assert_ne!(guard_epoch(), ep_before_kw, "writing() must bump GUARD_EPOCH");
+        let (seq3, after_kw) =
+            writes_guarded_since(base, base + TOTAL, seq2).expect("after kernel_will_write");
+        assert_eq!(after_kw, vec![((base + BLOCK) / PAGE, seq3)]);
+
+        // 7. Subsequent untouched check returns empty with 0 VQs and steady epoch!
+        let ep_steady = guard_epoch();
+        let (seq4, after_clean) =
+            writes_guarded_since(base, base + TOTAL, seq3).expect("back to clean");
+        assert!(after_clean.is_empty());
+        assert_eq!(seq4, seq3);
+        assert_eq!(guard_epoch(), ep_steady);
+        assert_eq!(mixed_virtual_queries(), 0);
     }
 }
 

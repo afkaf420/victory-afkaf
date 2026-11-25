@@ -65,6 +65,16 @@ const DEFAULT_DIFF_SHADOW_MB: u64 = 512;
 /// `[8]` sync microseconds.
 pub(crate) static STATS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
 
+/// Detailed per-kind dirty-scan breakdown for `status()` observability:
+/// `[0]` write_watch_tiles (current), `[1]` mapped_view_tiles (current),
+/// `[2]` plain_guarded_tiles (current), `[3]` uncommitted_tiles (current),
+/// `[4]` fallback_tiles (cum), `[5]` virtual_queries (cum),
+/// `[6]` bytes_compared (cum), `[7]` bytes_uploaded (cum),
+/// `[8]` submits (cum), `[9]` ww_calls (cum), `[10]` mv_calls (cum),
+/// `[11]` reclass_tiles (cum), `[12]` ww_us (cum), `[13]` mv_us (cum),
+/// `[14]` pg_us (cum), `[15]` scan_us (cum).
+static SCAN_STATS: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
+
 /// Resolves `VICTORY_SPARSE_UMA`: strictly opt-in (`"1"` enables; unset or any
 /// other value leaves all legacy paths intact).
 fn resolve_sparse_uma(env: Option<&str>) -> bool {
@@ -554,6 +564,20 @@ static PLAIN_GUARDS: Mutex<PlainGuards> = Mutex::new(PlainGuards {
     dirty: BTreeSet::new(),
 });
 
+/// Monotonic epoch bumped whenever any `PLAIN_GUARDS` tile transitions out of
+/// the clean protected state (VEH write fault, release, or failed protect).
+static PLAIN_GUARD_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+#[inline]
+fn plain_guard_epoch() -> u64 {
+    PLAIN_GUARD_EPOCH.load(Ordering::Acquire)
+}
+
+#[inline]
+fn bump_plain_guard_epoch() {
+    PLAIN_GUARD_EPOCH.fetch_add(1, Ordering::Release);
+}
+
 /// Returns the read-only guard protection matching a writable base protection.
 fn guard_prot_for(restore_prot: u32) -> u32 {
     use windows_sys::Win32::System::Memory::{
@@ -594,6 +618,10 @@ fn install_plain_guard_handler() {
         let page_id = fault_va / (TILE_BYTES as usize);
         let mut g = PLAIN_GUARDS.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(restore_prot) = g.protected.remove(&page_id) {
+            g.dirty.insert(page_id);
+            // Bump epoch BEFORE restoring write access so any concurrent O(1)
+            // epoch check observes the invalidation before the faulting store lands.
+            bump_plain_guard_epoch();
             let mut old = 0u32;
             // SAFETY: restoring the exact original writable protection on a
             // 64 KiB tile that `sparse_uma` itself protected read-only.
@@ -605,7 +633,6 @@ fn install_plain_guard_handler() {
                     &mut old,
                 )
             };
-            g.dirty.insert(page_id);
             return EXCEPTION_CONTINUE_EXECUTION;
         }
         // Another thread may have faulted on this same tile just before we
@@ -659,6 +686,7 @@ fn plain_guard_protect(va: usize, restore_prot: u32) -> bool {
     } else {
         g.protected.remove(&page_id);
         g.dirty.remove(&page_id);
+        bump_plain_guard_epoch();
     }
     ok
 }
@@ -681,6 +709,10 @@ fn plain_guards_release_range(start: usize, end: usize) {
         .range(first..last)
         .map(|(&p, &prot)| (p, prot))
         .collect();
+    let dirty_clear: Vec<usize> = g.dirty.range(first..last).copied().collect();
+    if !to_restore.is_empty() || !dirty_clear.is_empty() {
+        bump_plain_guard_epoch();
+    }
     for (page_id, restore_prot) in to_restore {
         g.protected.remove(&page_id);
         let mut old = 0u32;
@@ -695,7 +727,6 @@ fn plain_guards_release_range(start: usize, end: usize) {
             )
         };
     }
-    let dirty_clear: Vec<usize> = g.dirty.range(first..last).copied().collect();
     for page_id in dirty_clear {
         g.dirty.remove(&page_id);
     }
@@ -749,10 +780,26 @@ pub(crate) struct SyncMetrics {
     pub(crate) tiles_scanned: u64,
     /// Full-span unconditional dirty fallbacks triggered (target: 0).
     pub(crate) full_fallbacks: u64,
+    /// Tiles scanned via full-span fallback (target: 0).
+    pub(crate) fallback_tiles: u64,
     /// Per-`AllocationBase` `watch::writes(..., false)` calls for `MEM_WRITE_WATCH`.
     pub(crate) write_watch_calls: u64,
     /// Coalesced `watch::writes(..., true)` calls for `MEM_MAPPED` views.
     pub(crate) mapped_view_calls: u64,
+    /// Tiles invalidated and reclassified during this pass.
+    pub(crate) reclass_tiles: u64,
+    /// Bytes copied & compared against baseline (`tiles_scanned * TILE_BYTES`).
+    pub(crate) bytes_compared: u64,
+    /// Bytes emitted in upload chunks during this pass.
+    pub(crate) bytes_uploaded: u64,
+    /// Microseconds spent in `PrivateWriteWatch` `watch::writes`.
+    pub(crate) ww_us: u64,
+    /// Microseconds spent in `MappedView` `watch::writes`.
+    pub(crate) mv_us: u64,
+    /// Microseconds spent in `PrivateGuarded` guard checks.
+    pub(crate) pg_us: u64,
+    /// Microseconds spent copying & diffing dirty tiles.
+    pub(crate) scan_us: u64,
 }
 
 struct MappedTile {
@@ -779,6 +826,20 @@ pub(crate) struct UploadChunk {
     pub(crate) data: Vec<u8>,
 }
 
+/// Pre-partitioned contiguous same-`RegionKind` span cached across steady-state
+/// submits (rebuilt ONLY on tile map/unmap or region reclassification).
+struct CachedSpan {
+    kind: RegionKind,
+    start: u64,
+    end: u64,
+    keys: Vec<(u8, u32)>,
+    /// True once every tile in `keys` has completed `sync_initial_tile`.
+    all_initialized: bool,
+    /// Latest `watch::JOURNAL` sequence confirmed synced across this span
+    /// (`u64::MAX` transiently before first sync when all tiles need init).
+    synced_seq: u64,
+}
+
 /// Self-contained 12 × 2 GiB sparse VRAM window engine. Used both by the
 /// process-wide singleton (`MANAGER`) and by standalone RTX 3090 D3D12 Debug
 /// Layer tests with their own device and queues.
@@ -794,6 +855,22 @@ pub(crate) struct SparseEngine {
     diff_shadow_cap: u64,
     /// Reusable 64 KiB copy buffer (zero heap allocations on clean submits).
     scratch: Box<[u8; TILE_BYTES as usize]>,
+    /// True if any mapped tile currently has `RegionKind::Unknown`.
+    has_unclassified: bool,
+    /// Cached contiguous same-`RegionKind` spans (zero `BTreeMap` scans on steady state).
+    cached_spans: Vec<CachedSpan>,
+    /// True if `cached_spans` / `kind_counts` need rebuilding from `self.mapped`.
+    spans_dirty: bool,
+    /// Cached per-kind tile counts: `[ww, mv, pg, unc]`.
+    kind_counts: [u64; 4],
+    /// Number of writable `PrivateGuarded` spans in `cached_spans`.
+    pg_writable_spans: usize,
+    /// True if any originally read-only `PrivateGuarded` tile still needs initial sync.
+    has_uninit_ro: bool,
+    /// Clean `watch::guard_epoch()` when all `MappedView` spans were verified clean.
+    mv_clean_epoch: Option<u64>,
+    /// Clean `plain_guard_epoch()` when all writable `PrivateGuarded` spans were verified clean.
+    pg_clean_epoch: Option<u64>,
     last_sync: SyncMetrics,
     releases: ReleaseQueue,
 }
@@ -892,6 +969,14 @@ impl SparseEngine {
             diff_shadow_bytes: 0,
             diff_shadow_cap: diff_shadow_cap_bytes(),
             scratch: Box::new([0u8; TILE_BYTES as usize]),
+            has_unclassified: false,
+            cached_spans: Vec::new(),
+            spans_dirty: false,
+            kind_counts: [0; 4],
+            pg_writable_spans: 0,
+            has_uninit_ro: false,
+            mv_clean_epoch: None,
+            pg_clean_epoch: None,
             last_sync: SyncMetrics::default(),
             releases: ReleaseQueue::new(),
         })
@@ -915,11 +1000,13 @@ impl SparseEngine {
         keep_one_pool: bool,
     ) -> bool {
         let mut updated = false;
+        let mut mapped_changed = false;
 
         // 1. Park newly unmapped tiles (zero UpdateTileMappings cost until
         //    parked tiles exceed `park_limit_tiles`!).
         for &key in to_unmap {
             if let Some(m) = self.mapped.remove(&key) {
+                mapped_changed = true;
                 if matches!(
                     m.region,
                     RegionKind::PrivateGuarded {
@@ -949,6 +1036,8 @@ impl SparseEngine {
         let mut fresh: BTreeMap<u8, Vec<u32>> = BTreeMap::new();
         for &key in to_map {
             if let Some(existing) = self.mapped.get_mut(&key) {
+                mapped_changed = true;
+                self.has_unclassified = true;
                 if matches!(
                     existing.region,
                     RegionKind::PrivateGuarded {
@@ -965,6 +1054,8 @@ impl SparseEngine {
                 continue;
             }
             if let Some(p) = self.parked.remove(&key) {
+                mapped_changed = true;
+                self.has_unclassified = true;
                 // Instant reuse from parked tiles — no UpdateTileMappings needed!
                 self.mapped.insert(
                     key,
@@ -1036,6 +1127,8 @@ impl SparseEngine {
                     }
                     STATS[4].fetch_add(1, Ordering::Relaxed);
                     updated = true;
+                    mapped_changed = true;
+                    self.has_unclassified = true;
                     for k in 0..count {
                         self.mapped.insert(
                             (win, res_tile + k),
@@ -1056,6 +1149,12 @@ impl SparseEngine {
                     tracing::warn!(win, res_tile, remain, "sparse UMA: VRAM pool exhausted for tiles");
                 }
             }
+        }
+
+        if mapped_changed {
+            self.spans_dirty = true;
+            self.mv_clean_epoch = None;
+            self.pg_clean_epoch = None;
         }
 
         STATS[0].store(self.mapped.len() as u64, Ordering::Relaxed);
@@ -1354,7 +1453,9 @@ impl SparseEngine {
     ) {
         let win = key.0 as usize;
         let win_tile_off = u64::from(key.1) * TILE_BYTES;
+        let scan_started = std::time::Instant::now();
         self.last_sync.tiles_scanned += 1;
+        self.last_sync.bytes_compared += TILE_BYTES;
         crate::host::copy_mapped(
             self.scratch.as_mut_ptr(),
             va as *const u8,
@@ -1362,6 +1463,7 @@ impl SparseEngine {
             false,
         );
         let Some(tile) = self.mapped.get_mut(&key) else {
+            self.last_sync.scan_us += scan_started.elapsed().as_micros() as u64;
             return;
         };
         if diff64 && let Some(baseline) = tile.baseline.as_mut() {
@@ -1391,136 +1493,305 @@ impl SparseEngine {
                 data: self.scratch.to_vec(),
             });
         }
+        self.last_sync.scan_us += scan_started.elapsed().as_micros() as u64;
     }
 
-    /// Processes mapped tiles (all or `filter`), partitioned strictly by
-    /// contiguous same-`RegionKind` spans (so `MEM_WRITE_WATCH` queries NEVER
-    /// straddle `AllocationBase` boundaries, `MEM_MAPPED` views coalesce into
-    /// `watch::writes(..., true)`, and non-`MEM_WRITE_WATCH` private tiles use
-    /// `PLAIN_GUARDS` with zero repeat scans).
+    /// Rebuilds the cached contiguous same-`RegionKind` spans and per-kind tile
+    /// counts from `self.mapped` (called ONLY after tile map/unmap or region
+    /// reclassification — NEVER on steady-state submits).
+    fn rebuild_cached_spans(&mut self) {
+        self.cached_spans.clear();
+        let mut counts = [0u64; 4];
+        let mut pg_writable_spans = 0usize;
+        let mut has_uninit_ro = false;
+        for (&key, tile) in &self.mapped {
+            match tile.region {
+                RegionKind::PrivateWriteWatch { .. } => counts[0] += 1,
+                RegionKind::MappedView => counts[1] += 1,
+                RegionKind::PrivateGuarded {
+                    read_only_originally,
+                    ..
+                } => {
+                    counts[2] += 1;
+                    if read_only_originally && tile.needs_initial_sync {
+                        has_uninit_ro = true;
+                    }
+                }
+                RegionKind::Uncommitted | RegionKind::Unknown => {
+                    counts[3] += 1;
+                    continue;
+                }
+            }
+            let va = tile_va(self.aperture_base, key.0 as usize, key.1);
+            let end = va + TILE_BYTES;
+            match self.cached_spans.last_mut() {
+                Some(last) if last.kind == tile.region && last.end == va => {
+                    last.end = end;
+                    last.keys.push(key);
+                    if tile.needs_initial_sync {
+                        last.all_initialized = false;
+                    } else {
+                        last.synced_seq = last.synced_seq.min(tile.synced_seq);
+                    }
+                }
+                _ => {
+                    if matches!(
+                        tile.region,
+                        RegionKind::PrivateGuarded {
+                            read_only_originally: false,
+                            ..
+                        }
+                    ) {
+                        pg_writable_spans += 1;
+                    }
+                    self.cached_spans.push(CachedSpan {
+                        kind: tile.region,
+                        start: va,
+                        end,
+                        keys: vec![key],
+                        all_initialized: !tile.needs_initial_sync,
+                        synced_seq: if tile.needs_initial_sync {
+                            u64::MAX
+                        } else {
+                            tile.synced_seq
+                        },
+                    });
+                }
+            }
+        }
+        self.kind_counts = counts;
+        self.pg_writable_spans = pg_writable_spans;
+        self.has_uninit_ro = has_uninit_ro;
+        self.spans_dirty = false;
+        self.mv_clean_epoch = None;
+        self.pg_clean_epoch = None;
+    }
+
+    /// Builds a temporary list of `CachedSpan`s covering only `keys` (used on
+    /// rare lazy reclassification passes).
+    fn build_spans_for_keys(&self, keys: &[(u8, u32)]) -> Vec<CachedSpan> {
+        let mut spans: Vec<CachedSpan> = Vec::new();
+        for &key in keys {
+            let Some(tile) = self.mapped.get(&key) else {
+                continue;
+            };
+            if matches!(tile.region, RegionKind::Uncommitted | RegionKind::Unknown) {
+                continue;
+            }
+            let va = tile_va(self.aperture_base, key.0 as usize, key.1);
+            let end = va + TILE_BYTES;
+            match spans.last_mut() {
+                Some(last) if last.kind == tile.region && last.end == va => {
+                    last.end = end;
+                    last.keys.push(key);
+                    if tile.needs_initial_sync {
+                        last.all_initialized = false;
+                    } else {
+                        last.synced_seq = last.synced_seq.min(tile.synced_seq);
+                    }
+                }
+                _ => spans.push(CachedSpan {
+                    kind: tile.region,
+                    start: va,
+                    end,
+                    keys: vec![key],
+                    all_initialized: !tile.needs_initial_sync,
+                    synced_seq: if tile.needs_initial_sync {
+                        u64::MAX
+                    } else {
+                        tile.synced_seq
+                    },
+                }),
+            }
+        }
+        spans
+    }
+
+    /// Processes pre-partitioned same-`RegionKind` spans:
+    /// - `PrivateWriteWatch`: per-`AllocationBase` `watch::writes_private_since`
+    ///   (NEVER merges across `AllocationBase`s; skips per-tile `BTreeMap` loop
+    ///   when clean).
+    /// - `MappedView`: coalesced `watch::writes_guarded_since` (skips both
+    ///   `GetWriteWatch` and `writes_mixed` `VirtualQuery` loops; skipped
+    ///   entirely in O(1) when `mv_skip` is true).
+    /// - `PrivateGuarded`: `PLAIN_GUARDS` fast range check (skipped entirely in
+    ///   O(1) when `pg_skip` is true, or forever after init when originally RO).
     ///
-    /// Returns any tiles whose cached `RegionKind` became stale (e.g. after a
-    /// lazy `MEM_PRIVATE` -> `MEM_MAPPED` promotion) so the caller can
-    /// re-classify and re-process them once.
-    fn process_spans(
+    /// Returns `(reclassify, mv_had_work, mv_all_ok, pg_had_work, pg_all_ok)`.
+    #[allow(clippy::too_many_arguments)]
+    fn process_span_slice(
         &mut self,
-        filter: Option<&[(u8, u32)]>,
+        spans: &mut [CachedSpan],
+        mv_skip: bool,
+        pg_skip: bool,
         allow_reclassify: bool,
         diff64: bool,
         diff_runs: &mut Vec<(usize, usize)>,
         uploads: &mut Vec<UploadChunk>,
         total_bytes: &mut u64,
-    ) -> Vec<(u8, u32)> {
-        // Partition tiles into contiguous runs that share the EXACT same `RegionKind`.
-        let mut spans: Vec<(RegionKind, u64, u64, Vec<(u8, u32)>)> = Vec::new();
-        let mut push_tile = |key: (u8, u32), kind: RegionKind| {
-            if matches!(kind, RegionKind::Uncommitted | RegionKind::Unknown) {
-                return;
-            }
-            let va = tile_va(self.aperture_base, key.0 as usize, key.1);
-            let end = va + TILE_BYTES;
-            match spans.last_mut() {
-                Some(last) if last.0 == kind && last.2 == va => {
-                    last.2 = end;
-                    last.3.push(key);
-                }
-                _ => spans.push((kind, va, end, vec![key])),
-            }
-        };
-        if let Some(keys) = filter {
-            for &key in keys {
-                if let Some(tile) = self.mapped.get(&key) {
-                    push_tile(key, tile.region);
-                }
-            }
-        } else {
-            for (&key, tile) in &self.mapped {
-                push_tile(key, tile.region);
-            }
-        }
-
+    ) -> (Vec<(u8, u32)>, bool, bool, bool, bool) {
         let mut reclassify: Vec<(u8, u32)> = Vec::new();
+        let mut mv_had_work = false;
+        let mut mv_all_ok = true;
+        let mut pg_had_work = false;
+        let mut pg_all_ok = true;
 
-        for (kind, span_start, span_end, span_keys) in spans {
-            match kind {
+        for span in spans.iter_mut() {
+            match span.kind {
                 RegionKind::PrivateWriteWatch { .. } | RegionKind::MappedView => {
-                    let guarded = matches!(kind, RegionKind::MappedView);
+                    let guarded = matches!(span.kind, RegionKind::MappedView);
+                    if guarded && mv_skip {
+                        continue;
+                    }
                     if guarded {
                         self.last_sync.mapped_view_calls += 1;
                     } else {
                         self.last_sync.write_watch_calls += 1;
-                        // Pre-fault any demand-zero 4 KiB pages of newly mapped
-                        // `MEM_WRITE_WATCH` tiles BEFORE `watch::writes` resets
-                        // the kernel dirty bits: on Windows, the first read of
-                        // a demand-zero `MEM_WRITE_WATCH` page faults in a zero
-                        // frame and sets its write-watch bit, which would
-                        // otherwise trigger a spurious dirty scan on the very
-                        // next submit. Pre-faulting before `watch::writes` and
-                        // then copying after keeps initial sync 100% race-free.
-                        for (idx, &key) in span_keys.iter().enumerate() {
-                            if self.mapped.get(&key).is_some_and(|t| t.needs_initial_sync) {
-                                let va = span_start + (idx as u64) * TILE_BYTES;
-                                crate::host::copy_mapped(
-                                    self.scratch.as_mut_ptr(),
-                                    va as *const u8,
-                                    TILE_BYTES as usize,
-                                    false,
-                                );
+                        if !span.all_initialized {
+                            // Pre-fault any demand-zero 4 KiB pages of newly mapped
+                            // `MEM_WRITE_WATCH` tiles BEFORE `GetWriteWatch(RESET)`:
+                            // on Windows, the first read of a demand-zero
+                            // `MEM_WRITE_WATCH` page faults in a zero frame and sets
+                            // its write-watch bit, which would otherwise trigger a
+                            // spurious dirty scan on the next submit.
+                            for (idx, &key) in span.keys.iter().enumerate() {
+                                if self.mapped.get(&key).is_some_and(|t| t.needs_initial_sync) {
+                                    let va = span.start + (idx as u64) * TILE_BYTES;
+                                    crate::host::copy_mapped(
+                                        self.scratch.as_mut_ptr(),
+                                        va as *const u8,
+                                        TILE_BYTES as usize,
+                                        false,
+                                    );
+                                }
                             }
                         }
                     }
-                    // Route through `watch::writes` so `Shadow` copies and
-                    // `sparse_uma` share the `watch::JOURNAL` sequence and
-                    // NEVER steal each other's write-watch dirty bits.
-                    if let Some((now, pages)) =
-                        crate::watch::writes(span_start as usize, span_end as usize, guarded)
-                    {
-                        let mut pi = 0usize;
-                        for (idx, key) in span_keys.into_iter().enumerate() {
-                            let va = span_start + (idx as u64) * TILE_BYTES;
-                            let page_64k = (va / TILE_BYTES) as usize;
-                            while pi < pages.len() && pages[pi].0 < page_64k {
-                                pi += 1;
+                    // Route through `watch`'s shared `JOURNAL` so `Shadow` copies
+                    // and `sparse_uma` NEVER steal each other's dirty state, while
+                    // skipping `GetWriteWatch`/`VirtualQuery` walks on known spans
+                    // and filtering out unchanged historical journal entries.
+                    let q_started = std::time::Instant::now();
+                    let watch_res = if guarded {
+                        crate::watch::writes_guarded_since(
+                            span.start as usize,
+                            span.end as usize,
+                            span.synced_seq,
+                        )
+                    } else {
+                        crate::watch::writes_private_since(
+                            span.start as usize,
+                            span.end as usize,
+                            span.synced_seq,
+                        )
+                    };
+                    let q_us = q_started.elapsed().as_micros() as u64;
+                    if guarded {
+                        self.last_sync.mv_us += q_us;
+                    } else {
+                        self.last_sync.ww_us += q_us;
+                    }
+                    if let Some((now, pages)) = watch_res {
+                        if span.all_initialized {
+                            // Steady-state fast path: zero `BTreeMap` lookups when
+                            // `pages.is_empty()`, or O(dirty) lookups when sparse.
+                            if !pages.is_empty() {
+                                let first_page_64k = (span.start / TILE_BYTES) as usize;
+                                for &(page_64k, seq) in &pages {
+                                    let Some(idx) = page_64k.checked_sub(first_page_64k) else {
+                                        continue;
+                                    };
+                                    let Some(&key) = span.keys.get(idx) else {
+                                        continue;
+                                    };
+                                    let synced_seq = match self.mapped.get(&key) {
+                                        Some(t) => t.synced_seq,
+                                        None => continue,
+                                    };
+                                    if seq > synced_seq {
+                                        let va = span.start + (idx as u64) * TILE_BYTES;
+                                        self.sync_dirty_tile(
+                                            key,
+                                            va,
+                                            diff64,
+                                            diff_runs,
+                                            uploads,
+                                            total_bytes,
+                                        );
+                                        if guarded {
+                                            mv_had_work = true;
+                                        }
+                                    }
+                                    if let Some(t) = self.mapped.get_mut(&key) {
+                                        t.synced_seq = now;
+                                    }
+                                }
                             }
-                            let (needs_init, synced_seq) = match self.mapped.get(&key) {
-                                Some(t) => (t.needs_initial_sync, t.synced_seq),
-                                None => continue,
-                            };
-                            let journal_dirty = pi < pages.len()
-                                && pages[pi].0 == page_64k
-                                && pages[pi].1 > synced_seq;
-                            if needs_init {
-                                self.sync_initial_tile(key, va, uploads, total_bytes);
-                            } else if journal_dirty {
-                                self.sync_dirty_tile(
-                                    key,
-                                    va,
-                                    diff64,
-                                    diff_runs,
-                                    uploads,
-                                    total_bytes,
-                                );
+                            span.synced_seq = now;
+                        } else {
+                            let mut pi = 0usize;
+                            for (idx, &key) in span.keys.iter().enumerate() {
+                                let va = span.start + (idx as u64) * TILE_BYTES;
+                                let page_64k = (va / TILE_BYTES) as usize;
+                                while pi < pages.len() && pages[pi].0 < page_64k {
+                                    pi += 1;
+                                }
+                                let (needs_init, synced_seq) = match self.mapped.get(&key) {
+                                    Some(t) => (t.needs_initial_sync, t.synced_seq),
+                                    None => continue,
+                                };
+                                let journal_dirty = pi < pages.len()
+                                    && pages[pi].0 == page_64k
+                                    && pages[pi].1 > synced_seq;
+                                if needs_init {
+                                    self.sync_initial_tile(key, va, uploads, total_bytes);
+                                    if guarded {
+                                        mv_had_work = true;
+                                    }
+                                } else if journal_dirty {
+                                    self.sync_dirty_tile(
+                                        key,
+                                        va,
+                                        diff64,
+                                        diff_runs,
+                                        uploads,
+                                        total_bytes,
+                                    );
+                                    if guarded {
+                                        mv_had_work = true;
+                                    }
+                                }
+                                if let Some(t) = self.mapped.get_mut(&key) {
+                                    t.synced_seq = now;
+                                }
                             }
-                            if let Some(t) = self.mapped.get_mut(&key) {
-                                t.synced_seq = now;
-                            }
+                            span.all_initialized = true;
+                            span.synced_seq = now;
                         }
                     } else if allow_reclassify {
+                        if guarded {
+                            mv_all_ok = false;
+                        }
                         // Cached classification is stale (e.g. `xmem` promoted
                         // a private view to `MEM_MAPPED`, or memory was freed):
                         // invalidate just this span and re-classify once.
-                        for key in span_keys {
+                        self.last_sync.reclass_tiles += span.keys.len() as u64;
+                        for &key in &span.keys {
                             if let Some(t) = self.mapped.get_mut(&key) {
                                 t.region = RegionKind::Unknown;
                             }
                             reclassify.push(key);
                         }
                     } else {
+                        if guarded {
+                            mv_all_ok = false;
+                        }
                         // Last-resort safe fallback only if a span still fails
                         // immediately after fresh `VirtualQuery` classification.
                         self.last_sync.full_fallbacks += 1;
-                        for (idx, key) in span_keys.into_iter().enumerate() {
-                            let va = span_start + (idx as u64) * TILE_BYTES;
+                        self.last_sync.fallback_tiles += span.keys.len() as u64;
+                        for (idx, &key) in span.keys.iter().enumerate() {
+                            let va = span.start + (idx as u64) * TILE_BYTES;
                             let needs_init =
                                 self.mapped.get(&key).is_some_and(|t| t.needs_initial_sync);
                             if needs_init {
@@ -1536,6 +1807,7 @@ impl SparseEngine {
                                 );
                             }
                         }
+                        span.all_initialized = true;
                     }
                 }
                 RegionKind::PrivateGuarded {
@@ -1545,92 +1817,109 @@ impl SparseEngine {
                     // Originally read-only private memory cannot be written
                     // without a protection change: sync once on first map, then
                     // skip with 0 syscalls and 0 CPU scans forever.
-                    for (idx, key) in span_keys.into_iter().enumerate() {
-                        let va = span_start + (idx as u64) * TILE_BYTES;
+                    if span.all_initialized {
+                        continue;
+                    }
+                    for (idx, &key) in span.keys.iter().enumerate() {
+                        let va = span.start + (idx as u64) * TILE_BYTES;
                         if self.mapped.get(&key).is_some_and(|t| t.needs_initial_sync) {
                             self.sync_initial_tile(key, va, uploads, total_bytes);
                         }
                     }
+                    span.all_initialized = true;
                 }
                 RegionKind::PrivateGuarded {
                     read_only_originally: false,
                     restore_prot,
                 } => {
+                    if pg_skip {
+                        continue;
+                    }
                     // Batch-poll `PLAIN_GUARDS` under ONE mutex lock for the
-                    // entire span: untouched guarded tiles take ~20 ns each
-                    // with 0 syscalls, 0 copies, and 0 diff64 scans!
-                    let mut states: Vec<u8> = Vec::with_capacity(span_keys.len());
+                    // entire span: when all tiles are initialized and clean,
+                    // range-count confirms cleanliness with 0 allocations!
+                    let pg_started = std::time::Instant::now();
+                    let mut work: Vec<(usize, (u8, u32), bool)> = Vec::new();
                     {
                         let mut g = PLAIN_GUARDS.lock().unwrap_or_else(|e| e.into_inner());
-                        for (idx, &key) in span_keys.iter().enumerate() {
-                            let needs_init =
-                                self.mapped.get(&key).is_some_and(|t| t.needs_initial_sync);
-                            if needs_init {
-                                states.push(2); // initial sync
-                                continue;
-                            }
-                            let va = (span_start + (idx as u64) * TILE_BYTES) as usize;
-                            let page_id = va / (TILE_BYTES as usize);
-                            let was_dirty = g.dirty.remove(&page_id);
-                            let is_protected = g.protected.contains_key(&page_id);
-                            if !was_dirty && is_protected {
-                                states.push(0); // clean
-                            } else {
-                                states.push(1); // dirty or unguarded
+                        let first_page = (span.start / TILE_BYTES) as usize;
+                        let last_page = (span.end / TILE_BYTES) as usize;
+                        let all_clean = span.all_initialized
+                            && g.dirty.range(first_page..last_page).next().is_none()
+                            && g.protected.range(first_page..last_page).count() == span.keys.len();
+                        if !all_clean {
+                            for (idx, &key) in span.keys.iter().enumerate() {
+                                let needs_init = !span.all_initialized
+                                    && self.mapped.get(&key).is_some_and(|t| t.needs_initial_sync);
+                                if needs_init {
+                                    work.push((idx, key, true));
+                                    continue;
+                                }
+                                let page_id = first_page + idx;
+                                let was_dirty = g.dirty.remove(&page_id);
+                                let is_protected = g.protected.contains_key(&page_id);
+                                if was_dirty || !is_protected {
+                                    work.push((idx, key, false));
+                                }
                             }
                         }
                     }
-                    for (idx, (key, state)) in
-                        span_keys.into_iter().zip(states.into_iter()).enumerate()
-                    {
-                        if state == 0 {
-                            continue;
-                        }
-                        let va = span_start + (idx as u64) * TILE_BYTES;
-                        // Arm read-only guard BEFORE copying so any concurrent
-                        // CPU write faults and marks the tile dirty for the
-                        // next submission (linearizable, zero lost writes).
-                        if !plain_guard_protect(va as usize, restore_prot) {
-                            if allow_reclassify {
-                                if let Some(t) = self.mapped.get_mut(&key) {
-                                    t.region = RegionKind::Unknown;
+                    self.last_sync.pg_us += pg_started.elapsed().as_micros() as u64;
+                    if !work.is_empty() {
+                        pg_had_work = true;
+                        let mut span_ok = true;
+                        for (idx, key, is_init) in work {
+                            let va = span.start + (idx as u64) * TILE_BYTES;
+                            // Arm read-only guard BEFORE copying so any concurrent
+                            // CPU write faults and marks the tile dirty for the
+                            // next submission (linearizable, zero lost writes).
+                            if !plain_guard_protect(va as usize, restore_prot) {
+                                span_ok = false;
+                                pg_all_ok = false;
+                                if allow_reclassify {
+                                    self.last_sync.reclass_tiles += 1;
+                                    if let Some(t) = self.mapped.get_mut(&key) {
+                                        t.region = RegionKind::Unknown;
+                                    }
+                                    reclassify.push(key);
                                 }
-                                reclassify.push(key);
+                                continue;
                             }
-                            continue;
+                            if is_init {
+                                self.sync_initial_tile(key, va, uploads, total_bytes);
+                            } else {
+                                self.sync_dirty_tile(
+                                    key,
+                                    va,
+                                    diff64,
+                                    diff_runs,
+                                    uploads,
+                                    total_bytes,
+                                );
+                            }
                         }
-                        if state == 2 {
-                            self.sync_initial_tile(key, va, uploads, total_bytes);
-                        } else {
-                            self.sync_dirty_tile(
-                                key,
-                                va,
-                                diff64,
-                                diff_runs,
-                                uploads,
-                                total_bytes,
-                            );
+                        if span_ok {
+                            span.all_initialized = true;
                         }
+                    } else if !span.all_initialized {
+                        span.all_initialized = true;
                     }
                 }
                 RegionKind::Uncommitted | RegionKind::Unknown => {}
             }
         }
 
-        reclassify
+        (reclassify, mv_had_work, mv_all_ok, pg_had_work, pg_all_ok)
     }
 
     /// Scoped pre-submit CPU -> VRAM dirty scanner over all currently mapped
     /// sparse tiles:
     /// 1. Lazily classifies only newly mapped / invalidated tiles via
-    ///    `VirtualQuery` (cached per tile; 0 `VirtualQuery` calls on steady
-    ///    state).
-    /// 2. Partitions tiles strictly by `(RegionKind, AllocationBase)` so
-    ///    `GetWriteWatch` (`watch::writes(..., false)`) NEVER straddles
-    ///    `VirtualAlloc2` `AllocationBase` boundaries, coalesced `MEM_MAPPED`
-    ///    views use `watch::writes(..., true)` (`VIEW_GUARD`), and ordinary
-    ///    non-`MEM_WRITE_WATCH` private regions use `PLAIN_GUARDS` instead of
-    ///    full-span dirty fallback scans.
+    ///    `VirtualQuery` (0 `VirtualQuery` calls on steady state).
+    /// 2. Caches contiguous `(RegionKind, AllocationBase)` spans across submits
+    ///    and uses monotonic `watch::guard_epoch()` / `PLAIN_GUARD_EPOCH`
+    ///    tokens so untouched `MappedView` / `PrivateGuarded` tiles take **O(1)**
+    ///    time (~1 µs/submit, 0 syscalls, 0 `BTreeMap` walks, 0 allocations).
     /// 3. Runs Stage M2 64-byte cacheline diffing (`diff_cachelines_64`) ONLY
     ///    on genuinely dirty tiles against per-tile baselines.
     pub(crate) fn collect_dirty_uploads(&mut self) -> Vec<UploadChunk> {
@@ -1639,33 +1928,114 @@ impl SparseEngine {
             return Vec::new();
         }
         let started = std::time::Instant::now();
+
+        if self.has_unclassified {
+            self.classify_unknown_tiles(None);
+            self.has_unclassified = false;
+            self.spans_dirty = true;
+        }
+        if self.spans_dirty {
+            self.rebuild_cached_spans();
+        }
+
+        // Snapshot epochs BEFORE checking any spans (linearizable: any fault,
+        // alias open, `kernel_will_write`, or remap racing with this pass bumps
+        // the epoch so we will NOT falsely lock in a stale clean token).
+        let mv_ep0 = crate::watch::guard_epoch();
+        let pg_ep0 = plain_guard_epoch();
+        let mv_skip = self.kind_counts[1] == 0 || self.mv_clean_epoch == Some(mv_ep0);
+        let pg_skip = self.pg_writable_spans == 0 || self.pg_clean_epoch == Some(pg_ep0);
+
+        // O(1) steady-state fast exit: zero `PrivateWriteWatch` tiles, zero
+        // uninitialized read-only tiles, and both guard epochs unchanged!
+        if self.kind_counts[0] == 0 && !self.has_uninit_ro && mv_skip && pg_skip {
+            SCAN_STATS[0].store(self.kind_counts[0], Ordering::Relaxed);
+            SCAN_STATS[1].store(self.kind_counts[1], Ordering::Relaxed);
+            SCAN_STATS[2].store(self.kind_counts[2], Ordering::Relaxed);
+            SCAN_STATS[3].store(self.kind_counts[3], Ordering::Relaxed);
+            SCAN_STATS[8].fetch_add(1, Ordering::Relaxed);
+            STATS[8].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+            return Vec::new();
+        }
+
         let diff64 = diff64_enabled();
-
-        self.classify_unknown_tiles(None);
-
         let mut uploads: Vec<UploadChunk> = Vec::new();
         let mut total_bytes = 0u64;
         let mut diff_runs: Vec<(usize, usize)> = Vec::new();
 
-        let reclassify = self.process_spans(
-            None,
+        let mut spans = std::mem::take(&mut self.cached_spans);
+        let (reclassify, mv_had_work, mv_all_ok, pg_had_work, pg_all_ok) = self.process_span_slice(
+            &mut spans,
+            mv_skip,
+            pg_skip,
             true,
             diff64,
             &mut diff_runs,
             &mut uploads,
             &mut total_bytes,
         );
+        self.cached_spans = spans;
+
         if !reclassify.is_empty() {
             self.classify_unknown_tiles(Some(&reclassify));
-            let _ = self.process_spans(
-                Some(&reclassify),
+            self.has_unclassified = false;
+            let mut reclass_spans = self.build_spans_for_keys(&reclassify);
+            let _ = self.process_span_slice(
+                &mut reclass_spans,
+                false,
+                false,
                 false,
                 diff64,
                 &mut diff_runs,
                 &mut uploads,
                 &mut total_bytes,
             );
+            self.rebuild_cached_spans();
+        } else {
+            self.has_uninit_ro = false;
+            if !mv_skip {
+                if self.kind_counts[1] > 0
+                    && !mv_had_work
+                    && mv_all_ok
+                    && crate::watch::guard_epoch() == mv_ep0
+                {
+                    self.mv_clean_epoch = Some(mv_ep0);
+                } else {
+                    self.mv_clean_epoch = None;
+                }
+            }
+            if !pg_skip {
+                if self.pg_writable_spans > 0
+                    && !pg_had_work
+                    && pg_all_ok
+                    && plain_guard_epoch() == pg_ep0
+                {
+                    self.pg_clean_epoch = Some(pg_ep0);
+                } else {
+                    self.pg_clean_epoch = None;
+                }
+            }
         }
+
+        self.last_sync.bytes_uploaded = total_bytes;
+
+        // Publish per-kind residency & cumulative scan telemetry for `status()`.
+        SCAN_STATS[0].store(self.kind_counts[0], Ordering::Relaxed);
+        SCAN_STATS[1].store(self.kind_counts[1], Ordering::Relaxed);
+        SCAN_STATS[2].store(self.kind_counts[2], Ordering::Relaxed);
+        SCAN_STATS[3].store(self.kind_counts[3], Ordering::Relaxed);
+        SCAN_STATS[4].fetch_add(self.last_sync.fallback_tiles, Ordering::Relaxed);
+        SCAN_STATS[5].fetch_add(self.last_sync.virtual_queries, Ordering::Relaxed);
+        SCAN_STATS[6].fetch_add(self.last_sync.bytes_compared, Ordering::Relaxed);
+        SCAN_STATS[7].fetch_add(total_bytes, Ordering::Relaxed);
+        SCAN_STATS[8].fetch_add(1, Ordering::Relaxed);
+        SCAN_STATS[9].fetch_add(self.last_sync.write_watch_calls, Ordering::Relaxed);
+        SCAN_STATS[10].fetch_add(self.last_sync.mapped_view_calls, Ordering::Relaxed);
+        SCAN_STATS[11].fetch_add(self.last_sync.reclass_tiles, Ordering::Relaxed);
+        SCAN_STATS[12].fetch_add(self.last_sync.ww_us, Ordering::Relaxed);
+        SCAN_STATS[13].fetch_add(self.last_sync.mv_us, Ordering::Relaxed);
+        SCAN_STATS[14].fetch_add(self.last_sync.pg_us, Ordering::Relaxed);
+        SCAN_STATS[15].fetch_add(self.last_sync.scan_us, Ordering::Relaxed);
 
         STATS[6].fetch_add(total_bytes, Ordering::Relaxed);
         STATS[7].fetch_add(uploads.len() as u64, Ordering::Relaxed);
@@ -1797,12 +2167,18 @@ pub(crate) fn status() {
     if s[0] == 0 && s[1] == 0 && s[2] == 0 {
         return;
     }
+    let c: [u64; 16] = std::array::from_fn(|i| SCAN_STATS[i].load(Ordering::Relaxed));
     tracing::info!(
-        "sparse UMA (24 GiB, 12x2 GiB): {} MiB mapped ({} tiles), {} MiB parked ({} tiles), \
-         {} MiB DEFAULT pools ({} released), UpdateTileMappings {} map / {} unmap, \
-         synced {} MiB in {} diff64 runs ({} us)",
+        "sparse UMA (24 GiB, 12x2 GiB): {} MiB mapped ({} tiles: ww={} mv={} pg={} unc={}), \
+         {} MiB parked ({} tiles), {} MiB DEFAULT pools ({} released), UpdateTileMappings {} map / {} unmap, \
+         synced {} MiB in {} diff64 runs ({} us across {} submits; ww_calls={} {} us, mv_calls={} {} us, \
+         pg={} us, scan={} us, vq={}, reclass={}, fallback_tiles={}, compared={} MiB, uploaded={} MiB)",
         (s[0] * TILE_BYTES) >> 20,
         s[0],
+        c[0],
+        c[1],
+        c[2],
+        c[3],
         (s[1] * TILE_BYTES) >> 20,
         s[1],
         s[2] >> 20,
@@ -1812,6 +2188,18 @@ pub(crate) fn status() {
         s[6] >> 20,
         s[7],
         s[8],
+        c[8],
+        c[9],
+        c[12],
+        c[10],
+        c[13],
+        c[14],
+        c[15],
+        c[5],
+        c[11],
+        c[4],
+        c[6] >> 20,
+        c[7] >> 20,
     );
 }
 
@@ -2984,6 +3372,385 @@ void main() {
         assert_eq!(mc.tiles_scanned, 0);
         assert_eq!(mc.virtual_queries, 0);
         assert_eq!(mc.full_fallbacks, 0);
+        assert_eq!(mc.fallback_tiles, 0);
+        assert_eq!(mc.bytes_compared, 0);
         assert_eq!(mc.mapped_view_calls, 1);
+
+        // Subsequent untouched submit hits the O(1) `GUARD_EPOCH` fast exit (`mapped_view_calls == 0`).
+        let mut hit_o1_fast_exit = false;
+        for _ in 0..5 {
+            let steady = engine.collect_dirty_uploads();
+            let ms = engine.last_sync_metrics();
+            assert!(steady.is_empty());
+            assert_eq!(ms.tiles_scanned, 0);
+            assert_eq!(ms.virtual_queries, 0);
+            assert_eq!(ms.full_fallbacks, 0);
+            assert_eq!(ms.bytes_compared, 0);
+            if ms.mapped_view_calls == 0 {
+                hit_o1_fast_exit = true;
+                break;
+            }
+        }
+        assert!(hit_o1_fast_exit, "steady-state MappedView must hit O(1) GUARD_EPOCH fast exit");
+    }
+
+    /// Comprehensive Phase 6B verification across EVERY `RegionKind` variant
+    /// simultaneously (`PrivateWriteWatch`, multi-view `MappedView` + external
+    /// alias, writable `PrivateGuarded`, originally read-only `PrivateGuarded`,
+    /// and `Uncommitted`):
+    /// - Zero redundant scans (`tiles_scanned == 0`, `bytes_compared == 0`),
+    ///   zero `VirtualQuery` syscalls (both `sparse_uma` and `watch::writes_mixed`),
+    ///   zero fallbacks (`fallback_tiles == 0`), and O(1) `GUARD_EPOCH` fast exit
+    ///   on untouched steady-state submits;
+    /// - 100% coherency across direct CPU writes, alias view writes,
+    ///   `kernel_will_write` (`ReadFile`), and `Shadow` (`watch::writes`) overlap.
+    #[test]
+    fn all_region_kinds_zero_redundant_scans_and_o1_epoch_coherency() {
+        use std::io::{Read, Seek, Write};
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEM_COMMIT, MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE,
+            MEM_REPLACE_PLACEHOLDER, MEM_RESERVE, MEM_RESERVE_PLACEHOLDER,
+            MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, MapViewOfFile3, PAGE_NOACCESS,
+            PAGE_READONLY, PAGE_READWRITE, SEC_COMMIT, UnmapViewOfFile, UnmapViewOfFile2,
+            VirtualAlloc2, VirtualFree, VirtualProtect,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+        const MEM_WRITE_WATCH: u32 = 0x0020_0000;
+
+        let Some((device, copy_queue, mut engine, aperture_base)) = test_engine_and_copy_queue()
+        else {
+            return;
+        };
+
+        // Window 5, tiles 0..8 (512 KiB, unique VA range):
+        //   tile 0      : `PrivateWriteWatch` (`MEM_WRITE_WATCH`)
+        //   tiles 1..5  : 4 separate 64 KiB `MappedView`s back-to-back (exact `xmem` layout)
+        //   tile 5      : writable `PrivateGuarded` (plain `MEM_PRIVATE` `PAGE_READWRITE`)
+        //   tile 6      : originally read-only `PrivateGuarded` (`MEM_PRIVATE` `PAGE_READONLY`)
+        //   tile 7      : `Uncommitted` placeholder (`MEM_RESERVE`, `PAGE_NOACCESS`)
+        let base_va = tile_va(aperture_base, 5, 0);
+        let tile = |i: u64| base_va + i * TILE_BYTES;
+        let proc = unsafe { GetCurrentProcess() };
+
+        let ph = unsafe {
+            VirtualAlloc2(
+                proc,
+                base_va as *const std::ffi::c_void,
+                (8 * TILE_BYTES) as usize,
+                MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                PAGE_NOACCESS,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        assert_eq!(ph as u64, base_va);
+
+        // Split tiles 0..7 off individually (leaving tile 7 as an uncommitted placeholder).
+        for i in 0u64..7 {
+            assert_ne!(
+                unsafe {
+                    VirtualFree(
+                        tile(i) as *mut std::ffi::c_void,
+                        TILE_BYTES as usize,
+                        MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
+                    )
+                },
+                0
+            );
+        }
+
+        // Tile 0: `PrivateWriteWatch`.
+        let p_ww = unsafe {
+            VirtualAlloc2(
+                proc,
+                tile(0) as *const std::ffi::c_void,
+                TILE_BYTES as usize,
+                MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        assert_eq!(p_ww as u64, tile(0));
+
+        // Tiles 1..5: 4 separate 64 KiB `MapViewOfFile3` views + external alias of tile 2.
+        let section = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE | SEC_COMMIT,
+                0,
+                (4 * TILE_BYTES) as u32,
+                std::ptr::null(),
+            )
+        };
+        assert!(!section.is_null());
+        for i in 0u64..4 {
+            let va = tile(1 + i);
+            let v = unsafe {
+                MapViewOfFile3(
+                    section,
+                    proc,
+                    va as *const std::ffi::c_void,
+                    i * TILE_BYTES,
+                    TILE_BYTES as usize,
+                    MEM_REPLACE_PLACEHOLDER,
+                    PAGE_READWRITE,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            assert_eq!(v.Value as u64, va);
+            crate::inplace::title_memory_view(
+                va as usize,
+                TILE_BYTES as usize,
+                section as usize,
+                i * TILE_BYTES,
+            );
+        }
+        let alias_va = unsafe {
+            MapViewOfFile(section, FILE_MAP_WRITE, 0, TILE_BYTES as u32, TILE_BYTES as usize).Value
+                as usize
+        };
+        assert_ne!(alias_va, 0);
+        crate::inplace::title_memory_view(
+            alias_va,
+            TILE_BYTES as usize,
+            section as usize,
+            TILE_BYTES,
+        );
+
+        // Tile 5: plain writable `MEM_PRIVATE`.
+        let p_pg_rw = unsafe {
+            VirtualAlloc2(
+                proc,
+                tile(5) as *const std::ffi::c_void,
+                TILE_BYTES as usize,
+                MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER,
+                PAGE_READWRITE,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        assert_eq!(p_pg_rw as u64, tile(5));
+
+        // Tile 6: originally read-only `MEM_PRIVATE` (seed bytes then make `PAGE_READONLY`).
+        let p_pg_ro = unsafe {
+            VirtualAlloc2(
+                proc,
+                tile(6) as *const std::ffi::c_void,
+                TILE_BYTES as usize,
+                MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER,
+                PAGE_READWRITE,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        assert_eq!(p_pg_ro as u64, tile(6));
+        unsafe { (tile(6) as *mut u32).write_volatile(0x524F_524F) };
+        let mut old_prot = 0u32;
+        assert_ne!(
+            unsafe {
+                VirtualProtect(
+                    tile(6) as *const std::ffi::c_void,
+                    TILE_BYTES as usize,
+                    PAGE_READONLY,
+                    &mut old_prot,
+                )
+            },
+            0
+        );
+
+        struct AllKindsGuard {
+            base_va: u64,
+            alias_va: usize,
+            section: HANDLE,
+        }
+        impl Drop for AllKindsGuard {
+            fn drop(&mut self) {
+                let tile = |i: u64| (self.base_va + i * TILE_BYTES) as usize;
+                plain_guards_release_range(tile(5), tile(6));
+                crate::watch::title_memory_remapped(tile(0), (5 * TILE_BYTES) as usize);
+                crate::watch::title_memory_remapped(self.alias_va, TILE_BYTES as usize);
+                unsafe {
+                    let proc = GetCurrentProcess();
+                    VirtualFree(tile(0) as *mut std::ffi::c_void, 0, MEM_RELEASE);
+                    for i in 1u64..5 {
+                        UnmapViewOfFile2(
+                            proc,
+                            MEMORY_MAPPED_VIEW_ADDRESS {
+                                Value: tile(i) as *mut std::ffi::c_void,
+                            },
+                            0,
+                        );
+                    }
+                    UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                        Value: self.alias_va as *mut std::ffi::c_void,
+                    });
+                    VirtualFree(tile(5) as *mut std::ffi::c_void, 0, MEM_RELEASE);
+                    VirtualFree(tile(6) as *mut std::ffi::c_void, 0, MEM_RELEASE);
+                    VirtualFree(tile(7) as *mut std::ffi::c_void, 0, MEM_RELEASE);
+                    CloseHandle(self.section);
+                }
+            }
+        }
+        let _guard = AllKindsGuard {
+            base_va,
+            alias_va,
+            section,
+        };
+
+        // Seed initial bytes in writable tiles.
+        unsafe {
+            (tile(0) as *mut u32).write_volatile(0x0001_0001);
+            (tile(1) as *mut u32).write_volatile(0x0002_0002);
+            (tile(2) as *mut u32).write_volatile(0x0003_0003);
+            (tile(3) as *mut u32).write_volatile(0x0004_0004);
+            (tile(4) as *mut u32).write_volatile(0x0005_0005);
+            (tile(5) as *mut u32).write_volatile(0x0006_0006);
+        }
+
+        let mut to_map = BTreeSet::new();
+        for t in 0u32..8 {
+            to_map.insert((5u8, t));
+        }
+        let empty = BTreeSet::new();
+        assert!(engine.apply_tile_changes(&device, &copy_queue, &empty, &to_map, 1, false));
+
+        // 1. Initial sync: uploads the 7 committed tiles (0 for `Uncommitted` tile 7).
+        let init = engine.collect_dirty_uploads();
+        let m1 = engine.last_sync_metrics();
+        assert_eq!(init.len(), 7);
+        assert_eq!(m1.full_fallbacks, 0);
+        assert_eq!(m1.fallback_tiles, 0);
+        assert_eq!(m1.write_watch_calls, 1);
+        assert_eq!(m1.mapped_view_calls, 1, "all 4 separate 64 KiB MEM_MAPPED views coalesce");
+
+        // 2. Steady state: 0 scans, 0 bytes_compared, 0 VirtualQueries (sparse_uma & watch),
+        //    0 fallbacks, and O(1) `GUARD_EPOCH` skip (`mapped_view_calls == 0`)!
+        crate::watch::reset_mixed_virtual_queries();
+        let mut hit_o1_mv = false;
+        for _ in 0..5 {
+            let chunks = engine.collect_dirty_uploads();
+            let m = engine.last_sync_metrics();
+            assert!(chunks.is_empty());
+            assert_eq!(m.tiles_scanned, 0);
+            assert_eq!(m.bytes_compared, 0);
+            assert_eq!(m.virtual_queries, 0);
+            assert_eq!(m.full_fallbacks, 0);
+            assert_eq!(m.fallback_tiles, 0);
+            assert_eq!(crate::watch::mixed_virtual_queries(), 0);
+            if m.mapped_view_calls == 0 {
+                hit_o1_mv = true;
+            }
+        }
+        assert!(hit_o1_mv, "untouched MappedView span must hit O(1) GUARD_EPOCH skip");
+
+        // 3a. Direct CPU write to `MappedView` tile 1 -> caught immediately despite O(1) epoch cache!
+        unsafe { ((tile(1) + 0x100) as *mut u32).write_volatile(0x1111_AAAA) };
+        let c_mv = engine.collect_dirty_uploads();
+        let m_mv = engine.last_sync_metrics();
+        assert_eq!(c_mv.len(), 1);
+        assert_eq!(c_mv[0].offset, TILE_BYTES + 0x100);
+        assert_eq!(c_mv[0].data.len(), 64);
+        assert_eq!(u32::from_le_bytes(c_mv[0].data[0..4].try_into().unwrap()), 0x1111_AAAA);
+        assert_eq!(m_mv.tiles_scanned, 1);
+        assert_eq!(m_mv.bytes_compared, TILE_BYTES);
+
+        // Re-lock O(1) epoch cache before next coherency test.
+        for _ in 0..2 {
+            assert!(engine.collect_dirty_uploads().is_empty());
+        }
+
+        // 3b. External alias write into tile 2 (`alias_va`) -> caught despite O(1) epoch cache!
+        unsafe { ((alias_va + 0x140) as *mut u32).write_volatile(0x2222_BBBB) };
+        let c_alias = engine.collect_dirty_uploads();
+        let m_alias = engine.last_sync_metrics();
+        assert_eq!(c_alias.len(), 1);
+        assert_eq!(c_alias[0].offset, 2 * TILE_BYTES + 0x140);
+        assert_eq!(c_alias[0].data.len(), 64);
+        assert_eq!(u32::from_le_bytes(c_alias[0].data[0..4].try_into().unwrap()), 0x2222_BBBB);
+        assert_eq!(m_alias.tiles_scanned, 1);
+
+        for _ in 0..2 {
+            assert!(engine.collect_dirty_uploads().is_empty());
+        }
+
+        // 3c. `kernel_will_write` (`watch::writing`) + `ReadFile` into `MappedView` tile 3!
+        let mut f = tempfile::tempfile().unwrap();
+        f.write_all(b"SPARSE_UMA_KW64!").unwrap();
+        f.rewind().unwrap();
+        crate::watch::writing((tile(3) + 0x180) as usize, 16);
+        let dst = unsafe { std::slice::from_raw_parts_mut((tile(3) + 0x180) as *mut u8, 16) };
+        assert_eq!(f.read(dst).unwrap(), 16);
+        let c_kw = engine.collect_dirty_uploads();
+        let m_kw = engine.last_sync_metrics();
+        assert_eq!(c_kw.len(), 1);
+        assert_eq!(c_kw[0].offset, 3 * TILE_BYTES + 0x180);
+        assert_eq!(c_kw[0].data.len(), 64);
+        assert_eq!(&c_kw[0].data[0..16], b"SPARSE_UMA_KW64!");
+        assert_eq!(m_kw.tiles_scanned, 1);
+
+        for _ in 0..2 {
+            assert!(engine.collect_dirty_uploads().is_empty());
+        }
+
+        // 3d. `Shadow` overlap (`watch::writes` drains `MappedView` tile 4 fault first)!
+        unsafe { ((tile(4) + 0x1C0) as *mut u32).write_volatile(0x4444_DDDD) };
+        assert!(crate::watch::writes(tile(4) as usize, (tile(4) + TILE_BYTES) as usize, true).is_some());
+        let c_shadow = engine.collect_dirty_uploads();
+        let m_shadow = engine.last_sync_metrics();
+        assert_eq!(c_shadow.len(), 1, "must stay 100% coherent when Shadow drains guard fault first");
+        assert_eq!(c_shadow[0].offset, 4 * TILE_BYTES + 0x1C0);
+        assert_eq!(u32::from_le_bytes(c_shadow[0].data[0..4].try_into().unwrap()), 0x4444_DDDD);
+        assert_eq!(m_shadow.tiles_scanned, 1);
+
+        for _ in 0..2 {
+            assert!(engine.collect_dirty_uploads().is_empty());
+        }
+
+        // 3e. Writable `PrivateGuarded` tile 5 write -> caught despite `PLAIN_GUARD_EPOCH` cache!
+        unsafe { ((tile(5) + 0x200) as *mut u32).write_volatile(0x5555_EEEE) };
+        let c_pg = engine.collect_dirty_uploads();
+        let m_pg = engine.last_sync_metrics();
+        assert_eq!(c_pg.len(), 1);
+        assert_eq!(c_pg[0].offset, 5 * TILE_BYTES + 0x200);
+        assert_eq!(u32::from_le_bytes(c_pg[0].data[0..4].try_into().unwrap()), 0x5555_EEEE);
+        assert_eq!(m_pg.tiles_scanned, 1);
+
+        // 3f. `PrivateWriteWatch` tile 0 write -> caught immediately!
+        unsafe { ((tile(0) + 0x240) as *mut u32).write_volatile(0x0000_FFFF) };
+        let c_ww = engine.collect_dirty_uploads();
+        assert_eq!(c_ww.len(), 1);
+        assert_eq!(c_ww[0].offset, 0x240);
+        assert_eq!(u32::from_le_bytes(c_ww[0].data[0..4].try_into().unwrap()), 0x0000_FFFF);
+
+        // 4. Unmap `PrivateWriteWatch` tile 0 so only `MappedView` + `PrivateGuarded` + `Uncommitted`
+        //    remain, proving the complete O(1) ultra-fast exit (0 ww calls, 0 mv calls, 0 scans, 0 VQs)!
+        let mut to_unmap = BTreeSet::new();
+        to_unmap.insert((5u8, 0u32));
+        engine.apply_tile_changes(&device, &copy_queue, &to_unmap, &empty, 2, false);
+        crate::watch::reset_mixed_virtual_queries();
+        let mut hit_full_o1 = false;
+        for _ in 0..5 {
+            let chunks = engine.collect_dirty_uploads();
+            let m = engine.last_sync_metrics();
+            assert!(chunks.is_empty());
+            assert_eq!(m.write_watch_calls, 0);
+            assert_eq!(m.tiles_scanned, 0);
+            assert_eq!(m.bytes_compared, 0);
+            assert_eq!(m.virtual_queries, 0);
+            assert_eq!(m.fallback_tiles, 0);
+            assert_eq!(crate::watch::mixed_virtual_queries(), 0);
+            if m.mapped_view_calls == 0 {
+                hit_full_o1 = true;
+                break;
+            }
+        }
+        assert!(hit_full_o1, "steady-state MappedView+PrivateGuarded+Uncommitted must hit full O(1) exit");
+
+        drop(engine);
     }
 }

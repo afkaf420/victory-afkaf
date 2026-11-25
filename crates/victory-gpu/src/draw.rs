@@ -698,6 +698,10 @@ impl State {
     /// shortcut: the render target views are made again from the handles'
     /// descriptors as they are now, not as they were when the title set
     /// the targets (a descriptor rewritten in between names another view).
+    pub(crate) fn has_active_targets(&self) -> bool {
+        self.targets_set
+    }
+
     pub(crate) fn replay(&mut self, list: &HostList) {
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
@@ -2182,6 +2186,7 @@ impl State {
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        list.record_op();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -2453,6 +2458,7 @@ impl State {
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
                     self.mesh_scissor(list, false);
+                    list.record_op();
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true
                 }
@@ -2852,6 +2858,7 @@ impl State {
                 list.list
                     .DrawInstanced(count, instances, from, first_instance)
             };
+            list.record_op();
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -2953,6 +2960,7 @@ impl State {
                 list.list
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
+            list.record_op();
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -3169,6 +3177,7 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, false);
         }
+        list.record_op();
         crate::indirect::done(list, &bounded);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);

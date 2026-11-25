@@ -1622,3 +1622,299 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
         }
     }
 }
+
+/// Helper: compiles a synthetic Wave32 compute program, validates its DXIL,
+/// returns `(HostShader, select_count)`.
+fn lower_m0_test_cs(words: &[u32], vgprs: u16) -> (HostShader, u32) {
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs,
+        layout: vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 4,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 1,
+            },
+        ],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 5 << 1,
+            threads: [4, 1, 1],
+        }),
+        code,
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let lowered = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    })
+    .expect("lower");
+    let select_idx = super::census::KINDS
+        .iter()
+        .position(|&k| k == "select")
+        .expect("select kind");
+    let selects = super::census::take(&lowered.dxil)
+        .map(|c| c.counts[select_idx])
+        .unwrap_or(0);
+    let mut shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        root_indexed_views: Vec::new(),
+    };
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil).expect("DXIL validation failed");
+    }
+    (shader, selects)
+}
+
+fn run_m0_test_cs(shader: &HostShader, inputs: [u32; 4], out_dwords: u32) -> Vec<u32> {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut result = None;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            continue;
+        };
+        let (root, pso) = match host.compute_pipeline(shader) {
+            Ok(p) => p,
+            Err(e) if warp => {
+                eprintln!("{label}: compute_pipeline skipped ({e})");
+                continue;
+            }
+            Err(e) => panic!("{label}: compute_pipeline failed: {e}"),
+        };
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            ud[u.index as usize] = match (u.root, u.slot) {
+                (RootType::Constants, 0) => inputs[u.dword as usize],
+                (RootType::Table, 1) => 0,
+                other => panic!("unexpected user data {other:?}"),
+            };
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(out_dwords)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        if let Some(prev) = &result {
+            assert_eq!(prev, &out[0], "{label}: hardware vs warp mismatch");
+        } else {
+            result = Some(out[0].clone());
+        }
+    }
+    result.expect("need hardware GPU or WARP to run M0 test")
+}
+
+#[test]
+fn m0_counted_loops_narrow_movrels_and_match_hardware() {
+    // Tests both a self-loop IV (including an out-of-bounds M0 = -1 iteration)
+    // and a back-edge-trampoline loop IV over a 64-VGPR program.
+    const M0_REG: u32 = 124;
+    let s_add_i32 = |dst: u32, src0: u32, src1: u32| 0x8100_0000 | (dst << 16) | (src1 << 8) | src0;
+    let s_cmp_eq_u32 = |src0: u32, src1: u32| 0xBF06_0000 | (src1 << 8) | src0;
+    let v_mov_imm = |dst: u32, lit: u32| [0x7E00_02FF | (dst << 17), lit];
+    let v_movrels = |dst: u32, src: u32| 0x7E00_8700 | (dst << 17) | src;
+    let v_add_nc_u32 = |dst: u32, s0: u32, s1: u32| 0x4A00_0000 | (dst << 17) | (s1 << 9) | (256 + s0);
+
+    let mut w: Vec<u32> = Vec::new();
+    w.push(s_mov_b32(5, 0x80));
+    w.extend_from_slice(&s_load_dwordx4(8, 4));
+    // Populate v[4..20] with distinct values (100 + k).
+    for k in 0..16u32 {
+        w.extend_from_slice(&v_mov_imm(4 + k, 100 + k));
+    }
+    // Accumulators v20, v21, v22 = 0.
+    w.push(vop1(0x001, 20, 0x80));
+    w.push(vop1(0x001, 21, 0x80));
+    w.push(vop1(0x001, 22, 0x80));
+
+    // Loop 1 (self-loop): s0 = 15, 11, 7, 3; exit when (s0 - 3) == 0.
+    w.push(s_mov_b32(0, 128 + 15));
+    let loop1 = w.len();
+    w.push(s_add_i32(M0_REG, 0, 193)); // m0 = s0 - 1 -> {14, 10, 6, 2}
+    w.push(s_add_i32(1, 0, 195)); // s1 = s0 - 3 -> {12, 8, 4, 0}
+    w.push(v_movrels(23, 4));
+    w.push(v_add_nc_u32(20, 20, 23));
+    w.push(s_add_i32(M0_REG, 0, 196)); // m0 = s0 - 4 -> {11, 7, 3, -1(OOB->0)}
+    w.push(s_add_i32(0, 0, 196)); // s0 -= 4
+    w.push(s_cmp_eq_u32(1, 128)); // s1 == 0
+    w.push(v_movrels(24, 4));
+    w.push(v_add_nc_u32(21, 21, 24));
+    let rel1 = (loop1 as isize - (w.len() as isize + 1)) as i16;
+    w.push(0xBF84_0000 | (rel1 as u16 as u32)); // s_cbranch_scc0 loop1
+
+    // Loop 2 (trampoline back-edge): s1 = 15, 11, 7, 3; exit when (s1 - 3) == 0.
+    w.push(s_mov_b32(1, 128 + 15));
+    w.push(0xBF82_0001); // s_branch +1 (skip trampoline)
+    let tramp2 = w.len();
+    w.push(s_add_i32(1, 1, 196)); // s1 -= 4
+    w.push(s_add_i32(M0_REG, 1, 194)); // m0 = s1 - 2 -> {13, 9, 5, 1}
+    w.push(s_add_i32(0, 1, 195)); // s0 = s1 - 3 -> {12, 8, 4, 0}
+    w.push(v_movrels(25, 4));
+    w.push(v_add_nc_u32(22, 22, 25));
+    w.push(s_cmp_eq_u32(0, 128)); // s0 == 0
+    let rel2 = (tramp2 as isize - (w.len() as isize + 1)) as i16;
+    w.push(0xBF84_0000 | (rel2 as u16 as u32)); // s_cbranch_scc0 tramp2
+
+    w.extend_from_slice(&buffer_store_dword(20, 8, 0));
+    w.extend_from_slice(&buffer_store_dword(21, 8, 4));
+    w.extend_from_slice(&buffer_store_dword(22, 8, 8));
+    w.push(S_ENDPGM);
+
+    let (shader, selects) = lower_m0_test_cs(&w, 64);
+    assert!(
+        selects <= 12,
+        "expected counted-loop M0 narrowing (<= 12 selects across 3 movrels), got {selects}"
+    );
+    let out = run_m0_test_cs(&shader, [0; 4], 3);
+    assert_eq!(out[0], 114 + 110 + 106 + 102, "loop 1 in-bounds sum");
+    assert_eq!(out[1], 111 + 107 + 103, "loop 1 OOB -1 iteration must yield 0");
+    assert_eq!(out[2], 113 + 109 + 105 + 101, "loop 2 trampoline sum");
+}
+
+#[test]
+fn m0_counted_loop_narrows_movreld_and_forwards_untouched_vgprs() {
+    // Ascending counted loop writing v[4..8] via v_movreld_b32 in a 48-VGPR
+    // shader while leaving v20 untouched.
+    const M0_REG: u8 = 124;
+    let s_add_i32 = |dst: u8, src0: u32, src1: u32| 0x8100_0000 | (u32::from(dst) << 16) | (src1 << 8) | src0;
+    let s_cmp_eq_u32 = |src0: u32, src1: u32| 0xBF06_0000 | (src1 << 8) | src0;
+    let v_mov_imm = |dst: u32, lit: u32| [0x7E00_02FF | (dst << 17), lit];
+    let v_movreld = |dst: u32, src: u32| 0x7E00_8500 | (dst << 17) | src;
+
+    let mut w: Vec<u32> = Vec::new();
+    w.push(s_mov_b32(5, 0x80));
+    w.extend_from_slice(&s_load_dwordx4(8, 4));
+    for k in 0..4u8 {
+        w.push(vop1(0x001, 4 + k, 0x80));
+    }
+    w.extend_from_slice(&v_mov_imm(2, 0x1111_2222));
+    w.extend_from_slice(&v_mov_imm(3, 0x3333_4444));
+    w.extend_from_slice(&v_mov_imm(20, 0xCAFE_BABE));
+    w.push(s_mov_b32(15, 128)); // s15 = 0
+    let head = w.len();
+    w.push(s_mov_b32(M0_REG, 15)); // m0 = s15 -> {0, 2}
+    w.push(v_movreld(4, 2));
+    w.push(s_add_i32(14, 15, 128 + 1)); // s14 = s15 + 1 -> {1, 3}
+    w.push(s_mov_b32(M0_REG, 14));
+    w.push(v_movreld(4, 3));
+    w.push(s_add_i32(15, 14, 128 + 1)); // s15 = s14 + 1 = s15 + 2
+    w.push(s_cmp_eq_u32(15, 128 + 4)); // s15 == 4
+    let rel = (head as isize - (w.len() as isize + 1)) as i16;
+    w.push(0xBF84_0000 | (rel as u16 as u32)); // s_cbranch_scc0 head
+
+    w.extend_from_slice(&buffer_store_dword(4, 8, 0));
+    w.extend_from_slice(&buffer_store_dword(5, 8, 4));
+    w.extend_from_slice(&buffer_store_dword(6, 8, 8));
+    w.extend_from_slice(&buffer_store_dword(7, 8, 12));
+    w.extend_from_slice(&buffer_store_dword(20, 8, 16));
+    w.push(S_ENDPGM);
+
+    let (shader, selects) = lower_m0_test_cs(&w, 48);
+    assert!(
+        selects <= 8,
+        "expected narrowed v_movreld_b32 writes (<= 8 selects across 48 VGPRs), got {selects}"
+    );
+    let out = run_m0_test_cs(&shader, [0; 4], 5);
+    assert_eq!(out[0], 0x1111_2222);
+    assert_eq!(out[1], 0x3333_4444);
+    assert_eq!(out[2], 0x1111_2222);
+    assert_eq!(out[3], 0x3333_4444);
+    assert_eq!(out[4], 0xCAFE_BABE, "untouched VGPR must be forwarded verbatim");
+}
+
+#[test]
+fn m0_constant_masked_and_unbounded_fallback() {
+    const M0_REG: u8 = 124;
+    let s_and_b32 = |dst: u8, src0: u32, src1: u32| 0x8700_0000 | (u32::from(dst) << 16) | (src1 << 8) | src0;
+    let v_mov_imm = |dst: u32, lit: u32| [0x7E00_02FF | (dst << 17), lit];
+    let v_movrels = |dst: u32, src: u32| 0x7E00_8700 | (dst << 17) | src;
+    let v_movreld = |dst: u32, src: u32| 0x7E00_8500 | (dst << 17) | src;
+
+    // 1. Constant M0 (0 selects) + masked dynamic M0 (s_and_b32 m0, s0, 3 -> <= 4 selects).
+    let mut w_bounded: Vec<u32> = Vec::new();
+    w_bounded.push(s_mov_b32(5, 0x80));
+    w_bounded.extend_from_slice(&s_load_dwordx4(8, 4));
+    for k in 0..8u32 {
+        w_bounded.extend_from_slice(&v_mov_imm(4 + k, 0xA000 + k));
+    }
+    w_bounded.extend_from_slice(&v_mov_imm(2, 0xDEAD_BEEF));
+    w_bounded.push(s_mov_b32(M0_REG, 128 + 2)); // constant m0 = 2
+    w_bounded.push(v_movreld(4, 2)); // v6 = 0xDEAD_BEEF (0 selects)
+    w_bounded.push(v_movrels(20, 4)); // v20 = v6 (0 selects)
+    w_bounded.push(s_and_b32(M0_REG, 0, 128 + 3)); // m0 = s0 & 3 -> {0,1,2,3}
+    w_bounded.push(v_movrels(21, 4));
+    w_bounded.extend_from_slice(&buffer_store_dword(20, 8, 0));
+    w_bounded.extend_from_slice(&buffer_store_dword(21, 8, 4));
+    w_bounded.push(S_ENDPGM);
+
+    let (sh_b, sel_b) = lower_m0_test_cs(&w_bounded, 48);
+    assert!(
+        sel_b <= 4,
+        "expected constant + masked M0 narrowing (<= 4 selects on 48 VGPRs), got {sel_b}"
+    );
+    let out_b0 = run_m0_test_cs(&sh_b, [2, 0, 0, 0], 2);
+    assert_eq!(out_b0, [0xDEAD_BEEF, 0xDEAD_BEEF]);
+    let out_b1 = run_m0_test_cs(&sh_b, [7, 0, 0, 0], 2);
+    assert_eq!(out_b1, [0xDEAD_BEEF, 0xA003]);
+
+    // 2. Unbounded dynamic M0 must fall back soundly to full VGPR scan.
+    let mut w_dyn: Vec<u32> = Vec::new();
+    w_dyn.push(s_mov_b32(5, 0x80));
+    w_dyn.extend_from_slice(&s_load_dwordx4(8, 4));
+    for k in 0..16u32 {
+        w_dyn.extend_from_slice(&v_mov_imm(4 + k, 0xB000 + k));
+    }
+    w_dyn.push(s_mov_b32(M0_REG, 0)); // dynamic runtime s0
+    w_dyn.push(v_movrels(22, 4));
+    w_dyn.extend_from_slice(&buffer_store_dword(22, 8, 0));
+    w_dyn.push(S_ENDPGM);
+
+    let (sh_d, _sel_d) = lower_m0_test_cs(&w_dyn, 24);
+    assert_eq!(run_m0_test_cs(&sh_d, [11, 0, 0, 0], 1)[0], 0xB00B);
+    assert_eq!(run_m0_test_cs(&sh_d, [99, 0, 0, 0], 1)[0], 0);
+}

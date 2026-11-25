@@ -661,6 +661,17 @@ pub(crate) struct PlacedFootprint {
 }
 
 impl PlacedFootprint {
+    /// Dimensions and DXGI format `(width, height, depth, format)`.
+    #[cfg(windows)]
+    pub(crate) fn dims(&self) -> (u64, u32, u32, i32) {
+        (
+            u64::from(self.width),
+            self.height,
+            self.depth.max(1),
+            self.format as i32,
+        )
+    }
+
     /// The bytes it spans in a buffer: every row pitched but the last.
     pub(crate) fn bytes(&self) -> Option<u64> {
         let (element, block) = element(self.format)?;

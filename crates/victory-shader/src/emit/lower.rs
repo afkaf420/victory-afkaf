@@ -324,6 +324,8 @@ struct Lower<'a> {
     abort: Option<usize>,
     /// Recognized whole-loop DXR 1.1 `RayQuery` lifting plan (`VICTORY_DXR_RAYQUERY=1`).
     rq_plan: rayquery::RayQueryPlan,
+    /// Lazy sound `M0` possible-value analyzer for narrowing `v_movrel*` muxes.
+    m0_index: Option<valu_lower::M0Index>,
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -1125,6 +1127,7 @@ impl<'a> Lower<'a> {
             counters: HashMap::new(),
             abort: None,
             rq_plan: rayquery::recognize(x),
+            m0_index: None,
         }
     }
 

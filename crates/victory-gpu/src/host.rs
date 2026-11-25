@@ -1348,6 +1348,9 @@ pub(crate) struct HostList {
     /// Whether this list recorded a shader pass writing through Stage M3 sparse
     /// GDDR6X window UAVs (triggers global UAV barriers between passes & at close).
     sparse_uma_wrote: std::sync::atomic::AtomicBool,
+    /// Number of high-level GPU commands recorded into this host list since reset
+    /// (used by `list.rs` to chunk giant lists below the 2.0 s WDDM TDR window).
+    ops: std::sync::atomic::AtomicU32,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -2404,6 +2407,17 @@ static LINE_LANDED: std::sync::Condvar = std::sync::Condvar::new();
 /// fetch sent with the count at N ran behind sends 1..N and ahead of every
 /// later one.
 static QUEUE_ORDER: Mutex<u64> = Mutex::new(0);
+
+/// Fence + value signalled on `Host::queue` by the most recent `relay_card_back`
+/// GPU readback copy (updated while holding `QUEUE_ORDER`). `async_upload_dirty`
+/// waits on this on `upload_queue` so async buffer uploads never overwrite a
+/// `Shadow::buffer` while an earlier relay fetch is still reading it.
+struct RelayFetchFence(ID3D12Fence, u64);
+
+// SAFETY: `ID3D12Fence` is free-threaded.
+unsafe impl Send for RelayFetchFence {}
+
+static LAST_RELAY_FETCH: Mutex<Option<RelayFetchFence>> = Mutex::new(None);
 
 /// Since the last frame-rate line, of the thread that lands flights
 /// ([`relay`]): landings, flights landed, microseconds it waited for the
@@ -3497,6 +3511,7 @@ impl Host {
                 indirect_args: Mutex::default(),
                 _alive: Counted::new(),
                 sparse_uma_wrote: std::sync::atomic::AtomicBool::new(false),
+                ops: std::sync::atomic::AtomicU32::new(0),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -3709,10 +3724,19 @@ impl Host {
                     if !copied_any {
                         return Ok(());
                     }
-                    // Order copy queue after any in-flight graphics submission that
-                    // may still be reading/writing these card buffers (GPU-only wait).
+                    // Order copy queue after any in-flight graphics submission and
+                    // relay readback fetch that may still be reading/writing these
+                    // card buffers (GPU-only wait, zero CPU stall).
                     if prev_graphics_fence > 0 {
                         upload_queue.Wait(&self.fence, prev_graphics_fence)?;
+                    }
+                    let relay_fetch = LAST_RELAY_FETCH
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .as_ref()
+                        .map(|f| (f.0.clone(), f.1));
+                    if let Some((fetch_fence, fetch_val)) = relay_fetch {
+                        upload_queue.Wait(&fetch_fence, fetch_val)?;
                     }
                     let cmd: ID3D12CommandList = slot.list.cast()?;
                     upload_queue.ExecuteCommandLists(&[Some(cmd)]);
@@ -4404,10 +4428,12 @@ impl Host {
                 // far are ahead of this fetch, every later one behind it.
                 let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
                 self.queue.ExecuteCommandLists(&lists);
+                self.queue.Signal(&fence, sent)?;
+                *LAST_RELAY_FETCH.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some(RelayFetchFence(fence.clone(), sent));
                 let after = *order;
                 drop(order);
                 self.card_sent();
-                self.queue.Signal(&fence, sent)?;
                 fence.SetEventOnCompletion(sent, event)?;
                 WaitForSingleObject(event, INFINITE);
                 Ok(after)
@@ -5519,6 +5545,17 @@ impl HostList {
         self.sparse_uma_wrote.load(Ordering::Relaxed)
     }
 
+    /// Increments and returns the count of high-level GPU commands recorded on
+    /// this host list since its last reset.
+    pub(crate) fn record_op(&self) -> u32 {
+        self.ops.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// Number of high-level GPU commands recorded on this host list since reset.
+    pub(crate) fn op_count(&self) -> u32 {
+        self.ops.load(Ordering::Relaxed)
+    }
+
     /// Emits a global UAV barrier (`pResource = NULL`) on `self.list` so all
     /// prior UAV writes across window-backed buffers finish before later reads
     /// or writes.
@@ -5565,6 +5602,7 @@ impl HostList {
         let started = std::time::Instant::now();
         self._alive.used();
         self.sparse_uma_wrote.store(false, Ordering::Relaxed);
+        self.ops.store(0, Ordering::Relaxed);
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();

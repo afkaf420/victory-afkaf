@@ -129,12 +129,15 @@ struct List {
     gate: Vec<ValueWait>,
 }
 
-/// One part of a title list cut at its waits: the waits the queue stands
-/// at, then the host list that runs once they are met.
+/// One part of a title list cut at its waits or split for WDDM TDR safety:
+/// the waits the queue stands at, then the host list that runs once they are met.
 #[cfg(windows)]
 struct Part {
     waits: Vec<ValueWait>,
     host: crate::host::HostList,
+    /// When true, `detach_parts` starts a new submission batch after this part
+    /// so giant lists execute across multiple `ExecuteCommandLists` packets.
+    split: bool,
 }
 const _: () = assert!(offset_of!(List, put) == 0x18);
 const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
@@ -312,6 +315,102 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
 /// its place in the part: a queue waiting for it starts later than on the
 /// console, never earlier, and nothing can wait for itself that way (a
 /// part has no wait after its first work).
+/// Resolves `VICTORY_LIST_CHUNK_OPS`: maximum high-level GPU ops recorded into
+/// a single host command list before cutting into an independent submission
+/// chunk to stay safely below Windows' 2.0 s WDDM TDR timeout (and DRED's
+/// ~49,152-command history cap). Defaults to `2048`; `"0"` disables chunking.
+#[cfg(windows)]
+fn resolve_list_chunk_ops(env: Option<&str>) -> u32 {
+    const DEFAULT_CHUNK_OPS: u32 = 2048;
+    match env.map(str::trim) {
+        Some("0") => 0,
+        Some(v) => v
+            .parse::<u32>()
+            .ok()
+            .map_or(DEFAULT_CHUNK_OPS, |n| if n == 0 { 0 } else { n.clamp(64, 65_536) }),
+        None => DEFAULT_CHUNK_OPS,
+    }
+}
+
+#[cfg(windows)]
+fn list_chunk_ops() -> u32 {
+    static LIMIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let env = std::env::var("VICTORY_LIST_CHUNK_OPS").ok();
+        resolve_list_chunk_ops(env.as_deref())
+    })
+}
+
+/// Whether `queue.rs` cuts lists (`VICTORY_WAIT_CUT != "0"`). TDR chunking
+/// reuses `list.earlier` / `detach_parts`, so it runs only when cutting is on.
+#[cfg(windows)]
+fn cuts_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAIT_CUT").is_none_or(|v| v != "0"))
+}
+
+/// Splits an oversized command list into independent submission chunks once it
+/// reaches `limit` high-level GPU ops, preventing multi-second single-list GPU
+/// bakes (e.g. 23,896-op BC3 texture compression passes) from triggering a
+/// Windows 2.0 s WDDM TDR (`DXGI_ERROR_DEVICE_HUNG`).
+///
+/// Outside active render passes (`!has_active_targets()`), cuts at `limit`
+/// (default 2,048 ops). Inside an active render pass, defers until render
+/// targets are cleared unless ops reach an emergency `4 * limit` ceiling.
+#[cfg(windows)]
+fn maybe_cut_for_tdr(this: This) {
+    let limit = list_chunk_ops();
+    if limit == 0 || !cuts_enabled() {
+        return;
+    }
+    maybe_cut_for_tdr_with_limit(this, limit);
+}
+
+#[cfg(windows)]
+fn maybe_cut_for_tdr_with_limit(this: This, limit: u32) {
+    if this.is_null() || limit == 0 {
+        return;
+    }
+    // SAFETY: the title passes one of our lists; a list is recorded by one
+    // thread at a time and is not submitted while it records.
+    let list = unsafe { &mut *this.cast_mut().cast::<List>() };
+    let Some(current) = list.host.as_ref() else {
+        return;
+    };
+    let ops = current.op_count();
+    if ops < limit {
+        return;
+    }
+    let mut state = list.state.lock().unwrap_or_else(|e| e.into_inner());
+    if state.has_active_targets() && ops < limit.saturating_mul(4) {
+        return;
+    }
+    let Some(fresh) = fresh_list() else {
+        return;
+    };
+    current.close();
+    static SPLITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if SPLITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+        tracing::info!(
+            parts = list.earlier.len() + 2,
+            ops,
+            limit,
+            "giant command list split into TDR-safe submission chunk"
+        );
+    }
+    if let Some(done) = list.host.replace(fresh) {
+        let waits = std::mem::take(&mut list.gate);
+        list.earlier.push(Part {
+            waits,
+            host: done,
+            split: true,
+        });
+    }
+    if let Some(host) = list.host.as_ref() {
+        state.replay(host);
+    }
+}
+
 #[cfg(windows)]
 fn cut(this: This, wait: ValueWait) {
     if this.is_null() {
@@ -342,7 +441,11 @@ fn cut(this: This, wait: ValueWait) {
     }
     if let Some(done) = list.host.replace(fresh) {
         let waits = std::mem::replace(&mut list.gate, vec![wait]);
-        list.earlier.push(Part { waits, host: done });
+        list.earlier.push(Part {
+            waits,
+            host: done,
+            split: false,
+        });
     }
     // What the title set so far, on the new host list.
     if let Some(host) = list.host.as_ref() {
@@ -421,11 +524,12 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
         let uploads = std::mem::take(&mut *list.uploads.lock().unwrap_or_else(|e| e.into_inner()));
         let state = std::mem::take(&mut *list.state.lock().unwrap_or_else(|e| e.into_inner()));
         let single = earlier.is_empty() && gate.is_empty();
-        let mut pieces: Vec<(Vec<ValueWait>, Detached)> = earlier
+        let mut pieces: Vec<(Vec<ValueWait>, bool, Detached)> = earlier
             .into_iter()
             .map(|part| {
                 (
                     part.waits,
+                    part.split,
                     Detached {
                         host: part.host,
                         _uploads: Vec::new(),
@@ -436,6 +540,7 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
             .collect();
         pieces.push((
             gate,
+            false,
             Detached {
                 host,
                 _uploads: uploads,
@@ -443,8 +548,12 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
             },
         ));
         let mut last = None;
-        for (waits, detached) in pieces {
-            if !waits.is_empty() {
+        let mut split_before = false;
+        for (waits, split_after, detached) in pieces {
+            if !waits.is_empty()
+                || split_before
+                || (split_after && parts.last().is_some_and(|(_, taken, _)| !taken.is_empty()))
+            {
                 parts.push((waits, Vec::new(), Vec::new()));
             }
             let entry = parts.len() - 1;
@@ -453,6 +562,7 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
             order.push(place);
             taken.push(detached);
             last = Some((entry, place));
+            split_before = split_after;
         }
         seen.push((this, if single { last } else { None }));
     }
@@ -879,8 +989,9 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             list.twin_use(dst, false, true);
             list.twin_use(src, false, false);
             // A destination made level by level gets its levels' memory
-            // ahead of this list (`crate::tiles`).
-            crate::texture::card_writes(list, dst, to, None);
+            // ahead of this list (`crate::tiles`). `CopyResource` overwrites
+            // every level completely, so upfront zero-fill copies are skipped.
+            crate::texture::card_writes(list, dst, to, None, true);
             ensure_state(list, dst, COPY_DEST);
             ensure_state(list, src, COPY_SOURCE);
             crate::texture::host_written(dst);
@@ -888,6 +999,8 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
             // SAFETY: an open list and live textures.
             unsafe { list.list.CopyResource(to, from) };
+            list.record_op();
+            maybe_cut_for_tdr(this);
         } else if let (Some((to, a)), Some((from, b))) = (
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
@@ -911,6 +1024,42 @@ pub(crate) struct CopyLocation {
     resource: This,
     kind: u32,
     footprint: crate::resource::PlacedFootprint,
+}
+
+/// Whether `dxgi_format` is a 4x4 block-compressed format (`BC1..BC7`).
+#[cfg(windows)]
+fn is_block_compressed(dxgi_format: i32) -> bool {
+    matches!(dxgi_format, 70..=84 | 94..=99)
+}
+
+/// Whether a `CopyTextureRegion` at `(0, 0, 0)` with no source box overwrites
+/// 100% of destination mip `dst_mip` (`dst_w x dst_h x dst_d`, `dst_format`),
+/// accounting for GPU block-compression passes that copy an uncompressed
+/// 64-bit/128-bit block texture (`ceil(w/4) x ceil(h/4)`) into a `BC*` mip.
+#[cfg(windows)]
+fn covers_full_subresource(
+    dst_w: u64,
+    dst_h: u32,
+    dst_d: u16,
+    dst_mips: u16,
+    dst_format: i32,
+    dst_sub: u32,
+    src_w: u64,
+    src_h: u32,
+    src_d: u32,
+    src_format: i32,
+) -> bool {
+    let mips = u32::from(dst_mips.max(1));
+    let mip = dst_sub % mips;
+    let mip_w = (dst_w >> mip).max(1);
+    let mip_h = u64::from((dst_h >> mip).max(1));
+    let mip_d = u32::from(dst_d.max(1));
+    let (req_w, req_h) = if is_block_compressed(dst_format) && !is_block_compressed(src_format) {
+        (mip_w.div_ceil(4), mip_h.div_ceil(4))
+    } else {
+        (mip_w, mip_h)
+    };
+    src_w >= req_w && u64::from(src_h) >= req_h && src_d >= mip_d
 }
 
 /// Texture to texture on the GPU; buffer to texture through an upload
@@ -977,6 +1126,7 @@ extern "system" fn copy_texture_region(
         }
         let mut from = src;
         let _upload; // keeps the source alive while this call records it
+        let src_dims;
         #[cfg(feature = "diagnostics")]
         let mut read = None;
         if src.kind == FOOTPRINT {
@@ -994,6 +1144,7 @@ extern "system" fn copy_texture_region(
             list.defer_fill(staging, data, bytes as usize);
             from.resource = buffer.as_raw().cast_const().cast();
             from.footprint.offset = 0;
+            src_dims = Some(src.footprint.dims());
             #[cfg(feature = "diagnostics")]
             {
                 // SAFETY: a live buffer.
@@ -1009,16 +1160,55 @@ extern "system" fn copy_texture_region(
                 crate::texture::upload(list, src.resource, texture);
             }
             ensure_state(list, src.resource, COPY_SOURCE);
+            // SAFETY: live host texture.
+            let sd = unsafe { texture.GetDesc() };
+            let smips = u32::from(sd.MipLevels.max(1));
+            let smip = (src.footprint.offset as u32) % smips;
+            let sw = (sd.Width >> smip).max(1);
+            let sh = (sd.Height >> smip).max(1);
+            let sdepth = if sd.Dimension.0 == 4 {
+                u32::from((sd.DepthOrArraySize >> smip).max(1))
+            } else {
+                1
+            };
+            src_dims = Some((sw, sh, sdepth, sd.Format.0));
             from.resource = texture.as_raw().cast_const().cast();
         }
         // A depth texture shaders also write: what they wrote, first (the
         // source above too).
         list.twin_use(dst.resource, false, true);
         // A destination made level by level gets the level's memory ahead
-        // of this list (`crate::tiles`): the title's bake copies each level
-        // of its result into a block-compressed texture of that kind, and
-        // a copy into a level without memory is dropped.
-        crate::texture::card_writes(list, dst.resource, to, Some(dst.footprint.offset as u32));
+        // of this list (`crate::tiles`): skip redundant upfront zero-fill
+        // staging copies when this copy immediately overwrites 100% of the
+        // destination subresource (e.g. GPU BC3/BC7 mip bake passes).
+        let dst_sub = dst.footprint.offset as u32;
+        let full_overwrite = dst.kind == 0
+            && source_box.is_null()
+            && x == 0
+            && y == 0
+            && z == 0
+            && src_dims.is_some_and(|(sw, sh, sd, sfmt)| {
+                // SAFETY: live destination texture.
+                let dd = unsafe { to.GetDesc() };
+                let ddepth = if dd.Dimension.0 == 4 {
+                    (dd.DepthOrArraySize >> (dst_sub % u32::from(dd.MipLevels.max(1)))).max(1)
+                } else {
+                    1
+                };
+                covers_full_subresource(
+                    dd.Width,
+                    dd.Height,
+                    ddepth,
+                    dd.MipLevels,
+                    dd.Format.0,
+                    dst_sub,
+                    sw,
+                    sh,
+                    sd,
+                    sfmt,
+                )
+            });
+        crate::texture::card_writes(list, dst.resource, to, Some(dst_sub), full_overwrite);
         ensure_state(list, dst.resource, COPY_DEST);
         crate::texture::host_written(dst.resource);
         let mut to_location = dst;
@@ -1030,13 +1220,15 @@ extern "system" fn copy_texture_region(
                 // SAFETY: a live texture; the box is the title's or null.
                 let (d, b) = unsafe { (to.GetDesc(), host_box.map(|b| *b)) };
                 format!(
-                    "copy to {:?} {}x{} f{} sub/kind {} at {x},{y},{z} from {:?} kind {} footprint {:?} box {b:?}",
+                    "copy to {:?} {}x{} f{} sub {} kind {} at {x},{y},{z} from {:?} sub {} kind {} footprint {:?} box {b:?}",
                     dst.resource,
                     d.Width,
                     d.Height,
                     d.Format.0,
+                    dst_sub,
                     dst.kind,
                     src.resource,
+                    src.footprint.offset as u32,
                     src.kind,
                     (src.kind == FOOTPRINT).then_some(src.footprint)
                 )
@@ -1060,6 +1252,8 @@ extern "system" fn copy_texture_region(
                 host_box,
             )
         };
+        list.record_op();
+        maybe_cut_for_tdr(this);
     }
     #[cfg(not(windows))]
     let _ = (this, dst, x, y, z, src, source_box);
@@ -1172,8 +1366,14 @@ extern "system" fn resolve(
         // Depth textures shaders also write: what they wrote, first.
         list.twin_use(dst, false, true);
         list.twin_use(src, false, false);
-        // As for a copy (`crate::tiles`).
-        crate::texture::card_writes(list, dst, to, Some(dst_sub));
+        // As for a copy (`crate::tiles`): skip upfront zero-fill when resolve
+        // covers the whole destination subresource.
+        // SAFETY: live textures.
+        let full_overwrite = unsafe {
+            let (a, b) = (to.GetDesc(), from.GetDesc());
+            a.Width <= b.Width && a.Height <= b.Height
+        };
+        crate::texture::card_writes(list, dst, to, Some(dst_sub), full_overwrite);
         ensure_state(list, dst, RESOLVE_DEST);
         ensure_state(list, src, RESOLVE_SOURCE);
         crate::texture::host_written(dst);
@@ -1606,10 +1806,12 @@ mod state {
         with_state(this, |list, s| {
             s.draw(list, vertices, instances, first, first_instance)
         });
+        super::maybe_cut_for_tdr(this);
     }
     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
         super::count_dispatch();
         with_state(this, |list, s| s.dispatch(list, x, y, z));
+        super::maybe_cut_for_tdr(this);
     }
     /// `DispatchMesh(x, y, z)` (the PC method of List6); the title's mesh
     /// programs take `x` groups only.
@@ -1620,6 +1822,7 @@ mod state {
             ONCE.call_once(|| tracing::warn!(x, y, z, "a mesh dispatch with y or z groups"));
         }
         with_state(this, |list, s| s.dispatch_mesh(list, x));
+        super::maybe_cut_for_tdr(this);
     }
     /// `DispatchMeshX(x, flags, indirect arguments, payload)`.
     /// shortcut: dispatches whose group count is in GPU memory (indirect)
@@ -1638,6 +1841,7 @@ mod state {
             return;
         }
         with_state(this, |list, s| s.dispatch_mesh(list, x));
+        super::maybe_cut_for_tdr(this);
     }
     pub(super) extern "system" fn draw_indexed(
         this: This,
@@ -1651,6 +1855,7 @@ mod state {
         with_state(this, |list, s| {
             s.draw_indexed(list, indices, instances, first, base, first_instance)
         });
+        super::maybe_cut_for_tdr(this);
     }
 }
 
@@ -1738,6 +1943,8 @@ extern "system" fn execute_indirect(
         ));
     }
     if ran {
+        #[cfg(windows)]
+        maybe_cut_for_tdr(this);
         return;
     }
     INDIRECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2046,7 +2253,11 @@ fn value_written(this: This, address: u64, value: u64) {
             // The part so far keeps its waits; nothing stands before the
             // next one but this part itself.
             let waits = std::mem::take(&mut list.gate);
-            list.earlier.push(Part { waits, host: done });
+            list.earlier.push(Part {
+                waits,
+                host: done,
+                split: false,
+            });
         }
         if let Some(host) = list.host.as_ref() {
             list.state
@@ -2262,5 +2473,79 @@ mod tests {
         for object in [buffer, list, allocator] {
             assert_eq!(release(object), 0);
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn tdr_chunk_config_and_full_subresource_coverage() {
+        assert_eq!(resolve_list_chunk_ops(None), 2048);
+        assert_eq!(resolve_list_chunk_ops(Some("0")), 0);
+        assert_eq!(resolve_list_chunk_ops(Some("4096")), 4096);
+        assert_eq!(resolve_list_chunk_ops(Some("16")), 64);
+
+        // BC3_UNORM_SRGB (f78) 1024x1024 (11 mips) filled from R32G32B32A32_UINT (f3):
+        // mip 0 (1024x1024) <- 256x256 blocks -> full overwrite.
+        assert!(covers_full_subresource(1024, 1024, 1, 11, 78, 0, 256, 256, 1, 3));
+        // mip 8 (4x4), mip 9 (2x2), mip 10 (1x1) <- 1x1 block -> full overwrite.
+        assert!(covers_full_subresource(1024, 1024, 1, 11, 78, 8, 1, 1, 1, 3));
+        assert!(covers_full_subresource(1024, 1024, 1, 11, 78, 9, 1, 1, 1, 3));
+        assert!(covers_full_subresource(1024, 1024, 1, 11, 78, 10, 1, 1, 1, 3));
+        // Undersized source (128x128 blocks into 1024x1024 mip 0) -> partial, must NOT skip zeroing.
+        assert!(!covers_full_subresource(1024, 1024, 1, 11, 78, 0, 128, 128, 1, 3));
+        // Uncompressed exact match vs undersized.
+        assert!(covers_full_subresource(512, 256, 1, 1, 28, 0, 512, 256, 1, 28));
+        assert!(!covers_full_subresource(512, 256, 1, 1, 28, 0, 256, 256, 1, 28));
+
+        // Verify card_writes_zero_mask skips full-overwritten standard mips,
+        // keeps sibling packed mips, and preserves partial overwrites.
+        assert_eq!(crate::texture::card_writes_zero_mask(0b0001, Some(0), true), 0);
+        assert_eq!(crate::texture::card_writes_zero_mask(0b1110, Some(1), true), 0b1100);
+        assert_eq!(crate::texture::card_writes_zero_mask(0b1111, None, true), 0);
+        assert_eq!(crate::texture::card_writes_zero_mask(0b0001, Some(0), false), 0b0001);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn tdr_chunk_split_produces_separate_submission_parts() {
+        if crate::host::host().is_none() {
+            return;
+        }
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let mut list = null;
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+            S_OK
+        );
+        // Simulate 5 ops with a chunk threshold of 2 -> should split into 3 independent parts
+        // (2 ops + 2 ops + 1 op) so each runs in its own ExecuteCommandLists submission.
+        for _ in 0..5 {
+            if let Some(hl) = host_list(list) {
+                hl.record_op();
+            }
+            maybe_cut_for_tdr_with_limit(list, 2);
+        }
+        assert!(cut_list(list), "giant list must report cut_list() == true");
+        close(list);
+        let parts = detach_parts(&[list]);
+        assert_eq!(
+            parts.len(),
+            3,
+            "expected 3 independent submission batches for 5 ops @ limit 2, got {}",
+            parts.len()
+        );
+        for (waits, taken, order) in parts {
+            assert!(waits.is_empty());
+            assert_eq!(taken.len(), 1);
+            assert_eq!(order, vec![0]);
+            recycle(taken, &order);
+        }
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
     }
 }

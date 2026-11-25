@@ -1,6 +1,8 @@
 //! VALU lowering helpers extracted from `lower.rs` to keep module size
 //! within the repository policy limit.
 
+use std::collections::BTreeSet;
+
 use super::*;
 
 impl<'a> Lower<'a> {
@@ -134,7 +136,10 @@ impl<'a> Lower<'a> {
                 // M0 indexes the source (movrels), the destination (movreld)
                 // or both, from the encoded register up to the program's
                 // VGPR count (the registers the instruction reads or writes).
-                let m0 = self.i32_of(inst.read(Reg::S(crate::ir::M0)).ok_or("M0")?)?;
+                // When sound static analysis bounds M0 to a small exact value
+                // set (constants, masks, or counted-loop IVs), emit only those
+                // indices instead of a full VGPR-file mux.
+                let m0_val = inst.read(Reg::S(crate::ir::M0)).ok_or("M0")?;
                 let (
                     Some(&Operand::Vector { reg: sreg, .. }),
                     Some(Operand::Vector { reg: dreg, .. }),
@@ -142,29 +147,103 @@ impl<'a> Lower<'a> {
                 else {
                     return Err("an M0-relative move");
                 };
+                let bounded = self
+                    .m0_index
+                    .get_or_insert_with(|| M0Index::new(self.x.p))
+                    .possible_values(self.x.p, m0_val);
                 let indexed_src = name != "v_movreld_b32";
-                let value = if indexed_src {
-                    let mut r = self.s.m.i32(0);
-                    for k in 0..=255u8.saturating_sub(sreg) {
-                        let Some(x) = inst.read(Reg::V(sreg + k)) else {
-                            break;
-                        };
-                        let x = self.i32_of(x)?;
-                        let kk = self.s.m.i32(u32::from(k));
-                        let is = self.s.m.cmp(c, pred::EQ, m0, kk);
-                        r = self.s.m.select(c, is, x, r);
+                let mut m0_dxil: Option<V> = None;
+                let mut get_m0 = |l: &mut Self| -> Result<V, Why> {
+                    if let Some(v) = m0_dxil {
+                        return Ok(v);
                     }
-                    r
+                    let v = l.i32_of(m0_val)?;
+                    m0_dxil = Some(v);
+                    Ok(v)
+                };
+                let value = if indexed_src {
+                    if let Some(ref set) = bounded {
+                        let mut in_bounds: Vec<(u8, Value)> = Vec::new();
+                        let mut has_oob = false;
+                        for &k in set {
+                            if let Some(r) = k
+                                .checked_add(u32::from(sreg))
+                                .filter(|&r| r < 256)
+                                && let Some(x) = inst.read(Reg::V(r as u8))
+                            {
+                                in_bounds.push((k as u8, x));
+                            } else {
+                                has_oob = true;
+                            }
+                        }
+                        if in_bounds.is_empty() {
+                            self.s.m.i32(0)
+                        } else if !has_oob && in_bounds.len() == 1 {
+                            self.i32_of(in_bounds[0].1)?
+                        } else {
+                            let m0 = get_m0(self)?;
+                            let (mut r, start) = if !has_oob {
+                                (self.i32_of(in_bounds[0].1)?, 1)
+                            } else {
+                                (self.s.m.i32(0), 0)
+                            };
+                            for &(k, x) in &in_bounds[start..] {
+                                let xv = self.i32_of(x)?;
+                                let kk = self.s.m.i32(u32::from(k));
+                                let is = self.s.m.cmp(c, pred::EQ, m0, kk);
+                                r = self.s.m.select(c, is, xv, r);
+                            }
+                            r
+                        }
+                    } else {
+                        let m0 = get_m0(self)?;
+                        let mut r = self.s.m.i32(0);
+                        for k in 0..=255u8.saturating_sub(sreg) {
+                            let Some(x) = inst.read(Reg::V(sreg + k)) else {
+                                break;
+                            };
+                            let x = self.i32_of(x)?;
+                            let kk = self.s.m.i32(u32::from(k));
+                            let is = self.s.m.cmp(c, pred::EQ, m0, kk);
+                            r = self.s.m.select(c, is, x, r);
+                        }
+                        r
+                    }
                 } else {
                     s(self, 0)?
                 };
                 if name == "v_movrels_b32" {
                     return int(self, value);
                 }
+                let singleton_dst = bounded.as_ref().and_then(|s| (s.len() == 1).then_some(s[0]));
                 for k in 0..=255u8.saturating_sub(dreg) {
-                    let Some(_) = inst.write(Reg::V(dreg + k)) else {
+                    let Some(new) = inst.write(Reg::V(dreg + k)) else {
                         break;
                     };
+                    if let Some(ref set) = bounded
+                        && set.binary_search(&u32::from(k)).is_err()
+                    {
+                        // Proven untouched: forward the previous SSA value
+                        // verbatim without emitting any select or bitcast.
+                        if let Some(o) = inst.read(Reg::V(dreg + k)) {
+                            if let Some(prev) = self.vals.get(&o).copied() {
+                                self.vals.insert(new, prev);
+                            } else {
+                                self.vals.insert(new, Val::I32(self.s.m.i32(0)));
+                            }
+                            if let Some(&fv) = self.floats.get(&o) {
+                                self.floats.insert(new, fv);
+                            }
+                        } else {
+                            self.vals.insert(new, Val::I32(self.s.m.i32(0)));
+                        }
+                        continue;
+                    }
+                    if singleton_dst == Some(u32::from(k)) {
+                        self.write_placed(inst, Reg::V(dreg + k), value, guard);
+                        continue;
+                    }
+                    let m0 = get_m0(self)?;
                     let old = match inst.read(Reg::V(dreg + k)) {
                         Some(o) => self.i32_of(o)?,
                         None => self.s.m.i32(0),
@@ -2315,5 +2394,693 @@ impl<'a> Lower<'a> {
                 .or_insert(Val::Missing("a lane mask read as data"));
         }
     }
+}
 
+/// Sound static value-set analysis for scalar `M0` values feeding
+/// `v_movrel*` instructions.
+///
+/// Computes a sorted, deduplicated superset of all `u32` values an SSA scalar
+/// can take (constants, bitwise masks, small-width bitfield extracts, acyclic
+/// joins, and single-back-edge counted loops whose latch is guarded by a
+/// 32-bit `s_cmp*` on an affine function of the induction variable). Returns
+/// `None` whenever the value set is dynamic, unbounded, or exceeds `MAX_SET`.
+pub(super) struct M0Index {
+    defs: HashMap<Value, M0Def>,
+    /// Immediate dominator per reachable block (`usize::MAX` for unreachable;
+    /// `idom[0] == 0`).
+    idom: Vec<usize>,
+    cache: HashMap<Value, Option<Vec<u32>>>,
+}
+
+#[derive(Clone, Copy)]
+enum M0Def {
+    Inst(usize, usize),
+    Phi(usize, usize),
+}
+
+const MAX_M0_SET: usize = 64;
+const MAX_M0_DEPTH: usize = 32;
+
+impl M0Index {
+    pub(super) fn new(p: &crate::ir::Program) -> Self {
+        let mut defs = HashMap::new();
+        for (b, blk) in p.blocks.iter().enumerate() {
+            for (i, phi) in blk.phis.iter().enumerate() {
+                defs.insert(phi.value, M0Def::Phi(b, i));
+            }
+            for (i, inst) in blk.insts.iter().enumerate() {
+                for &(_, w) in &inst.writes {
+                    defs.insert(w, M0Def::Inst(b, i));
+                }
+            }
+        }
+        let idom = compute_idom(p);
+        Self {
+            defs,
+            idom,
+            cache: HashMap::new(),
+        }
+    }
+
+    fn dominates(&self, a: usize, mut b: usize) -> bool {
+        if b >= self.idom.len() || self.idom[b] == usize::MAX {
+            return false;
+        }
+        loop {
+            if b == a {
+                return true;
+            }
+            let next = self.idom[b];
+            if next == b || next == usize::MAX {
+                return false;
+            }
+            b = next;
+        }
+    }
+
+    pub(super) fn possible_values(&mut self, p: &crate::ir::Program, val: Value) -> Option<Vec<u32>> {
+        let mut visiting = HashSet::new();
+        self.eval_val(p, val, 0, &mut visiting)
+    }
+
+    fn eval_val(
+        &mut self,
+        p: &crate::ir::Program,
+        val: Value,
+        depth: usize,
+        visiting: &mut HashSet<Value>,
+    ) -> Option<Vec<u32>> {
+        if let Some(hit) = self.cache.get(&val) {
+            return hit.clone();
+        }
+        if depth > MAX_M0_DEPTH || !visiting.insert(val) {
+            return None;
+        }
+        let result = match self.defs.get(&val).copied() {
+            Some(M0Def::Inst(b, i)) => self.eval_inst(p, b, i, val, depth, visiting),
+            Some(M0Def::Phi(b, i)) => self.eval_phi(p, b, i, val, depth, visiting),
+            None => None,
+        };
+        visiting.remove(&val);
+        // Only cache results computed outside an active cycle probe so a
+        // conservative cycle break never poisons a later independent query.
+        if visiting.is_empty() {
+            self.cache.insert(val, result.clone());
+        }
+        result
+    }
+
+    fn eval_operand(
+        &mut self,
+        p: &crate::ir::Program,
+        inst: &Inst,
+        op: &Operand,
+        depth: usize,
+        visiting: &mut HashSet<Value>,
+    ) -> Option<Vec<u32>> {
+        match *op {
+            Operand::Literal(x) => Some(vec![x]),
+            Operand::Const(254) => {
+                let v = inst.read(Reg::S(crate::ir::M0))?;
+                self.eval_val(p, v, depth + 1, visiting)
+            }
+            Operand::Const(c) => crate::resource::inline(c).map(|x| vec![x]),
+            Operand::Scalar { code, .. } if code == crate::gfx10::NULL => Some(vec![0]),
+            Operand::Scalar { code, .. } => {
+                let v = inst.read(Reg::S(code))?;
+                self.eval_val(p, v, depth + 1, visiting)
+            }
+            _ => None,
+        }
+    }
+
+    fn eval_inst(
+        &mut self,
+        p: &crate::ir::Program,
+        b: usize,
+        i: usize,
+        val: Value,
+        depth: usize,
+        visiting: &mut HashSet<Value>,
+    ) -> Option<Vec<u32>> {
+        let inst = &p.blocks[b].insts[i];
+        let Fields::Sop { dst, src, imm, .. } = &inst.fields else {
+            return None;
+        };
+        let Some(Operand::Scalar { code: dst_code, dwords: 1 }) = *dst else {
+            return None;
+        };
+        if inst.write(Reg::S(dst_code)) != Some(val) {
+            return None;
+        }
+        let name = inst.name();
+        match name {
+            "s_mov_b32" => self.eval_operand(p, inst, src.first()?, depth, visiting),
+            "s_movk_i32" => Some(vec![i32::from(imm.unwrap_or(0) as i16) as u32]),
+            "s_not_b32" => {
+                let a = self.eval_operand(p, inst, src.first()?, depth, visiting)?;
+                map_set(&a, |x| !x)
+            }
+            "s_add_i32" | "s_add_u32" => {
+                let a = self.eval_operand(p, inst, src.first()?, depth, visiting)?;
+                let b = self.eval_operand(p, inst, src.get(1)?, depth, visiting)?;
+                combine_sets(&a, &b, u32::wrapping_add)
+            }
+            "s_addk_i32" => {
+                let prev = inst.read(Reg::S(dst_code))?;
+                let a = self.eval_val(p, prev, depth + 1, visiting)?;
+                let k = i32::from(imm.unwrap_or(0) as i16) as u32;
+                map_set(&a, |x| x.wrapping_add(k))
+            }
+            "s_sub_i32" | "s_sub_u32" => {
+                let a = self.eval_operand(p, inst, src.first()?, depth, visiting)?;
+                let b = self.eval_operand(p, inst, src.get(1)?, depth, visiting)?;
+                combine_sets(&a, &b, u32::wrapping_sub)
+            }
+            "s_mul_i32" => {
+                let a = self.eval_operand(p, inst, src.first()?, depth, visiting)?;
+                let b = self.eval_operand(p, inst, src.get(1)?, depth, visiting)?;
+                combine_sets(&a, &b, u32::wrapping_mul)
+            }
+            "s_mulk_i32" => {
+                let prev = inst.read(Reg::S(dst_code))?;
+                let a = self.eval_val(p, prev, depth + 1, visiting)?;
+                let k = i32::from(imm.unwrap_or(0) as i16) as u32;
+                map_set(&a, |x| x.wrapping_mul(k))
+            }
+            "s_and_b32" => {
+                let a = self.eval_operand(p, inst, src.first()?, depth, visiting);
+                let b = self.eval_operand(p, inst, src.get(1)?, depth, visiting);
+                match (a, b) {
+                    (Some(a), Some(b)) => combine_sets(&a, &b, |x, y| x & y),
+                    (Some(m), None) | (None, Some(m)) if m.len() == 1 && m[0] < MAX_M0_SET as u32 => {
+                        let mask = m[0];
+                        Some((0..=mask).filter(|&k| (k & !mask) == 0).collect())
+                    }
+                    _ => None,
+                }
+            }
+            "s_or_b32" => {
+                let a = self.eval_operand(p, inst, src.first()?, depth, visiting)?;
+                let b = self.eval_operand(p, inst, src.get(1)?, depth, visiting)?;
+                combine_sets(&a, &b, |x, y| x | y)
+            }
+            "s_xor_b32" => {
+                let a = self.eval_operand(p, inst, src.first()?, depth, visiting)?;
+                let b = self.eval_operand(p, inst, src.get(1)?, depth, visiting)?;
+                combine_sets(&a, &b, |x, y| x ^ y)
+            }
+            "s_lshl_b32" => {
+                let a = self.eval_operand(p, inst, src.first()?, depth, visiting)?;
+                let b = self.eval_operand(p, inst, src.get(1)?, depth, visiting)?;
+                combine_sets(&a, &b, |x, y| x.wrapping_shl(y & 31))
+            }
+            "s_lshr_b32" => {
+                let a = self.eval_operand(p, inst, src.first()?, depth, visiting);
+                let b = self.eval_operand(p, inst, src.get(1)?, depth, visiting);
+                match (a, b) {
+                    (Some(a), Some(b)) => combine_sets(&a, &b, |x, y| x.wrapping_shr(y & 31)),
+                    (None, Some(sh)) if sh.len() == 1 && (sh[0] & 31) >= 26 => {
+                        let max = u32::MAX >> (sh[0] & 31);
+                        Some((0..=max).collect())
+                    }
+                    _ => None,
+                }
+            }
+            "s_ashr_i32" => {
+                let a = self.eval_operand(p, inst, src.first()?, depth, visiting)?;
+                let b = self.eval_operand(p, inst, src.get(1)?, depth, visiting)?;
+                combine_sets(&a, &b, |x, y| ((x as i32).wrapping_shr(y & 31)) as u32)
+            }
+            "s_lshl1_add_u32" | "s_lshl2_add_u32" | "s_lshl3_add_u32" | "s_lshl4_add_u32" => {
+                let sh = u32::from(name.as_bytes()[6] - b'0');
+                let a = self.eval_operand(p, inst, src.first()?, depth, visiting)?;
+                let b = self.eval_operand(p, inst, src.get(1)?, depth, visiting)?;
+                combine_sets(&a, &b, |x, y| x.wrapping_shl(sh).wrapping_add(y))
+            }
+            "s_bfe_u32" => {
+                let spec = self.eval_operand(p, inst, src.get(1)?, depth, visiting)?;
+                if spec.len() != 1 {
+                    return None;
+                }
+                let off = spec[0] & 31;
+                let width = (spec[0] >> 16) & 0x7f;
+                if let Some(a) = self.eval_operand(p, inst, src.first()?, depth, visiting) {
+                    map_set(&a, |x| {
+                        if width == 0 {
+                            0
+                        } else if width >= 32 {
+                            x.wrapping_shr(off)
+                        } else {
+                            x.wrapping_shr(off) & ((1u32 << width) - 1)
+                        }
+                    })
+                } else if width <= 6 {
+                    Some((0..(1u32 << width)).collect())
+                } else {
+                    None
+                }
+            }
+            "s_min_u32" => {
+                let a = self.eval_operand(p, inst, src.first()?, depth, visiting);
+                let b = self.eval_operand(p, inst, src.get(1)?, depth, visiting);
+                match (a, b) {
+                    (Some(a), Some(b)) => combine_sets(&a, &b, u32::min),
+                    (Some(c), None) | (None, Some(c)) if c.len() == 1 && c[0] < MAX_M0_SET as u32 => {
+                        Some((0..=c[0]).collect())
+                    }
+                    _ => None,
+                }
+            }
+            "s_max_u32" => {
+                let a = self.eval_operand(p, inst, src.first()?, depth, visiting)?;
+                let b = self.eval_operand(p, inst, src.get(1)?, depth, visiting)?;
+                combine_sets(&a, &b, u32::max)
+            }
+            "s_min_i32" => {
+                let a = self.eval_operand(p, inst, src.first()?, depth, visiting)?;
+                let b = self.eval_operand(p, inst, src.get(1)?, depth, visiting)?;
+                combine_sets(&a, &b, |x, y| (x as i32).min(y as i32) as u32)
+            }
+            "s_max_i32" => {
+                let a = self.eval_operand(p, inst, src.first()?, depth, visiting)?;
+                let b = self.eval_operand(p, inst, src.get(1)?, depth, visiting)?;
+                combine_sets(&a, &b, |x, y| (x as i32).max(y as i32) as u32)
+            }
+            "s_cselect_b32" => {
+                let a = self.eval_operand(p, inst, src.first()?, depth, visiting)?;
+                let b = self.eval_operand(p, inst, src.get(1)?, depth, visiting)?;
+                union_sets(&[a, b])
+            }
+            _ => None,
+        }
+    }
+
+    fn eval_phi(
+        &mut self,
+        p: &crate::ir::Program,
+        header: usize,
+        phi_idx: usize,
+        val: Value,
+        depth: usize,
+        visiting: &mut HashSet<Value>,
+    ) -> Option<Vec<u32>> {
+        let blk = &p.blocks[header];
+        let phi = &blk.phis[phi_idx];
+        let mut entries = Vec::new();
+        let mut backs = Vec::new();
+        for (&pred, &arg) in blk.preds.iter().zip(&phi.args) {
+            if self.dominates(header, pred) {
+                backs.push((pred, arg));
+            } else {
+                entries.push(arg);
+            }
+        }
+        if entries.is_empty() {
+            return None;
+        }
+        if backs.is_empty() {
+            let mut sets = Vec::with_capacity(entries.len());
+            for arg in entries {
+                sets.push(self.eval_val(p, arg, depth + 1, visiting)?);
+            }
+            return union_sets(&sets);
+        }
+        if backs.len() != 1 {
+            return None;
+        }
+        let (back_pred, next_val) = backs[0];
+        let mut init_sets = Vec::with_capacity(entries.len());
+        for arg in entries {
+            init_sets.push(self.eval_val(p, arg, depth + 1, visiting)?);
+        }
+        let init_vals = union_sets(&init_sets)?;
+        let step = self.as_affine_of(p, next_val, val, 0)?;
+        if step == 0 {
+            return None;
+        }
+        let (latch, back_is_taken) = self.back_edge_guard(p, header, back_pred)?;
+        let branch = p.blocks[latch].insts.last()?;
+        let take_on_scc = match branch.name() {
+            "s_cbranch_scc1" => true,
+            "s_cbranch_scc0" => false,
+            _ => return None,
+        };
+        let scc_val = branch.read(Reg::Scc)?;
+        let M0Def::Inst(cb, ci) = self.defs.get(&scc_val).copied()? else {
+            return None;
+        };
+        let cmp = &p.blocks[cb].insts[ci];
+        let Fields::Sop { src, imm, .. } = &cmp.fields else {
+            return None;
+        };
+        let cmp_name = cmp.name();
+        let cmp_op = cmp_name
+            .strip_prefix("s_cmp_")
+            .or_else(|| cmp_name.strip_prefix("s_cmpk_"))?;
+        if !(cmp_op.ends_with("_i32") || cmp_op.ends_with("_u32")) {
+            return None;
+        }
+        let (cmp_off, cmp_rhs, swapped) = if cmp_name.starts_with("s_cmpk_") {
+            let off = self.as_affine_op(p, cmp, src.first()?, val, 0)?;
+            let rhs = if cmp_op.ends_with("_i32") {
+                i32::from(imm.unwrap_or(0) as i16) as u32
+            } else {
+                u32::from(imm.unwrap_or(0))
+            };
+            (off, rhs, false)
+        } else {
+            let s0 = src.first()?;
+            let s1 = src.get(1)?;
+            if let (Some(off), Some(rhs)) = (
+                self.as_affine_op(p, cmp, s0, val, 0),
+                self.eval_const_op(p, cmp, s1, 0),
+            ) {
+                (off, rhs, false)
+            } else if let (Some(off), Some(rhs)) = (
+                self.as_affine_op(p, cmp, s1, val, 0),
+                self.eval_const_op(p, cmp, s0, 0),
+            ) {
+                (off, rhs, true)
+            } else {
+                return None;
+            }
+        };
+        let mut out = BTreeSet::new();
+        for start in init_vals {
+            let mut cur = start;
+            let mut iter_seen = HashSet::new();
+            for _ in 0..=MAX_M0_SET {
+                if !iter_seen.insert(cur) {
+                    return None;
+                }
+                out.insert(cur);
+                if out.len() > MAX_M0_SET {
+                    return None;
+                }
+                let lhs = cur.wrapping_add(cmp_off);
+                let (a, b) = if swapped { (cmp_rhs, lhs) } else { (lhs, cmp_rhs) };
+                let scc = eval_scalar_cmp(cmp_op, a, b)?;
+                let branch_taken = scc == take_on_scc;
+                let takes_back = branch_taken == back_is_taken;
+                if !takes_back {
+                    break;
+                }
+                cur = cur.wrapping_add(step);
+                if iter_seen.len() >= MAX_M0_SET {
+                    return None;
+                }
+            }
+        }
+        Some(out.into_iter().collect())
+    }
+
+    fn back_edge_guard(
+        &self,
+        p: &crate::ir::Program,
+        header: usize,
+        back_pred: usize,
+    ) -> Option<(usize, bool)> {
+        match p.blocks[back_pred].exit {
+            crate::ir::Exit::Branch { taken, not_taken } => {
+                if taken == header && not_taken != header {
+                    Some((back_pred, true))
+                } else if not_taken == header && taken != header {
+                    Some((back_pred, false))
+                } else {
+                    None
+                }
+            }
+            crate::ir::Exit::Jump(target)
+                if target == header
+                    && back_pred != header
+                    && p.blocks[back_pred].preds.len() == 1 =>
+            {
+                let latch = p.blocks[back_pred].preds[0];
+                if !self.dominates(header, latch) {
+                    return None;
+                }
+                match p.blocks[latch].exit {
+                    crate::ir::Exit::Branch { taken, not_taken } => {
+                        if taken == back_pred && not_taken != back_pred {
+                            Some((latch, true))
+                        } else if not_taken == back_pred && taken != back_pred {
+                            Some((latch, false))
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn eval_const_op(&self, p: &crate::ir::Program, inst: &Inst, op: &Operand, depth: usize) -> Option<u32> {
+        if depth > MAX_M0_DEPTH {
+            return None;
+        }
+        match *op {
+            Operand::Literal(x) => Some(x),
+            Operand::Const(254) => self.eval_const_val(p, inst.read(Reg::S(crate::ir::M0))?, depth + 1),
+            Operand::Const(c) => crate::resource::inline(c),
+            Operand::Scalar { code, .. } if code == crate::gfx10::NULL => Some(0),
+            Operand::Scalar { code, .. } => self.eval_const_val(p, inst.read(Reg::S(code))?, depth + 1),
+            _ => None,
+        }
+    }
+
+    fn eval_const_val(&self, p: &crate::ir::Program, val: Value, depth: usize) -> Option<u32> {
+        if depth > MAX_M0_DEPTH {
+            return None;
+        }
+        let M0Def::Inst(b, i) = self.defs.get(&val).copied()? else {
+            return None;
+        };
+        let inst = &p.blocks[b].insts[i];
+        let Fields::Sop { dst, src, imm, .. } = &inst.fields else {
+            return None;
+        };
+        let Some(Operand::Scalar { code: dst_code, dwords: 1 }) = *dst else {
+            return None;
+        };
+        if inst.write(Reg::S(dst_code)) != Some(val) {
+            return None;
+        }
+        match inst.name() {
+            "s_mov_b32" => self.eval_const_op(p, inst, src.first()?, depth + 1),
+            "s_movk_i32" => Some(i32::from(imm.unwrap_or(0) as i16) as u32),
+            "s_add_i32" | "s_add_u32" => Some(
+                self.eval_const_op(p, inst, src.first()?, depth + 1)?
+                    .wrapping_add(self.eval_const_op(p, inst, src.get(1)?, depth + 1)?),
+            ),
+            "s_addk_i32" => Some(
+                self.eval_const_val(p, inst.read(Reg::S(dst_code))?, depth + 1)?
+                    .wrapping_add(i32::from(imm.unwrap_or(0) as i16) as u32),
+            ),
+            "s_sub_i32" | "s_sub_u32" => Some(
+                self.eval_const_op(p, inst, src.first()?, depth + 1)?
+                    .wrapping_sub(self.eval_const_op(p, inst, src.get(1)?, depth + 1)?),
+            ),
+            _ => None,
+        }
+    }
+
+    fn as_affine_op(
+        &self,
+        p: &crate::ir::Program,
+        inst: &Inst,
+        op: &Operand,
+        base: Value,
+        depth: usize,
+    ) -> Option<u32> {
+        if depth > MAX_M0_DEPTH {
+            return None;
+        }
+        match *op {
+            Operand::Const(254) => {
+                self.as_affine_of(p, inst.read(Reg::S(crate::ir::M0))?, base, depth + 1)
+            }
+            Operand::Scalar { code, .. } if code != crate::gfx10::NULL => {
+                self.as_affine_of(p, inst.read(Reg::S(code))?, base, depth + 1)
+            }
+            _ => None,
+        }
+    }
+
+    /// Returns `Some(off)` when `val` is provably `base.wrapping_add(off)`
+    /// through pure 32-bit SOP moves/adds/subs (never crossing a PHI).
+    fn as_affine_of(
+        &self,
+        p: &crate::ir::Program,
+        val: Value,
+        base: Value,
+        depth: usize,
+    ) -> Option<u32> {
+        if val == base {
+            return Some(0);
+        }
+        if depth > MAX_M0_DEPTH {
+            return None;
+        }
+        let M0Def::Inst(b, i) = self.defs.get(&val).copied()? else {
+            return None;
+        };
+        let inst = &p.blocks[b].insts[i];
+        let Fields::Sop { dst, src, imm, .. } = &inst.fields else {
+            return None;
+        };
+        let Some(Operand::Scalar { code: dst_code, dwords: 1 }) = *dst else {
+            return None;
+        };
+        if inst.write(Reg::S(dst_code)) != Some(val) {
+            return None;
+        }
+        match inst.name() {
+            "s_mov_b32" => self.as_affine_op(p, inst, src.first()?, base, depth + 1),
+            "s_add_i32" | "s_add_u32" => {
+                let s0 = src.first()?;
+                let s1 = src.get(1)?;
+                if let (Some(off), Some(k)) = (
+                    self.as_affine_op(p, inst, s0, base, depth + 1),
+                    self.eval_const_op(p, inst, s1, depth + 1),
+                ) {
+                    Some(off.wrapping_add(k))
+                } else if let (Some(k), Some(off)) = (
+                    self.eval_const_op(p, inst, s0, depth + 1),
+                    self.as_affine_op(p, inst, s1, base, depth + 1),
+                ) {
+                    Some(off.wrapping_add(k))
+                } else {
+                    None
+                }
+            }
+            "s_addk_i32" => {
+                let off = self.as_affine_of(p, inst.read(Reg::S(dst_code))?, base, depth + 1)?;
+                Some(off.wrapping_add(i32::from(imm.unwrap_or(0) as i16) as u32))
+            }
+            "s_sub_i32" | "s_sub_u32" => {
+                let off = self.as_affine_op(p, inst, src.first()?, base, depth + 1)?;
+                let k = self.eval_const_op(p, inst, src.get(1)?, depth + 1)?;
+                Some(off.wrapping_sub(k))
+            }
+            _ => None,
+        }
+    }
+}
+
+fn eval_scalar_cmp(op: &str, a: u32, b: u32) -> Option<bool> {
+    let signed = op.ends_with("_i32");
+    Some(match &op[..2] {
+        "eq" => a == b,
+        "lg" => a != b,
+        "lt" if signed => (a as i32) < (b as i32),
+        "le" if signed => (a as i32) <= (b as i32),
+        "gt" if signed => (a as i32) > (b as i32),
+        "ge" if signed => (a as i32) >= (b as i32),
+        "lt" => a < b,
+        "le" => a <= b,
+        "gt" => a > b,
+        "ge" => a >= b,
+        _ => return None,
+    })
+}
+
+fn map_set(a: &[u32], f: impl Fn(u32) -> u32) -> Option<Vec<u32>> {
+    let mut out = BTreeSet::new();
+    for &x in a {
+        out.insert(f(x));
+        if out.len() > MAX_M0_SET {
+            return None;
+        }
+    }
+    Some(out.into_iter().collect())
+}
+
+fn combine_sets(a: &[u32], b: &[u32], f: impl Fn(u32, u32) -> u32) -> Option<Vec<u32>> {
+    let mut out = BTreeSet::new();
+    for &x in a {
+        for &y in b {
+            out.insert(f(x, y));
+            if out.len() > MAX_M0_SET {
+                return None;
+            }
+        }
+    }
+    Some(out.into_iter().collect())
+}
+
+fn union_sets(sets: &[Vec<u32>]) -> Option<Vec<u32>> {
+    let mut out = BTreeSet::new();
+    for s in sets {
+        for &x in s {
+            out.insert(x);
+            if out.len() > MAX_M0_SET {
+                return None;
+            }
+        }
+    }
+    Some(out.into_iter().collect())
+}
+
+/// Cooper-Harvey-Kennedy iterative dominator tree rooted at block 0.
+fn compute_idom(p: &crate::ir::Program) -> Vec<usize> {
+    let n = p.blocks.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut seen = vec![false; n];
+    let mut post = Vec::with_capacity(n);
+    fn dfs(p: &crate::ir::Program, b: usize, seen: &mut [bool], post: &mut Vec<usize>) {
+        if seen[b] {
+            return;
+        }
+        seen[b] = true;
+        for s in p.blocks[b].exit.successors() {
+            dfs(p, s, seen, post);
+        }
+        post.push(b);
+    }
+    dfs(p, 0, &mut seen, &mut post);
+    let mut rpo = post;
+    rpo.reverse();
+    let mut rpo_num = vec![usize::MAX; n];
+    for (idx, &b) in rpo.iter().enumerate() {
+        rpo_num[b] = idx;
+    }
+    let mut idom = vec![usize::MAX; n];
+    idom[0] = 0;
+    let intersect = |idom: &[usize], mut b1: usize, mut b2: usize| -> usize {
+        while b1 != b2 {
+            while rpo_num[b1] > rpo_num[b2] {
+                b1 = idom[b1];
+            }
+            while rpo_num[b2] > rpo_num[b1] {
+                b2 = idom[b2];
+            }
+        }
+        b1
+    };
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for &b in &rpo[1..] {
+            let mut new_idom = usize::MAX;
+            for &pred in &p.blocks[b].preds {
+                if idom[pred] != usize::MAX {
+                    new_idom = if new_idom == usize::MAX {
+                        pred
+                    } else {
+                        intersect(&idom, pred, new_idom)
+                    };
+                }
+            }
+            if new_idom != usize::MAX && idom[b] != new_idom {
+                idom[b] = new_idom;
+                changed = true;
+            }
+        }
+    }
+    idom
 }
