@@ -1058,21 +1058,27 @@ impl HostHeap {
         let enough = self.free.load(std::sync::atomic::Ordering::Relaxed) >= n
             && n < self.too_long.load(std::sync::atomic::Ordering::Relaxed);
         let n = n as usize;
-        // Search from `next` on, then from the start.
-        let starts = (*next as usize..self.dynamic as usize).chain(0..*next as usize);
+        // Search from `next` on, then from the start, extending past `cursor`
+        // by `n - 1` so contiguous free runs crossing `cursor` are not missed.
+        let cursor = *next as usize;
+        let end = self.dynamic as usize;
+        let second_end = cursor.saturating_add(n.saturating_sub(1)).min(end);
+        let starts = (cursor..end).chain(0..second_end);
         let mut run = 0;
         let mut found = None;
         let mut last = usize::MAX;
-        for at in starts.take(if enough { DYNAMIC as usize } else { 0 }) {
-            // A run cannot wrap past the end.
-            if at != last.wrapping_add(1) {
-                run = 0;
-            }
-            last = at;
-            run = if taken[at] { 0 } else { run + 1 };
-            if run == n {
-                found = Some(at + 1 - n);
-                break;
+        if enough {
+            for at in starts {
+                // A run cannot wrap past the end.
+                if at != last.wrapping_add(1) {
+                    run = 0;
+                }
+                last = at;
+                run = if taken[at] { 0 } else { run + 1 };
+                if run == n {
+                    found = Some(at + 1 - n);
+                    break;
+                }
             }
         }
         let Some(first) = found else {
@@ -3290,5 +3296,30 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    /// A contiguous free range that straddles the search cursor is found when
+    /// the rest of the dynamic range is full.
+    #[test]
+    fn dynamic_allocation_finds_contiguous_range_crossing_search_cursor() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        let p0 = heap.dynamic(10).unwrap();
+        let p1 = heap.dynamic(2).unwrap();
+        let p2 = heap.dynamic(2).unwrap();
+        let rest = heap.dynamic(heap.dynamic - 14).unwrap();
+        assert_eq!((p0, p1, p2, rest), (4, 14, 16, 18));
+        // Park the search cursor at dynamic offset 12 (between `p1` and `p2`)
+        // while keeping the entire dynamic range full.
+        heap.release(p1, 2);
+        assert_eq!(heap.dynamic(2), Some(p1));
+        assert_eq!(heap.dynamic(1), None);
+        // Free `[10..14)` straddling cursor 12: scanning only `12..end` then
+        // `0..12` (or truncating the wraparound chain to `DYNAMIC`) misses it.
+        heap.release(p1, 2);
+        heap.release(p2, 2);
+        assert_eq!(heap.dynamic(4), Some(p1));
+        assert_eq!(heap.dynamic(1), None);
     }
 }

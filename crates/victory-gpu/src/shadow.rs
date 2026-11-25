@@ -139,32 +139,54 @@ pub(crate) fn cards() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_BUFFERS").is_none_or(|v| v != "0"))
 }
 
+/// Resolves `VICTORY_CARD_BUFFERS_MB` (in bytes): honors an explicit override,
+/// otherwise defaults to 4,096 MiB on high-VRAM GPUs (>= 16 GiB dedicated VRAM)
+/// and 1,024 MiB on smaller GPUs.
+fn resolve_card_buffers_bytes(env: Option<&str>, high_vram: bool) -> u64 {
+    let default_mb = if high_vram { 4096 } else { 1024 };
+    env.and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default_mb) << 20
+}
+
 /// The smallest title buffer whose copy goes to the card's memory, and the
 /// most bytes of such copies (their "before" twins not counted: a copy
 /// shaders write takes its size twice), both in bytes:
-/// `VICTORY_CARD_BUFFERS_MIN_MB` (16) and `VICTORY_CARD_BUFFERS_MB` (512).
-/// Run 69's gameplay has ten title buffers of 16 MiB or more, 494 MB, and
-/// 1,650 MB of the card's budget free.
+/// `VICTORY_CARD_BUFFERS_MIN_MB` (default 1) and `VICTORY_CARD_BUFFERS_MB`
+/// (default 1024, or 4096 when host dedicated VRAM >= 16 GiB).
 fn card_limits() -> (u64, u64) {
     static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
     *LIMITS.get_or_init(|| {
-        let mb = |name: &str, default: u64| {
-            std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default) << 20
-        };
-        // From 1 MiB up and 1,024 MB in all by default (it was 16 and 512):
+        let min = std::env::var("VICTORY_CARD_BUFFERS_MIN_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(1)
+            << 20;
+        let max_env = std::env::var("VICTORY_CARD_BUFFERS_MB").ok();
+        let max = resolve_card_buffers_bytes(max_env.as_deref(), crate::host::high_vram());
+        // From 1 MiB up and 1,024 MB (or 4,096 MB on >= 16 GiB GPUs) by default:
         // the shader writes of the smaller buffers are then found by the
         // card's hashes too, and with that the first room's walls were
         // drawn in every run.
-        (mb("VICTORY_CARD_BUFFERS_MIN_MB", 1).max(1 << 20), mb("VICTORY_CARD_BUFFERS_MB", 1024))
+        (min.max(1 << 20), max)
     })
 }
 
 /// Bytes alive of copies' card sides, and of their "before" twins.
 static CARD_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
+/// Resolves `VICTORY_CARD_ROOM_FOR_BUFFERS`: honors explicit `"1"`/`"0"`
+/// overrides, otherwise defaults on for high-VRAM GPUs (>= 16 GiB dedicated
+/// VRAM) and off on smaller GPUs.
+fn resolve_card_room_kept(env: Option<&str>, high_vram: bool) -> bool {
+    match env.map(str::trim) {
+        Some(v) => v == "1",
+        None => high_vram,
+    }
+}
+
 /// Whether the texture queue leaves room on the card for the card copies
-/// of title buffers that are not made yet
-/// (`VICTORY_CARD_ROOM_FOR_BUFFERS=1`; off by default).
+/// of title buffers that are not made yet (`VICTORY_CARD_ROOM_FOR_BUFFERS`;
+/// defaults to on when host dedicated VRAM >= 16 GiB, off on smaller GPUs;
+/// explicit `0` or `1` always overrides).
 ///
 /// The copies are made in one burst when the world loads (run 189: 94 of
 /// its 95 within two seconds, right before the first world frame), and
@@ -183,7 +205,10 @@ static CARD_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// burst left of the limit (87 MB of 1,024 in run 189).
 fn card_room_kept_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_ROOM_FOR_BUFFERS").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| {
+        let env = std::env::var("VICTORY_CARD_ROOM_FOR_BUFFERS").ok();
+        resolve_card_room_kept(env.as_deref(), crate::host::high_vram())
+    })
 }
 
 /// The bytes of the card's memory the texture queue leaves free for card
@@ -265,8 +290,17 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
     buffer
 }
 
+/// Resolves `VICTORY_CARD_WINDOWS_MB` (in bytes): honors an explicit override
+/// (including `"0"` to disable), otherwise defaults to 4,096 MiB on high-VRAM
+/// GPUs (>= 16 GiB dedicated VRAM) and 0 on smaller GPUs.
+fn resolve_card_windows_bytes(env: Option<&str>, high_vram: bool) -> u64 {
+    let default_mb = if high_vram { 4096 } else { 0 };
+    env.and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default_mb) << 20
+}
+
 /// The most bytes of windows outside buffers whose copies go to the card's
-/// memory (`VICTORY_CARD_WINDOWS_MB`; 0, the default, none).
+/// memory (`VICTORY_CARD_WINDOWS_MB`; defaults to 4096 when host dedicated
+/// VRAM >= 16 GiB, or 0 on smaller GPUs; explicit override always wins).
 ///
 /// Windows are two thirds of the PC memory the card shares (run 104: 861
 /// windows, 3,552 MB of 5,400), and every draw that takes vertices, indices
@@ -286,7 +320,8 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
 fn window_card_most() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
-        std::env::var("VICTORY_CARD_WINDOWS_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0) << 20
+        let env = std::env::var("VICTORY_CARD_WINDOWS_MB").ok();
+        resolve_card_windows_bytes(env.as_deref(), crate::host::high_vram())
     })
 }
 
@@ -3653,6 +3688,32 @@ mod window_tests {
             assert!(start <= address && start + len >= end);
             assert!(start % g == 0 && len % g == 0);
         }
+    }
+
+    /// High-VRAM GPUs (>= 16 GiB) scale card buffer/window defaults up, while
+    /// explicit environment overrides always take precedence.
+    #[test]
+    fn high_vram_smart_defaults_respect_overrides() {
+        use super::{
+            resolve_card_buffers_bytes, resolve_card_room_kept, resolve_card_windows_bytes,
+        };
+        // Default < 16 GiB (12 GB card behavior preserved)
+        assert_eq!(resolve_card_buffers_bytes(None, false), 1024 << 20);
+        assert_eq!(resolve_card_windows_bytes(None, false), 0);
+        assert!(!resolve_card_room_kept(None, false));
+
+        // Default >= 16 GiB (24 GB GPU smart defaults)
+        assert_eq!(resolve_card_buffers_bytes(None, true), 4096 << 20);
+        assert_eq!(resolve_card_windows_bytes(None, true), 4096 << 20);
+        assert!(resolve_card_room_kept(None, true));
+
+        // Explicit overrides always win in both directions
+        assert_eq!(resolve_card_buffers_bytes(Some("2048"), true), 2048 << 20);
+        assert_eq!(resolve_card_buffers_bytes(Some(" 512 "), false), 512 << 20);
+        assert_eq!(resolve_card_windows_bytes(Some("0"), true), 0);
+        assert_eq!(resolve_card_windows_bytes(Some("1024"), false), 1024 << 20);
+        assert!(!resolve_card_room_kept(Some("0"), true));
+        assert!(resolve_card_room_kept(Some("1"), false));
     }
 }
 

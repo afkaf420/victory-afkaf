@@ -57,6 +57,33 @@ pub(crate) struct Host {
     /// The adapter the device is on, for its memory budget
     /// ([`Host::video_memory`]); `None` if the system does not name it.
     adapter: Option<IDXGIAdapter3>,
+    /// Dedicated video memory reported by the active adapter, in bytes.
+    dedicated_vram: u64,
+    /// Whether the active D3D12 device supports `D3D12_HEAP_TYPE_GPU_UPLOAD`
+    /// (Resizable BAR exposed via `D3D12_FEATURE_D3D12_OPTIONS16`).
+    gpu_upload_heap: bool,
+}
+
+/// Threshold (16 GiB) above which default card buffer/window budgets scale up
+/// for high-VRAM discrete GPUs (such as 24 GB cards) when the corresponding
+/// environment overrides are unset.
+pub(crate) const HIGH_VRAM_BYTES: u64 = 16 << 30;
+
+/// Dedicated VRAM of the active host adapter in bytes (0 if unavailable).
+pub(crate) fn dedicated_vram() -> u64 {
+    host().map_or(0, |h| h.dedicated_vram)
+}
+
+/// Whether the active host GPU has at least 16 GiB of dedicated VRAM.
+pub(crate) fn high_vram() -> bool {
+    dedicated_vram() >= HIGH_VRAM_BYTES
+}
+
+/// Whether the active host GPU supports `D3D12_HEAP_TYPE_GPU_UPLOAD`
+/// (`D3D12_FEATURE_D3D12_OPTIONS16::GPUUploadHeapSupported`).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn gpu_upload_heap_supported() -> bool {
+    host().is_some_and(|h| h.gpu_upload_heap)
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -590,18 +617,18 @@ fn create() -> windows::core::Result<Host> {
                 dred.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
             }
         }
-        let mut device: Option<ID3D12Device> = None;
         // Diagnostics: the software adapter, on which a shader's wild access
         // is an access violation in this process (a crash report with the
         // address and instruction) instead of a GPU fault and driver reset.
-        if cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_WARP").is_some() {
+        let device = if cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_WARP").is_some() {
+            let mut device: Option<ID3D12Device> = None;
             let adapter = warp_adapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
+            device.ok_or_else(windows::core::Error::empty)?
         } else {
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
-        }
-        let device = device.ok_or_else(windows::core::Error::empty)?;
+            create_hardware_device()?
+        };
         // `VICTORY_D3D12_BACKGROUND=0`: the runtime's background work (the
         // driver compiling shaders again on the "D3D Background Thread"s,
         // for minutes after pipelines were made or loaded) is switched off.
@@ -657,7 +684,49 @@ fn create() -> windows::core::Result<Host> {
         let adapter = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
             .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
             .ok();
-        tracing::info!("host D3D12 device ready");
+        let (adapter_name, dedicated_vram) = adapter
+            .as_ref()
+            .and_then(|a| a.GetDesc1().ok())
+            .map_or_else(
+                || ("unknown".to_owned(), 0u64),
+                |desc| {
+                    let end = desc
+                        .Description
+                        .iter()
+                        .position(|&c| c == 0)
+                        .unwrap_or(desc.Description.len());
+                    (
+                        String::from_utf16_lossy(&desc.Description[..end]),
+                        desc.DedicatedVideoMemory as u64,
+                    )
+                },
+            );
+        let budget = adapter
+            .as_ref()
+            .and_then(|a| {
+                let mut local = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+                a.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut local)
+                    .ok()
+                    .map(|()| local.Budget)
+            })
+            .unwrap_or(0);
+        let mut o16 = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
+        let gpu_upload_heap = device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS16,
+                (&raw mut o16).cast(),
+                size_of_val(&o16) as u32,
+            )
+            .is_ok()
+            && o16.GPUUploadHeapSupported.as_bool();
+        tracing::info!(
+            adapter = %adapter_name,
+            dedicated_mb = dedicated_vram >> 20,
+            budget_mb = budget >> 20,
+            gpu_upload_heap,
+            high_vram = dedicated_vram >= HIGH_VRAM_BYTES,
+            "host D3D12 device ready"
+        );
         Ok(Host {
             device,
             queue,
@@ -673,7 +742,43 @@ fn create() -> windows::core::Result<Host> {
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
             adapter,
+            dedicated_vram,
+            gpu_upload_heap,
         })
+    }
+}
+
+/// Creates a hardware D3D12 device on the highest-performance non-software
+/// DXGI adapter (`DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE`), falling back to
+/// the default adapter (`None`) if `IDXGIFactory6` or preference enumeration
+/// does not produce a usable hardware device.
+fn create_hardware_device() -> windows::core::Result<ID3D12Device> {
+    // SAFETY: plain DXGI/D3D12 adapter enumeration and device creation.
+    unsafe {
+        if let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory6>(DXGI_CREATE_FACTORY_FLAGS(0)) {
+            let mut index = 0u32;
+            while let Ok(adapter) = factory.EnumAdapterByGpuPreference::<IDXGIAdapter1>(
+                index,
+                DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+            ) {
+                index += 1;
+                let Ok(desc) = adapter.GetDesc1() else {
+                    continue;
+                };
+                if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
+                    continue;
+                }
+                let mut device: Option<ID3D12Device> = None;
+                if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).is_ok()
+                    && let Some(device) = device
+                {
+                    return Ok(device);
+                }
+            }
+        }
+        let mut device: Option<ID3D12Device> = None;
+        D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+        device.ok_or_else(windows::core::Error::empty)
     }
 }
 
@@ -760,6 +865,23 @@ mod tests {
         assert_eq!(
             warp_adapter().is_ok(),
             desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
+        );
+    }
+
+    #[test]
+    fn host_adapter_reports_vram_and_gpu_upload_heap() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let vram = dedicated_vram();
+        assert_eq!(vram, host.dedicated_vram);
+        assert_eq!(high_vram(), vram >= HIGH_VRAM_BYTES);
+        assert_eq!(gpu_upload_heap_supported(), host.gpu_upload_heap);
+        eprintln!(
+            "host adapter: dedicated_mb={}, high_vram={}, gpu_upload_heap={}",
+            vram >> 20,
+            high_vram(),
+            gpu_upload_heap_supported()
         );
     }
 }
@@ -3508,13 +3630,6 @@ impl Host {
                     }
                 }
                 relay_hand_back(&back);
-                // Only now, and flight by flight: a range another flight
-                // in the air declared too stays closed to refreshes.
-                for flight in &flights {
-                    for (shadow, ranges) in &flight.back {
-                        shadow.copy_back_done(ranges);
-                    }
-                }
                 COPY_BACK[0].fetch_add(landing.elapsed().as_micros() as u64, Ordering::Relaxed);
                 RELAY_STATS[0].fetch_add(1, Ordering::Relaxed);
                 RELAY_STATS[1].fetch_add(flights.len() as u64, Ordering::Relaxed);
@@ -3523,6 +3638,12 @@ impl Host {
         // In the order given: what tells the title the card is done.
         let mut last = 0;
         let mut landed = Vec::new();
+        // Collect each flight's back ranges before consuming `items` (without
+        // deduplicating across flights: `Shadow::copy_back_done` decrements
+        // `Flights` per flight!). Calling `copy_back_done` after `line.written`
+        // is updated and waiters are woken closes the race where a concurrent
+        // refresh could see a range as free while its merge was still in flight.
+        let mut backs: Vec<Declared> = Vec::new();
         for item in items {
             match item {
                 Late::Run(flight) => {
@@ -3534,6 +3655,7 @@ impl Host {
                         self.card_done(card);
                     }
                     landed.push((flight.lists, flight.order));
+                    backs.extend(flight.back);
                 }
                 Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
                 Late::Signal(fence, value) => crate::fence::set(fence as crate::object::This, value),
@@ -3577,6 +3699,11 @@ impl Host {
         }
         LINE_MOVED.notify_all();
         LINE_LANDED.notify_all();
+        // Only now, flight by flight: release declared ranges from `pending`,
+        // after `line.written` no longer names them and waiters have been woken.
+        for (shadow, ranges) in &backs {
+            shadow.copy_back_done(ranges);
+        }
     }
 
     /// After a submission ran, for copies in the card's memory: the pieces
@@ -5721,6 +5848,7 @@ const BUFFERS: u32 = 2;
 
 struct Presenter {
     swap_chain: IDXGISwapChain3,
+    tearing: bool,
     width: u32,
     height: u32,
     format: DXGI_FORMAT,
@@ -6117,7 +6245,9 @@ impl Host {
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let _ = p
+                .swap_chain
+                .Present(0, crate::dxgi::present_flags(p.tearing));
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
@@ -6140,6 +6270,8 @@ impl Host {
         // SAFETY: plain object creation for our window.
         unsafe {
             let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+            let tearing = crate::dxgi::host_supports_tearing(&factory);
+            let flags = crate::dxgi::swap_chain_flags(tearing);
             let desc = DXGI_SWAP_CHAIN_DESC1 {
                 Width: width,
                 Height: height,
@@ -6151,17 +6283,29 @@ impl Host {
                 BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
                 BufferCount: BUFFERS,
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
+                Flags: flags,
                 ..Default::default()
             };
             let swap_chain = factory
                 .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
                 .cast::<IDXGISwapChain3>()?;
+            if flags != 0 {
+                // `DXGI_PRESENT_ALLOW_TEARING` is invalid in exclusive fullscreen.
+                let _ = factory.MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
+            }
             let copy = self.new_list()?;
             copy.close();
-            tracing::info!(width, height, format = format.0, "presenting to a window");
+            tracing::info!(
+                width,
+                height,
+                format = format.0,
+                tearing = flags != 0,
+                "presenting to a window"
+            );
             self.log_video_memory("right after the swap chain is made");
             Ok(Presenter {
                 swap_chain,
+                tearing,
                 width,
                 height,
                 format,

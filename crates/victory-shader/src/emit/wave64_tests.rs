@@ -450,3 +450,95 @@ fn scc_of_a_mask_operation_joined_with_a_scalar_test_needs_the_skip_wave_wide() 
     }
     eprintln!("ran on the hardware device: the inner test's SCC for every lane once some lane is inside");
 }
+
+/// A 128-thread wave64 compute program with LDS and cross-half exchange: inside
+/// a per-lane branch (`wave_id != 0`), every arriving lane reads the same LDS
+/// dword at a uniform address, adds a scalar, and broadcasts via
+/// `v_readfirstlane_b32`. Proving uniform `ds_read` in `lane_uniform` lets the
+/// program lower cleanly for 32-lane host waves without widening or shortcuts.
+#[test]
+fn uniform_lds_read_in_divergent_branch_allows_first_lane_read_on_wave32() {
+    let words = [
+        0xD765_0007,
+        0x0001_00C1, // v_mbcnt_lo_u32_b32 v7, -1, 0 (forces exchange on wave32)
+        0x7E10_0200, // v_mov_b32 v8, s0
+        0x7E12_0280, // v_mov_b32 v9, 0
+        0xD834_0000,
+        0x0000_0809, // ds_write_b32 v9, v8
+        0xBF8A_0000, // s_barrier
+        0x2C0E_0086, // v_lshrrev_b32 v7, 6, v0
+        0xBE8C_047E, // s_mov_b64 s[12:13], exec
+        0x7DAA_0E80, // v_cmpx_ne_u32 exec, 0, v7
+        0xBF88_0008, // s_cbranch_execz +8 dwords (to restore exec)
+        0x7E10_0280, // v_mov_b32 v8, 0
+        0xD8D8_0000,
+        0x0800_0008, // ds_read_b32 v8, v8
+        0x4A10_1001, // v_add_nc_u32 v8, s1, v8
+        0x7E0E_0508, // v_readfirstlane_b32 s7, v8
+        0x7E00_0207, // v_mov_b32 v0, s7
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+    ];
+    let mut native = native_of(&words, true, 128);
+    native.io = StageIo::Cs(ComputeIo {
+        rsrc2: (5 << 1) | (1 << 15), // 5 user SGPRs + 512 B LDS
+        threads: [128, 1, 1],
+    });
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let shader = lowered(&native, &p, &HashSet::new()).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for (a, b) in [(0x1234u32, 0x5678u32), (0x100, 42)] {
+        let Some(got) = on_the_card(&shader, [a, b]) else { return };
+        assert_eq!(got, a.wrapping_add(b), "s0={a:#x}, s1={b:#x}");
+    }
+}
+
+/// Out-of-bounds LDS accesses follow RDNA2 semantics: reads return 0 and writes
+/// are dropped without clobbering dword 0 or faulting host shared memory.
+#[test]
+fn lds_oob_reads_zero_and_drops_writes() {
+    let words = [
+        0x7E10_0200, // v_mov_b32 v8, s0
+        0x7E12_0280, // v_mov_b32 v9, 0
+        0xD834_0000,
+        0x0000_0809, // ds_write_b32 v9, v8 (LDS[0] = s0)
+        0x7E14_0201, // v_mov_b32 v10, s1
+        0x7E16_02FF,
+        0xDEAD_BEEF, // v_mov_b32 v11, 0xDEADBEEF
+        0xD834_0000,
+        0x0000_0B0A, // ds_write_b32 v10, v11 (dropped if s1 >= 512)
+        0xD8D8_0000,
+        0x0C00_000A, // ds_read_b32 v12, v10 (0 if s1 >= 512)
+        0xD8D8_0000,
+        0x0D00_0009, // ds_read_b32 v13, v9 (must still be s0)
+        0x4A00_1B0C, // v_add_nc_u32 v0, v12, v13
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+    ];
+    let mut native = native_of(&words, false, 32);
+    native.io = StageIo::Cs(ComputeIo {
+        rsrc2: (5 << 1) | (1 << 15), // 5 user SGPRs + 512 B (128 dwords) LDS
+        threads: [32, 1, 1],
+    });
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let shader = lowered(&native, &p, &HashSet::new()).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let sentinel = 0x1234_5678u32;
+    for (byte_addr, expected) in [
+        (512u32, sentinel),
+        (0x1_0000, sentinel),
+        (4, sentinel.wrapping_add(0xDEAD_BEEF)),
+    ] {
+        let Some(got) = on_the_card(&shader, [sentinel, byte_addr]) else { return };
+        assert_eq!(got, expected, "byte_addr={byte_addr:#x}");
+    }
+}

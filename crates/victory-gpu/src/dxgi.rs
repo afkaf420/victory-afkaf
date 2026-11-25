@@ -208,6 +208,7 @@ static FACTORY_FUNCTIONS: Table<32> = {
 /// A display mode as the console lists it: size, refresh rate (numerator,
 /// denominator), format, scanline order, scaling, flags.
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct Mode {
     width: u32,
     height: u32,
@@ -240,10 +241,47 @@ fn display_size() -> (u32, u32) {
     })
 }
 
-/// The console's mode list: one 4K mode at 60 Hz (the title looks
-/// for a 120 Hz one to allow 120 Hz frame intervals).
-/// shortcut: fixed mode, not the host display's; report the host's rates if
-/// a title paces by them.
+/// Minimum and maximum display refresh rates accepted from `VICTORY_REFRESH_HZ`.
+const MIN_REFRESH_HZ: u32 = 30;
+const MAX_REFRESH_HZ: u32 = 480;
+
+/// Parses `VICTORY_REFRESH_HZ` into the list of refresh rates reported to the
+/// title. Unset or empty defaults to `[60, 120]` so titles that probe for a
+/// 120 Hz output mode can unlock 120 Hz frame intervals while preserving 60 Hz.
+fn parse_refresh_rates(raw: Option<&str>) -> Vec<u32> {
+    let mut rates = Vec::new();
+    if let Some(raw) = raw {
+        for part in raw.split(',') {
+            if let Ok(hz) = part.trim().parse::<u32>()
+                && (MIN_REFRESH_HZ..=MAX_REFRESH_HZ).contains(&hz)
+                && !rates.contains(&hz)
+            {
+                rates.push(hz);
+            }
+        }
+    }
+    if rates.is_empty() {
+        rates.extend_from_slice(&[60, 120]);
+    }
+    rates
+}
+
+/// The refresh rates reported by `IDXGIOutput::GetDisplayModeList`.
+/// Controlled by `VICTORY_REFRESH_HZ` (single rate such as `60` or `120`, or a
+/// comma-separated list such as `60,120,144`); defaults to `[60, 120]`.
+fn refresh_rates() -> &'static [u32] {
+    static RATES: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+    RATES.get_or_init(|| {
+        let raw = std::env::var("VICTORY_REFRESH_HZ").ok();
+        let rates = parse_refresh_rates(raw.as_deref());
+        tracing::info!(?rates, "display refresh rates reported to the title");
+        rates
+    })
+}
+
+/// The console's mode list: one mode per configured refresh rate (60 Hz and
+/// 120 Hz by default so titles that probe for 120 Hz can select 120 Hz frame
+/// intervals; override with `VICTORY_REFRESH_HZ`).
 extern "system" fn modes(
     _: This,
     _format: u32,
@@ -255,27 +293,93 @@ extern "system" fn modes(
     let Some(count) = (unsafe { count.as_mut() }) else {
         return E_INVALIDARG;
     };
+    let rates = refresh_rates();
+    let total = rates.len() as u32;
     if out.is_null() {
-        *count = 1;
+        *count = total;
         return S_OK;
     }
-    if *count < 1 {
+    if *count < total {
         return MORE_DATA;
     }
-    *count = 1;
+    *count = total;
     let (width, height) = display_size();
-    let mode = Mode {
-        width,
-        height,
-        refresh: [60, 1],
-        format: 0,
-        scanlines: 1, // progressive
-        scaling: 0,
-        flags: 0,
-    };
-    // SAFETY: checked non-null; room for `count` >= 1 modes.
-    unsafe { out.write(mode) };
+    for (i, &hz) in rates.iter().enumerate() {
+        let mode = Mode {
+            width,
+            height,
+            refresh: [hz, 1],
+            format: 0,
+            scanlines: 1, // progressive
+            scaling: 0,
+            flags: 0,
+        };
+        // SAFETY: checked non-null and `*count >= total > i`.
+        unsafe { out.add(i).write(mode) };
+    }
     S_OK
+}
+
+/// Queries whether the host DXGI factory supports variable-refresh tearing
+/// (`DXGI_FEATURE_PRESENT_ALLOW_TEARING`).
+#[cfg(windows)]
+pub fn host_supports_tearing(factory: &windows::Win32::Graphics::Dxgi::IDXGIFactory2) -> bool {
+    use windows::Win32::Graphics::Dxgi::{DXGI_FEATURE_PRESENT_ALLOW_TEARING, IDXGIFactory5};
+    use windows::core::Interface;
+
+    let Ok(factory5) = factory.cast::<IDXGIFactory5>() else {
+        return false;
+    };
+    let mut allow: u32 = 0;
+    // SAFETY: `allow` is a valid 4-byte out parameter matching `DXGI_FEATURE_PRESENT_ALLOW_TEARING`.
+    let hr = unsafe {
+        factory5.CheckFeatureSupport(
+            DXGI_FEATURE_PRESENT_ALLOW_TEARING,
+            (&raw mut allow).cast(),
+            size_of::<u32>() as u32,
+        )
+    };
+    hr.is_ok() && allow != 0
+}
+
+/// Swap-chain creation flags for flip-discard presentation given whether
+/// unlocked/VRR tearing is requested and supported by the host DXGI factory.
+#[cfg(windows)]
+pub fn swap_chain_flags_for(unlock_fps: bool, tearing_supported: bool) -> u32 {
+    use windows::Win32::Graphics::Dxgi::DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+    if unlock_fps && tearing_supported {
+        DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING.0 as u32
+    } else {
+        0
+    }
+}
+
+/// Swap-chain creation flags matching the active `VICTORY_UNLOCK_FPS` setting.
+#[cfg(windows)]
+pub fn swap_chain_flags(tearing_supported: bool) -> u32 {
+    swap_chain_flags_for(crate::frame::allow_tearing(), tearing_supported)
+}
+
+/// `IDXGISwapChain::Present(0, flags)` flags given whether unlocked/VRR
+/// tearing is requested and supported on the swap chain.
+#[cfg(windows)]
+pub fn present_flags_for(
+    unlock_fps: bool,
+    tearing_supported: bool,
+) -> windows::Win32::Graphics::Dxgi::DXGI_PRESENT {
+    use windows::Win32::Graphics::Dxgi::{DXGI_PRESENT, DXGI_PRESENT_ALLOW_TEARING};
+    if unlock_fps && tearing_supported {
+        DXGI_PRESENT_ALLOW_TEARING
+    } else {
+        DXGI_PRESENT(0)
+    }
+}
+
+/// `IDXGISwapChain::Present(0, flags)` flags matching the active
+/// `VICTORY_UNLOCK_FPS` setting.
+#[cfg(windows)]
+pub fn present_flags(tearing_supported: bool) -> windows::Win32::Graphics::Dxgi::DXGI_PRESENT {
+    present_flags_for(crate::frame::allow_tearing(), tearing_supported)
 }
 
 /// IUnknown 3, object 4, output 15 (12 as on PC, then 3 console ones).
@@ -337,5 +441,76 @@ mod tests {
         assert_eq!(outputs(adapter, 0, &mut output), S_OK);
         assert!(!output.is_null());
         assert_eq!(outputs(adapter, 1, &mut output), NOT_FOUND);
+    }
+
+    #[test]
+    fn parse_refresh_rates_handles_defaults_lists_and_bounds() {
+        assert_eq!(parse_refresh_rates(None), vec![60, 120]);
+        assert_eq!(parse_refresh_rates(Some("")), vec![60, 120]);
+        assert_eq!(parse_refresh_rates(Some("60")), vec![60]);
+        assert_eq!(parse_refresh_rates(Some("120")), vec![120]);
+        assert_eq!(parse_refresh_rates(Some("60, 120, 144, 120")), vec![60, 120, 144]);
+        assert_eq!(parse_refresh_rates(Some("0, 9999, nope")), vec![60, 120]);
+    }
+
+    #[test]
+    fn modes_expose_60_and_120_hz_by_default() {
+        type GetModes = extern "system" fn(This, u32, u32, *mut u32, *mut Mode) -> HRESULT;
+        let get_modes = slot::<GetModes>(&OUTPUT_OBJECT, 0xa8);
+
+        assert_eq!(get_modes(&OUTPUT_OBJECT, 0, 0, std::ptr::null_mut(), std::ptr::null_mut()), E_INVALIDARG);
+
+        let mut count = 0u32;
+        assert_eq!(get_modes(&OUTPUT_OBJECT, 0, 0, &mut count, std::ptr::null_mut()), S_OK);
+        let expected = refresh_rates();
+        assert_eq!(count as usize, expected.len());
+        assert!(expected.contains(&60));
+        assert!(expected.contains(&120));
+
+        if count > 1 {
+            let mut too_small = count - 1;
+            let mut one = std::mem::MaybeUninit::<Mode>::uninit();
+            assert_eq!(get_modes(&OUTPUT_OBJECT, 0, 0, &mut too_small, one.as_mut_ptr()), MORE_DATA);
+        }
+
+        let mut list = vec![
+            Mode {
+                width: 0,
+                height: 0,
+                refresh: [0, 0],
+                format: 0,
+                scanlines: 0,
+                scaling: 0,
+                flags: 0,
+            };
+            count as usize
+        ];
+        assert_eq!(get_modes(&OUTPUT_OBJECT, 0, 0, &mut count, list.as_mut_ptr()), S_OK);
+        let got_hz: Vec<u32> = list.iter().map(|m| m.refresh[0]).collect();
+        assert_eq!(got_hz, expected);
+        assert!(list.iter().all(|m| m.refresh[1] == 1 && m.scanlines == 1));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn tearing_flags_match_unlock_and_host_capability() {
+        use windows::Win32::Graphics::Dxgi::{
+            CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, DXGI_PRESENT,
+            DXGI_PRESENT_ALLOW_TEARING, DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING, IDXGIFactory2,
+        };
+        assert_eq!(swap_chain_flags_for(false, true), 0);
+        assert_eq!(swap_chain_flags_for(true, false), 0);
+        assert_eq!(
+            swap_chain_flags_for(true, true),
+            DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING.0 as u32
+        );
+        assert_eq!(present_flags_for(false, true), DXGI_PRESENT(0));
+        assert_eq!(present_flags_for(true, false), DXGI_PRESENT(0));
+        assert_eq!(present_flags_for(true, true), DXGI_PRESENT_ALLOW_TEARING);
+
+        // SAFETY: creating a read-only DXGI factory to probe feature support.
+        if let Ok(factory) = unsafe { CreateDXGIFactory2::<IDXGIFactory2>(DXGI_CREATE_FACTORY_FLAGS(0)) } {
+            let _supported = host_supports_tearing(&factory);
+        }
     }
 }

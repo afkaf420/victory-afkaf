@@ -24,6 +24,86 @@ const ORIGIN: u32 = 0;
 /// frame early).
 const TOKEN_ON_TIMEOUT: u32 = 2;
 const SIXTIETH: Duration = Duration::from_micros(16_667);
+const MIN_TARGET_FPS: u32 = 1;
+const MAX_TARGET_FPS: u32 = 1_000;
+
+/// Opt-in frame-pacing overrides controlled by `VICTORY_UNLOCK_FPS=1` and
+/// `VICTORY_TARGET_FPS=<N>` (1..=1000).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PacingConfig {
+    /// When true, enable VRR/tearing presentation (`DXGI_PRESENT_ALLOW_TEARING`
+    /// when supported by host DXGI) and bypass artificial console frame-interval
+    /// blocking unless `target_fps` requests an explicit cap.
+    pub unlock_fps: bool,
+    /// Optional host frame-rate cap (1..=1000 FPS). Overrides slower title
+    /// intervals such as 30 Hz (33,333 us) with `1_000_000_000 / fps` ns.
+    pub target_fps: Option<u32>,
+}
+
+impl PacingConfig {
+    /// Parses `VICTORY_UNLOCK_FPS` and `VICTORY_TARGET_FPS` values.
+    pub fn parse(unlock: Option<&str>, target: Option<&str>) -> Self {
+        let unlock_fps = unlock.is_some_and(|v| {
+            let t = v.trim();
+            t == "1" || t.eq_ignore_ascii_case("true")
+        });
+        let target_fps = target
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .filter(|&fps| (MIN_TARGET_FPS..=MAX_TARGET_FPS).contains(&fps));
+        Self {
+            unlock_fps,
+            target_fps,
+        }
+    }
+
+    /// True when frame waits should return immediately without sleeping on the
+    /// synthetic interval clock (fully uncapped / host-VRR paced).
+    pub const fn is_uncapped(self) -> bool {
+        self.unlock_fps && self.target_fps.is_none()
+    }
+
+    /// Target interval implied by `VICTORY_TARGET_FPS`, if set.
+    pub fn target_interval(self) -> Option<Duration> {
+        self.target_fps
+            .map(|fps| Duration::from_nanos(1_000_000_000 / u64::from(fps)))
+    }
+
+    /// Effective interval applied when the title calls `SetFrameIntervalX`.
+    pub fn effective_interval(self, requested: Duration) -> Duration {
+        match self.target_interval() {
+            Some(target) => requested.min(target),
+            None => requested,
+        }
+    }
+}
+
+fn config() -> PacingConfig {
+    static CONFIG: std::sync::OnceLock<PacingConfig> = std::sync::OnceLock::new();
+    *CONFIG.get_or_init(|| {
+        let unlock = std::env::var("VICTORY_UNLOCK_FPS").ok();
+        let target = std::env::var("VICTORY_TARGET_FPS").ok();
+        let cfg = PacingConfig::parse(unlock.as_deref(), target.as_deref());
+        if cfg.unlock_fps || cfg.target_fps.is_some() {
+            tracing::info!(
+                unlock_fps = cfg.unlock_fps,
+                target_fps = ?cfg.target_fps,
+                "frame pacing override active"
+            );
+        }
+        cfg
+    })
+}
+
+/// Whether `VICTORY_UNLOCK_FPS=1` is enabled (enables VRR/tearing presentation
+/// when supported by host DXGI).
+pub fn allow_tearing() -> bool {
+    config().unlock_fps
+}
+
+/// Configured `VICTORY_TARGET_FPS` cap, if any.
+pub fn target_fps() -> Option<u32> {
+    config().target_fps
+}
 
 struct Clock {
     start: Instant,
@@ -49,11 +129,18 @@ pub(crate) extern "system" fn set_interval(
     _period: u32,
     _flags: u32,
 ) -> HRESULT {
-    let interval = match length {
+    let requested = match length {
         0 => SIXTIETH,
         us => Duration::from_micros(u64::from(us)),
     };
-    tracing::info!(?interval, "frame interval");
+    let cfg = config();
+    let interval = cfg.effective_interval(requested);
+    tracing::info!(
+        ?requested,
+        ?interval,
+        uncapped = cfg.is_uncapped(),
+        "frame interval"
+    );
     // A new interval starts from now, after the last tick handed out.
     let first = LAST
         .iter()
@@ -95,11 +182,11 @@ fn last(kind: u32) -> &'static AtomicU64 {
 /// The next tick after now and after the last one a wait for `kind` ended
 /// on (an event happens once per tick: a wait woken a little early must not
 /// let the next one end on the same tick), and how long until it.
-fn next_tick(kind: u32) -> (u64, Duration) {
+fn next_tick(kind: u32, cfg: PacingConfig) -> (u64, Duration) {
     let mut clock = clock();
     let c = clock.get_or_insert_with(|| Clock {
         start: Instant::now(),
-        interval: SIXTIETH,
+        interval: cfg.effective_interval(SIXTIETH),
         first: 0,
     });
     let elapsed = c.start.elapsed().as_nanos();
@@ -111,6 +198,26 @@ fn next_tick(kind: u32) -> (u64, Duration) {
         tick,
         Duration::from_nanos(at.saturating_sub(elapsed) as u64),
     )
+}
+
+/// Sleeps for `dur`, yielding the final tail when pacing at high frame rates
+/// so coarse OS timer ticks do not drag a 120+ FPS cap down.
+fn sleep_for(dur: Duration, high_precision: bool) {
+    if dur.is_zero() {
+        return;
+    }
+    if !high_precision {
+        std::thread::sleep(dur);
+        return;
+    }
+    let deadline = Instant::now() + dur;
+    let tail = Duration::from_millis(2);
+    if dur > tail {
+        std::thread::sleep(dur - tail);
+    }
+    while Instant::now() < deadline {
+        std::thread::yield_now();
+    }
 }
 
 /// Device method: blocks until the next tick (or the time-out); an origin
@@ -125,36 +232,55 @@ pub(crate) extern "system" fn wait(
     flags: u32,
     token: *mut u64,
 ) -> HRESULT {
+    wait_with_config(config(), kind, timeout_ms, flags, token)
+}
+
+fn wait_with_config(
+    cfg: PacingConfig,
+    kind: u32,
+    timeout_ms: u32,
+    flags: u32,
+    token: *mut u64,
+) -> HRESULT {
     let origin = kind == ORIGIN;
-    let (mut tick, mut wait) = next_tick(kind);
-    let limit = Duration::from_millis(u64::from(timeout_ms));
-    // A blocking wait for an event that has happened since the last wait
-    // for it ended (a frame took longer than a tick) ends at once, on the
-    // tick that passed: sleeping on to the next one cost 17 ms of every
-    // 730 ms frame (run 58: "2.0 frame waits sleeping 16.8 ms"). Polls (a
-    // time-out shorter than a tick) answer as before.
-    // `VICTORY_LATE_WAITS=1` sleeps to the next tick, as before.
-    static SLEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*SLEEP.get_or_init(|| std::env::var_os("VICTORY_LATE_WAITS").is_some_and(|v| v == "1"))
-        && limit >= wait
-        && tick > last(kind).load(Ordering::Relaxed) + 1
-    {
-        tick -= 1;
-        wait = Duration::ZERO;
-    }
-    let hr = if wait > limit {
-        std::thread::sleep(limit);
-        TIMEOUT
+    let (hr, tick, wait) = if cfg.is_uncapped() {
+        // Unlocked / VRR mode: never artificially sleep on a console interval;
+        // advance the event tick immediately and let the host swap chain pace.
+        let tick = last(kind).fetch_add(1, Ordering::Relaxed) + 1;
+        (S_OK, tick, Duration::ZERO)
     } else {
-        std::thread::sleep(wait);
-        last(kind).fetch_max(tick, Ordering::Relaxed);
-        S_OK
+        let (mut tick, mut wait) = next_tick(kind, cfg);
+        let limit = Duration::from_millis(u64::from(timeout_ms));
+        // A blocking wait for an event that has happened since the last wait
+        // for it ended (a frame took longer than a tick) ends at once, on the
+        // tick that passed: sleeping on to the next one cost 17 ms of every
+        // 730 ms frame (run 58: "2.0 frame waits sleeping 16.8 ms"). Polls (a
+        // time-out shorter than a tick) answer as before.
+        // `VICTORY_LATE_WAITS=1` sleeps to the next tick, as before.
+        static SLEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*SLEEP.get_or_init(|| std::env::var_os("VICTORY_LATE_WAITS").is_some_and(|v| v == "1"))
+            && limit >= wait
+            && tick > last(kind).load(Ordering::Relaxed) + 1
+        {
+            tick -= 1;
+            wait = Duration::ZERO;
+        }
+        let high_precision = cfg.target_fps.is_some_and(|fps| fps >= 60);
+        let hr = if wait > limit {
+            sleep_for(limit, false);
+            TIMEOUT
+        } else {
+            sleep_for(wait, high_precision);
+            last(kind).fetch_max(tick, Ordering::Relaxed);
+            S_OK
+        };
+        (hr, tick, wait.min(limit))
     };
     #[cfg(all(windows, feature = "diagnostics"))]
     {
         use crate::copystat::{C, add};
         add(C::PaceWaits, 1);
-        add(C::PaceUs, wait.min(limit).as_micros() as u64);
+        add(C::PaceUs, wait.as_micros() as u64);
     }
     // A frame begun on a time-out takes no tick: its flip still does.
     if origin && (hr == S_OK || flags & TOKEN_ON_TIMEOUT != 0) {
@@ -176,6 +302,7 @@ pub(crate) extern "system" fn wait(
         frame = current(),
         "frame wait"
     );
+    let _ = (tick, wait);
     hr
 }
 
@@ -198,8 +325,77 @@ pub(crate) extern "system" fn statistics(
 mod tests {
     use super::*;
 
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn pacing_config_parses_unlock_and_target_fps() {
+        let default = PacingConfig::parse(None, None);
+        assert!(!default.unlock_fps);
+        assert_eq!(default.target_fps, None);
+        assert!(!default.is_uncapped());
+        assert_eq!(
+            default.effective_interval(Duration::from_micros(33_333)),
+            Duration::from_micros(33_333)
+        );
+
+        let uncapped = PacingConfig::parse(Some("1"), None);
+        assert!(uncapped.unlock_fps);
+        assert_eq!(uncapped.target_fps, None);
+        assert!(uncapped.is_uncapped());
+
+        let capped = PacingConfig::parse(Some("true"), Some("120"));
+        assert!(capped.unlock_fps);
+        assert_eq!(capped.target_fps, Some(120));
+        assert!(!capped.is_uncapped());
+        assert_eq!(
+            capped.effective_interval(Duration::from_micros(33_333)),
+            Duration::from_nanos(1_000_000_000 / 120)
+        );
+        // Never slows down a faster requested interval.
+        assert_eq!(
+            capped.effective_interval(Duration::from_micros(4_000)),
+            Duration::from_micros(4_000)
+        );
+
+        let invalid = PacingConfig::parse(Some("0"), Some("5000"));
+        assert!(!invalid.unlock_fps);
+        assert_eq!(invalid.target_fps, None);
+    }
+
+    #[test]
+    fn unlocked_wait_returns_immediately_without_30hz_blocking() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let null = std::ptr::null();
+        assert_eq!(set_interval(null, null, 33_333, 3, 0), S_OK);
+        let uncapped = PacingConfig {
+            unlock_fps: true,
+            target_fps: None,
+        };
+        const FLIP: u32 = 2;
+        let before = Instant::now();
+        let mut prev_token = 0u64;
+        for i in 0..8 {
+            let mut token = 0u64;
+            assert_eq!(
+                wait_with_config(uncapped, ORIGIN, 0, TOKEN_ON_TIMEOUT, &mut token),
+                S_OK
+            );
+            if i > 0 {
+                assert_eq!(token, prev_token + 1);
+            }
+            prev_token = token;
+            assert_eq!(
+                wait_with_config(uncapped, FLIP, u32::MAX, 0, &mut token),
+                S_OK
+            );
+        }
+        // Eight 30 Hz frames would take ~266 ms if blocked; uncapped is instant.
+        assert!(before.elapsed() < Duration::from_millis(50));
+    }
+
     #[test]
     fn waits_end_on_ticks_and_count_frames() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let null = std::ptr::null();
         assert_eq!(set_interval(null, null, 2_000, 1, 0), S_OK);
         let mut first = 0;
@@ -240,7 +436,7 @@ mod tests {
             .collect();
         assert!(flips.windows(2).all(|w| w[1] == w[0] + 1), "{flips:?}");
         // Even when a flip wait begins on the tick another just ended on.
-        let (tick, _) = next_tick(FLIP);
+        let (tick, _) = next_tick(FLIP, config());
         assert!(tick > flips[3]);
     }
 }

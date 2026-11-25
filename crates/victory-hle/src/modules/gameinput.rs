@@ -59,7 +59,8 @@ const DEVICES: usize = PADS + 2;
 
 /// Readings kept per device for next/previous lookups.
 const HISTORY: usize = 256;
-const POLL: Duration = Duration::from_millis(8);
+/// 500 Hz polling keeps input fresh on 120+ FPS frames without double-sampling.
+const POLL: Duration = Duration::from_millis(2);
 
 /// The keyboard's stand-in gamepad (virtual key, button); README lists it.
 /// Sticks: W/A/S/D left, I/J/K/L right; triggers Z and C.
