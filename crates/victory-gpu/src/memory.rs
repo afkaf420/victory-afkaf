@@ -87,8 +87,12 @@ static MEMORY: Mutex<Option<Memory>> = Mutex::new(None);
 pub(crate) struct Ready {
     pub(crate) directory: u64,
     pub(crate) faults: u64,
-    /// The view heap slot of the null view; copy `n`'s view is `n` further.
+    /// The view heap slot of the null view; copy `n`'s view is `n` further
+    /// (or under `VICTORY_SPARSE_UMA=1`: `SPARSE_BASE`, with `+1..=12` holding
+    /// the twelve 2 GiB reserved window UAVs).
     pub(crate) base: u32,
+    /// High 32 bits of the 24 GiB sparse UMA VA aperture (0 in legacy mode).
+    pub(crate) aperture_hi: u32,
 }
 
 impl Memory {
@@ -246,6 +250,19 @@ pub(crate) fn ready(
     constants: &[u32],
     writes: bool,
 ) -> Option<Ready> {
+    if crate::sparse_uma::active() {
+        let base = heap.ensure_sparse_views()?;
+        let aperture_hi = crate::sparse_uma::aperture_hi();
+        if writes {
+            list.mark_sparse_uma_write();
+        }
+        return Some(Ready {
+            directory: 0,
+            faults: 0,
+            base,
+            aperture_hi,
+        });
+    }
     let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
     if guard.is_none() {
         *guard = Memory::new();
@@ -315,5 +332,6 @@ pub(crate) fn ready(
         directory: m.directory.2,
         faults: m.faults.2,
         base,
+        aperture_hi: 0,
     })
 }

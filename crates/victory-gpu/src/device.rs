@@ -208,6 +208,10 @@ pub extern "system" fn configure_virtual_memory(config: *mut VirtualMemory) -> H
         preserved_bytes = config.preserved_bytes,
         "graphics virtual memory"
     );
+    #[cfg(windows)]
+    if crate::sparse_uma::active() {
+        let _ = crate::sparse_uma::ensure_aperture();
+    }
     (config.lowest, config.highest) = user_space();
     S_OK
 }

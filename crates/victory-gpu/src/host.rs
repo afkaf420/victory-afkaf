@@ -496,6 +496,7 @@ fn sweep() {
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
     crate::resource::let_go_idle();
+    crate::sparse_uma::sweep();
 }
 
 /// Drops `object` once every submission running now has finished: at once
@@ -1316,6 +1317,9 @@ pub(crate) struct HostList {
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
+    /// Whether this list recorded a shader pass writing through Stage M3 sparse
+    /// GDDR6X window UAVs (triggers global UAV barriers between passes & at close).
+    sparse_uma_wrote: std::sync::atomic::AtomicBool,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -2249,7 +2253,8 @@ pub(crate) fn late() -> bool {
 fn late_stage() -> u8 {
     static STAGE: OnceLock<u8> = OnceLock::new();
     *STAGE.get_or_init(|| {
-        if std::env::var_os("VICTORY_GPU_TIMING").is_some() {
+        #[cfg(feature = "diagnostics")]
+        if timing() {
             return 0;
         }
         match std::env::var("VICTORY_LATE_WAIT").as_deref() {
@@ -3463,6 +3468,7 @@ impl Host {
                 budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
                 _alive: Counted::new(),
+                sparse_uma_wrote: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -3803,6 +3809,167 @@ impl Host {
             };
             ring.slots.push(slot);
             res.ok()
+        })?
+    }
+
+    /// Next fence value expected on `upload_queue` (for lock-free deferred COM
+    /// `Release` ordering in `sparse_uma`).
+    pub(crate) fn next_upload_fence_hint(&self) -> u64 {
+        self.upload_value.load(Ordering::Acquire).saturating_add(1)
+    }
+
+    /// Last completed value on `upload_fence` (`u64::MAX` when no copy queue exists).
+    pub(crate) fn upload_completed_value(&self) -> u64 {
+        self.upload_fence
+            .as_ref()
+            // SAFETY: plain fence query.
+            .map_or(u64::MAX, |f| unsafe { f.GetCompletedValue() })
+    }
+
+    /// Runs `prepare` on `upload_queue` (performing batched `UpdateTileMappings`
+    /// and collecting Stage M2 64-byte diff chunks for Stage M3 sparse windows),
+    /// uploads all dirty chunks through the write-only `UploadRing` (splitting
+    /// bursts automatically if they exceed half the ring), signals
+    /// `upload_fence`, and orders `self.queue` via GPU-only `Queue::Wait`
+    /// (zero CPU wait).
+    pub(crate) fn async_upload_sparse(
+        &self,
+        prev_graphics_fence: u64,
+        windows: &[ID3D12Resource; crate::sparse_uma::WINDOW_COUNT],
+        prepare: impl FnOnce(&ID3D12Device, &ID3D12CommandQueue) -> (bool, Vec<crate::sparse_uma::UploadChunk>),
+    ) -> Option<u64> {
+        let (upload_queue, upload_fence) = (self.upload_queue.as_ref()?, self.upload_fence.as_ref()?);
+        if prev_graphics_fence > 0 {
+            // Order any `UpdateTileMappings(NULL)` eviction and buffer copies
+            // after in-flight graphics submissions on the GPU (zero CPU wait).
+            // SAFETY: live queues and fence.
+            let _ = unsafe { upload_queue.Wait(&self.fence, prev_graphics_fence) };
+        }
+        let (tile_ops, chunks) = prepare(&self.device, upload_queue);
+        if !tile_ops && chunks.is_empty() {
+            return None;
+        }
+        if chunks.is_empty() {
+            // Pure tile map/unmap with zero dirty bytes: still signal & wait on GPU.
+            let val = self.upload_value.fetch_add(1, Ordering::AcqRel) + 1;
+            // SAFETY: live queues and fence.
+            let ok = unsafe {
+                upload_queue
+                    .Signal(upload_fence, val)
+                    .and_then(|()| self.queue.Wait(upload_fence, val))
+                    .is_ok()
+            };
+            return ok.then_some(val);
+        }
+        self.with_upload_ring(|ring| -> Option<u64> {
+            let mut idx = 0usize;
+            let mut last_val: Option<u64> = None;
+            while idx < chunks.len() {
+                let mut slot = ring
+                    .take_slot(&self.device, upload_fence, self.upload_event)
+                    .ok()?;
+                let mut spans: Vec<(u64, u64)> = Vec::new();
+                let mut keep: Vec<KeptResource> = Vec::new();
+                let mut kept_win = [false; crate::sparse_uma::WINDOW_COUNT];
+                let mut batch_used: u64 = 0;
+                let mut copied_any = false;
+                // SAFETY: idle COPY command slot, live reserved window buffers & ring.
+                let res = unsafe {
+                    (|| -> windows::core::Result<Option<u64>> {
+                        slot.allocator.Reset()?;
+                        slot.list.Reset(&slot.allocator, None)?;
+                        while idx < chunks.len() {
+                            let c = &chunks[idx];
+                            if c.data.is_empty() {
+                                idx += 1;
+                                continue;
+                            }
+                            let len = c.data.len() as u64;
+                            let Some((off, end)) = ring.stage_write(
+                                len,
+                                64,
+                                &mut batch_used,
+                                upload_fence,
+                                self.upload_event,
+                                |dst| {
+                                    std::ptr::copy_nonoverlapping(c.data.as_ptr(), dst, c.data.len());
+                                },
+                            ) else {
+                                // Current batch reached half the ring: flush and continue in next batch.
+                                if copied_any {
+                                    break;
+                                }
+                                // Single chunk unexpectedly larger than half ring: skip to avoid infinite loop.
+                                idx += 1;
+                                continue;
+                            };
+                            slot.list.CopyBufferRegion(
+                                &windows[c.window],
+                                c.offset,
+                                &ring.buffer,
+                                off,
+                                len,
+                            );
+                            if !kept_win[c.window] {
+                                kept_win[c.window] = true;
+                                keep.push(KeptResource(windows[c.window].clone()));
+                            }
+                            match spans.last_mut() {
+                                Some(last) if off == last.1 => last.1 = end,
+                                _ => spans.push((off, end)),
+                            }
+                            copied_any = true;
+                            idx += 1;
+                        }
+                        slot.list.Close()?;
+                        if !copied_any {
+                            return Ok(None);
+                        }
+                        let cmd: ID3D12CommandList = slot.list.cast()?;
+                        upload_queue.ExecuteCommandLists(&[Some(cmd)]);
+                        let val = self.upload_value.fetch_add(1, Ordering::AcqRel) + 1;
+                        upload_queue.Signal(upload_fence, val)?;
+                        slot.fence = val;
+                        let last_span = spans.len().saturating_sub(1);
+                        let mut keep_opt = Some(keep);
+                        for (s_idx, (start, end)) in spans.into_iter().enumerate() {
+                            ring.in_flight.push_back(RingFlight {
+                                start,
+                                end,
+                                fence: val,
+                                _keep: if s_idx == last_span {
+                                    keep_opt.take().unwrap_or_default()
+                                } else {
+                                    Vec::new()
+                                },
+                            });
+                        }
+                        Ok(Some(val))
+                    })()
+                };
+                ring.slots.push(slot);
+                match res {
+                    Ok(Some(v)) => last_val = Some(v),
+                    Ok(None) => break,
+                    Err(_) => return None,
+                }
+            }
+            if let Some(val) = last_val {
+                // Synchronize main graphics queue on the GPU — zero CPU stall.
+                // SAFETY: live queue and upload_fence.
+                unsafe { self.queue.Wait(upload_fence, val) }.ok()?;
+                Some(val)
+            } else if tile_ops {
+                let val = self.upload_value.fetch_add(1, Ordering::AcqRel) + 1;
+                // SAFETY: live queues and fence.
+                unsafe {
+                    upload_queue.Signal(upload_fence, val).ok()?;
+                    self.queue.Wait(upload_fence, val).ok()?;
+                }
+                Some(val)
+            } else {
+                None
+            }
         })?
     }
 
@@ -4865,6 +5032,9 @@ impl Host {
             settled += settling.elapsed();
         }
         let card = self.card_before(runs, flown, *submitted);
+        if crate::sparse_uma::active() {
+            crate::sparse_uma::sync_before_submit(self, *submitted);
+        }
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
         }
@@ -5294,7 +5464,39 @@ impl HostList {
         times
     }
 
+    /// Records that a pass on this list wrote through Stage M3 sparse GDDR6X
+    /// window UAVs so subsequent sparse passes and list close emit a global
+    /// UAV barrier (`pResource = NULL`).
+    pub(crate) fn mark_sparse_uma_write(&self) {
+        self.sparse_uma_wrote.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether this list has recorded a Stage M3 sparse GDDR6X window UAV write.
+    pub(crate) fn sparse_uma_wrote(&self) -> bool {
+        self.sparse_uma_wrote.load(Ordering::Relaxed)
+    }
+
+    /// Emits a global UAV barrier (`pResource = NULL`) on `self.list` so all
+    /// prior UAV writes across window-backed buffers finish before later reads
+    /// or writes.
+    pub(crate) fn uav_barrier_all(&self) {
+        let barrier = D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                    pResource: std::mem::ManuallyDrop::new(None),
+                }),
+            },
+        };
+        // SAFETY: an open command list and a valid global UAV barrier.
+        unsafe { self.list.ResourceBarrier(&[barrier]) };
+    }
+
     pub(crate) fn close(&self) {
+        if self.sparse_uma_wrote.load(Ordering::Relaxed) {
+            self.uav_barrier_all();
+        }
         self.twins_to_depth();
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
@@ -5319,6 +5521,7 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         self._alive.used();
+        self.sparse_uma_wrote.store(false, Ordering::Relaxed);
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -6730,6 +6933,7 @@ impl Meter {
                 crate::descriptor::host::KEPT_VIEWS.load(Ordering::Relaxed)
             );
             crate::tiles::status();
+            crate::sparse_uma::status();
             {
                 let [queued, due, away, partly, oldest] =
                     [0, 1, 2, 3, 4].map(|i| crate::draw::HEAP_TEXTURES_QUEUE[i].load(Ordering::Relaxed));

@@ -472,6 +472,8 @@ pub(super) fn host_max_wave() -> u32 {
 thread_local! {
     /// A test's host wave size, for its thread only ([`set_host_max_wave`] is the process's).
     pub(super) static TEST_HOST_WAVE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    /// A test's override for `VICTORY_SPARSE_UMA`, for its thread only.
+    pub(super) static TEST_SPARSE_UMA: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// The parameters packing 16-bit rows two per dword and where each lays
@@ -2233,36 +2235,91 @@ impl<'a> Lower<'a> {
         })
     }
 
-    /// The title address (low dword, bits from 32 up) of the buffer view
-    /// whose descriptor the scalar load at `site` reads from the start of
-    /// a table entry, as the host tells it when it binds (`shader.rs`
-    /// `USER_VIEW_ADDRESS`); none for anything else. (The console's
-    /// descriptor holds more in the second dword, the stride from bit 16
-    /// up; code that takes the address masks those away.)
-    fn view_address(&mut self, site: Site) -> Option<(V, V)> {
+    /// Loads `(addr_lo, addr_hi, num_records, stride)` for the view-heap slot
+    /// read by the scalar descriptor load at `site` from root SRV `t<SLOT_VIEWS>`
+    /// (16 bytes = 4 × `u32` per slot, `slot << 4`, clamped to `SLOT_STRIDES_COUNT - 1`).
+    /// Does NOT add `a.offset` to `(addr_lo, addr_hi)` because `heap_index`
+    /// already folds `base + offset + soffset >> 5` into `slot`.
+    fn view_table_entry(&mut self, site: Site) -> Option<(V, V, V, V)> {
+        use super::shader::{SLOT_STRIDES_COUNT, SLOT_VIEWS};
+        let a = self.scalar.get(&site).copied()?;
+        let rp = *self.x.native.layout.get(a.param)?;
+        if !matches!(rp.root, RootType::Table | RootType::ResourceHeap) {
+            return None;
+        }
+        let slot = self.heap_index(site, 0, false).ok()?;
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let last = self.s.m.i32(SLOT_STRIDES_COUNT - 1);
+        let slot = self
+            .s
+            .op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[slot, last]);
+        self.s.m.tag(slot, Tag::Clamp);
+        let four = self.s.m.i32(4);
+        let byte = self.s.m.bin(c, Bin::Shl, slot, four);
+        let h = self.s.root_srv_handle(SLOT_VIEWS);
+        let iu = self.s.m.undef(i32t);
+        let mask = self.s.m.i8(0xF);
+        let align = self.s.m.i32(4);
+        let r = self.s.op(
+            c,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            139,
+            &[h, byte, iu, mask, align],
+        );
+        let (f0, f1, f2, f3) = (
+            self.s.m.extract(c, r, 0),
+            self.s.m.extract(c, r, 1),
+            self.s.m.extract(c, r, 2),
+            self.s.m.extract(c, r, 3),
+        );
+        let lo = self.as_int(f0);
+        let hi = self.as_int(f1);
+        let num_records = self.as_int(f2);
+        let stride = self.as_int(f3);
+        Some((lo, hi, num_records, stride))
+    }
+
+    /// The title address `(addr_lo, addr_hi)` and optional `num_records` of the
+    /// buffer view whose descriptor the scalar load at `site` reads:
+    /// - Static descriptor table entry (`USER_VIEW_ADDRESS` user-data words)
+    ///   when `num_records` is not needed, or
+    /// - Dynamic descriptor table / `ResourceHeap` / count-reading slot via
+    ///   root SRV `t<SLOT_VIEWS>` (16-byte `[addr_lo, addr_hi, num_records, stride]`).
+    fn view_address_and_count(&mut self, site: Site, need_count: bool) -> Option<(V, V, Option<V>)> {
         use super::shader::USER_VIEW_ADDRESS;
         let a = self.scalar.get(&site).copied()?;
         let rp = *self.x.native.layout.get(a.param)?;
-        if rp.root != RootType::Table || a.dynamic.is_some() || a.offset % 32 != 0 {
-            return None;
+        if !need_count && rp.root == RootType::Table && a.dynamic.is_none() && a.offset % 32 == 0 {
+            let dword = a.offset / 4;
+            if let Some(used) = self
+                .x
+                .native
+                .used
+                .iter()
+                .filter(|u| {
+                    u.root == RootType::Table
+                        && u.user_data == rp.user_data
+                        && u.table_offset_dwords <= dword
+                })
+                .max_by_key(|u| u.table_offset_dwords)
+                && used.dwords == 4
+                && matches!(used.kind, ResourceType::Srv | ResourceType::Uav)
+            {
+                let lo = self.host_word(RootType::Other(USER_VIEW_ADDRESS), rp.slot, dword);
+                let hi = self.host_word(RootType::Other(USER_VIEW_ADDRESS + 1), rp.slot, dword);
+                return Some((lo, hi, None));
+            }
         }
-        let dword = a.offset / 4;
-        let used = self
-            .x
-            .native
-            .used
-            .iter()
-            .filter(|u| {
-                u.root == RootType::Table
-                    && u.user_data == rp.user_data
-                    && u.table_offset_dwords <= dword
-            })
-            .max_by_key(|u| u.table_offset_dwords)?;
-        if used.dwords != 4 || !matches!(used.kind, ResourceType::Srv | ResourceType::Uav) {
-            return None;
-        }
-        let lo = self.host_word(RootType::Other(USER_VIEW_ADDRESS), rp.slot, dword);
-        let hi = self.host_word(RootType::Other(USER_VIEW_ADDRESS + 1), rp.slot, dword);
+        let (lo, hi, num_records, _) = self.view_table_entry(site)?;
+        Some((lo, hi, Some(num_records)))
+    }
+
+    /// The title address `(addr_lo, addr_hi)` of the buffer view at `site`.
+    fn view_address(&mut self, site: Site) -> Option<(V, V)> {
+        let (lo, hi, _) = self.view_address_and_count(site, false)?;
         Some((lo, hi))
     }
 
@@ -2286,16 +2343,48 @@ impl<'a> Lower<'a> {
         (sum, hi)
     }
 
-    /// Title memory at the 40-bit address `lo`, `hi` (`shader.rs`
-    /// `SLOT_MEMORY`): the handle of the raw view of the host copy holding
-    /// it and the byte in that view. A page without a copy reads zeros
-    /// (and drops writes) through the null view at the first slot, and its
-    /// number is left for the host, for lanes that run (`guard`).
+    /// Title memory at the 40-bit address `lo`, `hi`:
+    /// - With `VICTORY_SPARSE_UMA=1`: direct 12 × 2 GiB (24 GiB seamless)
+    ///   sparse GDDR6X raw UAVs at `USER_MEMORY_BASE + 1..=12` (null raw UAV at
+    ///   `USER_MEMORY_BASE + 0`), using `USER_MEMORY_APERTURE_HI` (`aperture >> 32`).
+    /// - Otherwise: legacy 64 KiB page directory `SLOT_MEMORY` / `SLOT_FAULTS`.
+    /// Both paths annotate the raw buffer UAV handle as `globallycoherent`
+    /// (`0x4000`) so cross-group BVH tree linking stays coherent across SMs.
     fn memory(&mut self, lo: V, hi: V, guard: Option<V>) -> (V, V) {
-        use super::shader::{MEMORY_FAULTS, MEMORY_PAGES, SLOT_FAULTS, SLOT_MEMORY, USER_MEMORY_BASE};
+        use super::shader::{
+            MEMORY_FAULTS, MEMORY_PAGES, SLOT_FAULTS, SLOT_MEMORY, USER_MEMORY_APERTURE_HI,
+            USER_MEMORY_BASE,
+        };
+        // DXIL ResourceProperties word 0: Kind=11 (RawBuffer) | IsUAV (0x1000) | IsGloballyCoherent (0x4000).
+        const RAW_UAV_GC: (u32, u32) = (11 | 0x1000 | 0x4000, 0);
         let c = self.cur;
-        let (i32t, res) = (self.s.t.i32, self.s.t.res_ret);
         let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+        if super::sparse_uma() {
+            let base = self.host_word(RootType::Other(USER_MEMORY_BASE), 0, 0);
+            let aperture_hi = self.host_word(RootType::Other(USER_MEMORY_APERTURE_HI), 0, 0);
+            // Strip any unmasked descriptor stride/flags in bits 16..31 while
+            // keeping the full 48-bit Windows user VA upper bits (32..47).
+            let hi_mask = k(self, 0xFFFF);
+            let hi_48 = self.s.m.bin(c, Bin::And, hi, hi_mask);
+            let hi_rel = self.s.m.bin(c, Bin::Sub, hi_48, aperture_hi);
+            let k6 = k(self, 6);
+            let in_range = self.s.m.cmp(c, pred::IULT, hi_rel, k6);
+            let one = k(self, 1);
+            let k31 = k(self, 31);
+            let hi_part = self.s.m.bin(c, Bin::Shl, hi_rel, one);
+            let lo_top = self.s.m.bin(c, Bin::LShr, lo, k31);
+            let win = self.s.m.bin(c, Bin::Or, hi_part, lo_top);
+            let win1 = self.s.m.bin(c, Bin::Add, win, one);
+            let target_slot = self.s.m.bin(c, Bin::Add, base, win1);
+            let slot = self.s.m.select(c, in_range, target_slot, base);
+            let h = self.s.heap_handle(c, slot, false, true, RAW_UAV_GC);
+            let mask2g = k(self, 0x7FFF_FFFF);
+            let raw_byte = self.s.m.bin(c, Bin::And, lo, mask2g);
+            let zero = k(self, 0);
+            let byte = self.s.m.select(c, in_range, raw_byte, zero);
+            return (h, byte);
+        }
+        let (i32t, res) = (self.s.t.i32, self.s.t.res_ret);
         let (k16, k8) = (k(self, 16), k(self, 0xFF));
         let low = self.s.m.bin(c, Bin::LShr, lo, k16);
         let high = self.s.m.bin(c, Bin::And, hi, k8);
@@ -2349,7 +2438,7 @@ impl<'a> Lower<'a> {
         );
         let base = self.host_word(RootType::Other(USER_MEMORY_BASE), 0, 0);
         let slot = self.s.m.bin(c, Bin::Add, base, copy);
-        let h = self.s.heap_handle(c, slot, false, true, (11 | 0x1000, 0));
+        let h = self.s.heap_handle(c, slot, false, true, RAW_UAV_GC);
         let k64k = k(self, 0xFFFF);
         let within = self.s.m.bin(c, Bin::And, lo, k64k);
         let byte = self.s.m.bin(c, Bin::Add, start, within);
@@ -5691,7 +5780,60 @@ impl<'a> Lower<'a> {
                 .find_map(|(s, _)| use_of(*s))
         };
         let use_at = use_of(site).or_else(twin);
-        let Some((at, first)) = use_at else {
+        let (first, src, used, uav, props, image) = if let Some((at, first)) = use_at {
+            let src = Source::Loaded { load: site, first };
+            let used = self.used_kind(&src);
+            let ui: &Inst = &self.x.p.blocks[at.0].insts[at.1];
+            let un = ui.name();
+            let uav = un.contains("store")
+                || un.contains("atomic")
+                || used.is_some_and(|u| u.kind == ResourceType::Uav);
+            let u = if uav { 0x1000 } else { 0 };
+            let (props, image) = match &ui.fields {
+                // A ray-tracing structure in a buffer of the host: read raw.
+                Fields::Image { .. } if un.starts_with("image_bvh") => ((11, 0), None),
+                Fields::Image { dim, .. } => {
+                    let kind = match dim {
+                        0 => 1,
+                        1 => 2,
+                        2 => 4,
+                        4 => 6,
+                        5 => 7,
+                        _ => return Err("an image dimension (cube or MSAA)"),
+                    };
+                    ((kind | u, 0x409), Some(kind))
+                }
+                Fields::Buffer { idxen, format, .. } => {
+                    let stride = used.map_or(0, |u| u.stride);
+                    let props = if un.starts_with("buffer_load_format")
+                        || un.starts_with("buffer_store_format")
+                    {
+                        (10 | u, 0x409)
+                    } else if *idxen && format.is_none() && stride >= 4 && stride.is_multiple_of(4)
+                    {
+                        (12 | u, stride)
+                    } else {
+                        (11 | u, 0)
+                    };
+                    if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
+                        self.stale.extend(inst.writes.iter().map(|w| w.1));
+                        return Err("a constant buffer's descriptor read as data");
+                    }
+                    (props, None)
+                }
+                // Read by scalar buffer loads alone: the raw view `smem` reads it through.
+                Fields::Smem { .. } if used.is_some_and(|u| u.kind == ResourceType::Srv) => {
+                    ((11, 0), None)
+                }
+                // A constant buffer: nothing of its descriptor is a number.
+                Fields::Smem { .. } => {
+                    self.stale.extend(inst.writes.iter().map(|w| w.1));
+                    return Err("a constant buffer's descriptor read as data");
+                }
+                _ => return Err("a scalar memory read as data"),
+            };
+            (first, src, used, uav, props, image)
+        } else {
             // A descriptor kept per lane in VGPRs (`Resources::lane_copied`): the code only
             // copies its dwords and compares them, lane against first lane, and every load
             // that reaches those lanes reads one address. Each dword stands in as its place
@@ -5718,17 +5860,35 @@ impl<'a> Lower<'a> {
                 self.stale.extend(inst.writes.iter().map(|w| w.1));
                 return Err("a sampler's descriptor read as data");
             }
-            // A buffer view the code only takes the address of, to walk
-            // the memory behind it (a ray-tracing structure): the address
-            // from the host, the other dwords have no value.
-            if count <= 4
-                && let Some((lo, hi)) = self.view_address(site)
+            let dword_read = |k: u32| {
+                inst.write(Reg::S(code + k as u8)).is_some_and(|v| {
+                    self.x.p.blocks.iter().any(|blk| {
+                        blk.insts.iter().any(|j| j.reads.iter().any(|r| r.1 == v))
+                            || blk.phis.iter().any(|phi| phi.args.contains(&v))
+                    })
+                })
+            };
+            let first_dword = address
+                .filter(|a| a.offset % 4 == 0)
+                .map(|a| (a.offset % 32) / 4);
+            // A buffer view the code only reads metadata from (title address
+            // for ray-tracing / pointer traversal, or record count via
+            // `SLOT_VIEWS`): serve `[addr_lo, addr_hi, num_records]` at the
+            // load's dword offset within the 32-byte descriptor slot.
+            let need_count =
+                first_dword.is_some_and(|fd| fd <= 2 && 2 < fd + count && dword_read(2 - fd));
+            if let Some(fd) = first_dword
+                && fd + count <= 4
+                && let Some((lo, hi, num_records)) = self.view_address_and_count(site, need_count)
             {
                 for k in 0..count {
                     let reg = Reg::S(code + k as u8);
-                    match k {
+                    match fd + k {
                         0 => self.write(inst, reg, lo, None),
                         1 => self.write(inst, reg, hi, None),
+                        2 if num_records.is_some() => {
+                            self.write(inst, reg, num_records.unwrap(), None);
+                        }
                         _ => {
                             if let Some(v) = inst.write(reg) {
                                 self.vals.insert(v, Val::Missing(OTHER));
@@ -5739,66 +5899,32 @@ impl<'a> Lower<'a> {
                 }
                 return Ok(());
             }
-            if std::env::var_os("VICTORY_DESC_WHY").is_some() {
-                eprintln!(
-                    "DESC-WHY {:#x} {} scalar={:?} lane_copied={}",
-                    inst.machine.offset,
-                    inst.name(),
-                    address,
-                    self.x.res.lane_copied.contains(&site)
-                );
-            }
-            return Err("a descriptor read only as data");
-        };
-        let src = Source::Loaded { load: site, first };
-        let used = self.used_kind(&src);
-        let ui: &Inst = &self.x.p.blocks[at.0].insts[at.1];
-        let un = ui.name();
-        let uav = un.contains("store")
-            || un.contains("atomic")
-            || used.is_some_and(|u| u.kind == ResourceType::Uav);
-        let u = if uav { 0x1000 } else { 0 };
-        let (props, image) = match &ui.fields {
-            // A ray-tracing structure in a buffer of the host: read raw.
-            Fields::Image { .. } if un.starts_with("image_bvh") => ((11, 0), None),
-            Fields::Image { dim, .. } => {
-                let kind = match dim {
-                    0 => 1,
-                    1 => 2,
-                    2 => 4,
-                    4 => 6,
-                    5 => 7,
-                    _ => return Err("an image dimension (cube or MSAA)"),
-                };
-                ((kind | u, 0x409), Some(kind))
-            }
-            Fields::Buffer { idxen, format, .. } => {
-                let stride = used.map_or(0, |u| u.stride);
-                let props = if un.starts_with("buffer_load_format")
-                    || un.starts_with("buffer_store_format")
-                {
-                    (10 | u, 0x409)
-                } else if *idxen && format.is_none() && stride >= 4 && stride.is_multiple_of(4) {
-                    (12 | u, stride)
-                } else {
-                    (11 | u, 0)
-                };
-                if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
-                    self.stale.extend(inst.writes.iter().map(|w| w.1));
-                    return Err("a constant buffer's descriptor read as data");
+            // An 8-dword image descriptor read solely for 2D dimensions
+            // (dwords 1..=3: width, height, mip count) without sampling from
+            // the same load (e.g. bindless `ResourceHeap` `GetDimensions`).
+            if count == 8
+                && first_dword == Some(0)
+                && !dword_read(0)
+                && !(4..8).any(dword_read)
+                && (1..=3).any(dword_read)
+            {
+                let src = Source::Loaded { load: site, first: 0 };
+                let used = self.used_kind(&src);
+                let uav = used.is_some_and(|u| u.kind == ResourceType::Uav);
+                let u = if uav { 0x1000 } else { 0 };
+                (0u8, src, used, uav, (2 | u, 0x409), Some(2))
+            } else {
+                if std::env::var_os("VICTORY_DESC_WHY").is_some() {
+                    eprintln!(
+                        "DESC-WHY {:#x} {} scalar={:?} lane_copied={}",
+                        inst.machine.offset,
+                        inst.name(),
+                        address,
+                        self.x.res.lane_copied.contains(&site)
+                    );
                 }
-                (props, None)
+                return Err("a descriptor read only as data");
             }
-            // Read by scalar buffer loads alone: the raw view `smem` reads it through.
-            Fields::Smem { .. } if used.is_some_and(|u| u.kind == ResourceType::Srv) => {
-                ((11, 0), None)
-            }
-            // A constant buffer: nothing of its descriptor is a number.
-            Fields::Smem { .. } => {
-                self.stale.extend(inst.writes.iter().map(|w| w.1));
-                return Err("a constant buffer's descriptor read as data");
-            }
-            _ => return Err("a scalar memory read as data"),
         };
         let h = self.handle(site, &src, false, props)?;
         let c = self.cur;

@@ -18,6 +18,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::{CStr, c_char, c_void};
 use std::os::windows::fs::FileExt;
@@ -26,6 +27,15 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 
 use victory_formats::bcpack::{self, Tables};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE,
+};
+use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+use windows_sys::Win32::System::Memory::{
+    MEM_COMMIT, MEM_FREE, MEM_PRIVATE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_READWRITE,
+    VirtualAlloc, VirtualQuery,
+};
+use windows_sys::Win32::System::Threading::{CreateEventW, GetCurrentProcess, ResetEvent, SetEvent};
 
 use super::xasync::{E_INVALIDARG, E_NOTIMPL, E_PENDING};
 use super::xgameruntime::{Guid, HRESULT, Methods, Object, S_OK, add_ref, missing, put};
@@ -172,8 +182,17 @@ extern "system" fn create_status_array(
     put(out, array)
 }
 
-/// The queue's description: as in 2020 (source type, capacity, priority,
-/// name), plus a field the title sets to 1.
+/// The 2020 v0 queue description (0x18 bytes): source type, capacity, priority, name.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct QueueDescV0 {
+    source_type: u64,
+    capacity: u16,
+    priority: i8,
+    name: *const c_char,
+}
+
+/// The v1 queue description (0x20 bytes): v0 fields plus a trailing field the title sets to 1.
 #[repr(C)]
 struct QueueDesc {
     source_type: u64,
@@ -181,6 +200,50 @@ struct QueueDesc {
     priority: i8,
     name: *const c_char,
     unknown: u64,
+}
+
+const _: () = {
+    assert!(size_of::<QueueDescV0>() == 0x18);
+    assert!(size_of::<QueueDesc>() == 0x20);
+};
+
+fn create_queue_inner(desc: QueueDescV0, unknown: u64, iid: *const Guid, out: Out) -> HRESULT {
+    let name = text(desc.name);
+    tracing::info!(
+        source = desc.source_type,
+        capacity = desc.capacity,
+        priority = desc.priority,
+        name,
+        unknown,
+        iid = iid_text(iid),
+        "dstorage: queue"
+    );
+    let Some(scheduler) = scheduler() else {
+        return E_OUTOFMEMORY;
+    };
+    let mut lanes = scheduler.lock();
+    let id = lanes.next_id;
+    lanes.next_id += 1;
+    let lane = Lane::new_with_desc(desc);
+    lanes.lanes.insert(id, lane);
+    drop(lanes);
+    put(
+        out,
+        Instance::create(Object::new("dstorage queue", &QUEUE_VTABLE), Queue { id }),
+    )
+}
+
+extern "system" fn create_queue_v0(
+    _: Factory,
+    desc: *const QueueDescV0,
+    iid: *const Guid,
+    out: Out,
+) -> HRESULT {
+    // SAFETY: the title passes its v0 queue description (null tolerated).
+    let Some(&desc) = (unsafe { desc.as_ref() }) else {
+        return E_INVALIDARG;
+    };
+    create_queue_inner(desc, 0, iid, out)
 }
 
 extern "system" fn create_queue(
@@ -193,33 +256,29 @@ extern "system" fn create_queue(
     let Some(desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
-    let name = text(desc.name);
-    tracing::info!(
-        source = desc.source_type,
-        capacity = desc.capacity,
-        priority = desc.priority,
-        name,
-        unknown = desc.unknown,
-        iid = iid_text(iid),
-        "dstorage: queue"
-    );
-    let Some(scheduler) = scheduler() else {
-        return E_OUTOFMEMORY;
+    let v0 = QueueDescV0 {
+        source_type: desc.source_type,
+        capacity: desc.capacity,
+        priority: desc.priority,
+        name: desc.name,
     };
-    let mut lanes = scheduler.lock();
-    let id = lanes.next_id;
-    lanes.next_id += 1;
-    let lane = Lane::new(desc.priority, desc.capacity);
-    lanes.lanes.insert(id, lane);
-    drop(lanes);
-    put(
-        out,
-        Instance::create(Object::new("dstorage queue", &QUEUE_VTABLE), Queue { id }),
-    )
+    create_queue_inner(v0, desc.unknown, iid, out)
+}
+
+extern "system" fn set_cpu_affinity(_: Factory, affinity: u64) -> HRESULT {
+    tracing::debug!(affinity = format_args!("{affinity:#x}"), "dstorage: set cpu affinity");
+    S_OK
+}
+
+extern "system" fn set_debug_flags(_: Factory, flags: u32) {
+    tracing::debug!(flags = format_args!("{flags:#x}"), "dstorage: set debug flags");
 }
 
 /// The title asks for 32 MiB and stops if this fails.
 extern "system" fn set_staging_buffer_size(_: Factory, size: u32) -> HRESULT {
+    if size == 0 {
+        return E_INVALIDARG;
+    }
     tracing::info!(size, "dstorage: staging buffer size");
     if let Some(scheduler) = scheduler() {
         scheduler.lock().staging = u64::from(size);
@@ -241,14 +300,14 @@ static FACTORY_VTABLE: Methods<16> = Methods([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),
-    missing::<3> as *const (),            // 0x18 (2020: queue creation)
+    create_queue_v0 as *const (),         // 0x18 (2020: v0 queue creation)
     open_file as *const (),               // 0x20
     create_status_array as *const (),     // 0x28
-    missing::<6> as *const (),            // 0x30 (2020: CPU affinity)
-    missing::<7> as *const (),            // 0x38 (2020: debug flags)
+    set_cpu_affinity as *const (),        // 0x30 (2020: CPU affinity)
+    set_debug_flags as *const (),         // 0x38 (2020: debug flags)
     set_staging_buffer_size as *const (), // 0x40
     missing::<9> as *const (),
-    create_queue as *const (), // 0x50
+    create_queue as *const (), // 0x50 (v1 queue creation)
     missing::<11> as *const (),
     missing::<12> as *const (),
     missing::<13> as *const (),
@@ -262,10 +321,25 @@ struct File {
     file: std::fs::File,
 }
 
+extern "system" fn release_file(this: *mut Instance<File>) -> u32 {
+    let addr = this as usize;
+    // SAFETY: an instance we created and the title still holds.
+    let left = unsafe { &*this }.refs.fetch_sub(1, Ordering::AcqRel) - 1;
+    if left == 0 {
+        WALLS_FILES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(p, _)| *p != addr);
+        // SAFETY: the last reference; created by `Instance::create`.
+        drop(unsafe { Box::from_raw(this) });
+    }
+    left
+}
+
 static FILE_VTABLE: Methods<8> = Methods([
     missing::<0> as *const (),
     add_ref_instance::<File> as *const (),
-    release::<File> as *const (),
+    release_file as *const (),
     missing::<3> as *const (),
     missing::<4> as *const (),
     missing::<5> as *const (),
@@ -360,8 +434,52 @@ struct Lanes {
     since: Option<std::time::Instant>,
 }
 
+/// Recorded first failure on a queue since the last `RetrieveErrorRecord`.
+struct FirstError {
+    hr: HRESULT,
+    filename: String,
+    request_name: String,
+    request: Request,
+}
+
+/// `DSTORAGE_ERROR_RECORD` (`0x290` bytes) returned by `RetrieveErrorRecord`.
+#[repr(C)]
+struct ErrorRecord {
+    failure_count: u32,
+    _pad0: u32,
+    hresult: HRESULT,
+    command_type: u32,
+    filename: [u16; 260],
+    request_name: [u8; 64],
+    /// First 0x38 bytes of `Request` (`options`, `destination`, `page_offset`,
+    /// `destination_size`, `source`, `offset`, `source_size`, `intermediate_size`).
+    request_prefix: [u8; 0x38],
+}
+
+const _: () = {
+    assert!(size_of::<ErrorRecord>() == 0x290);
+    assert!(std::mem::offset_of!(ErrorRecord, hresult) == 0x08);
+    assert!(std::mem::offset_of!(ErrorRecord, command_type) == 0x0C);
+    assert!(std::mem::offset_of!(ErrorRecord, filename) == 0x10);
+    assert!(std::mem::offset_of!(ErrorRecord, request_name) == 0x218);
+    assert!(std::mem::offset_of!(ErrorRecord, request_prefix) == 0x258);
+};
+
+const DSTORAGE_COMMAND_TYPE_REQUEST: u32 = 0;
+const DSTORAGE_COMMAND_TYPE_NONE: u32 = 0xFFFF_FFFF;
+
+/// `DSTORAGE_QUEUE_INFO` returned by `IDStorageQueueX::Query`.
+#[repr(C)]
+struct QueueInfo {
+    desc: QueueDescV0,
+    empty_slot_count: u16,
+    request_count_until_auto_submit: u16,
+    _pad: u32,
+}
+
 /// A queue's requests in the scheduler.
 struct Lane {
+    desc: QueueDescV0,
     class: usize,
     capacity: usize,
     /// Bytes started, for round robin among the lanes of a class.
@@ -374,7 +492,21 @@ struct Lane {
     statuses: VecDeque<(u64, Status)>,
     running: BTreeSet<u64>,
     failures: BTreeMap<u64, HRESULT>,
+    /// Owned manual-reset Win32 event signaled on queue errors (0 until created).
+    error_event: usize,
+    error_count: u32,
+    first_error: Option<FirstError>,
     closed: bool,
+}
+
+impl Drop for Lane {
+    fn drop(&mut self) {
+        if self.error_event != 0 {
+            // SAFETY: owned Win32 event handle created by `ensure_error_event`.
+            unsafe { CloseHandle(self.error_event as HANDLE) };
+            self.error_event = 0;
+        }
+    }
 }
 
 // SAFETY: requests point into title memory and our own objects, which stay
@@ -392,6 +524,19 @@ struct Job {
 
 // SAFETY: as for `Lane`.
 unsafe impl Send for Job {}
+
+/// Computes DirectStorage worker pool size: honors `VICTORY_DSTORAGE_WORKERS`
+/// (`1..=32`) when set, otherwise scales `4..=8` (1 per physical core on
+/// 8C/16T CPUs so decompression saturates NVMe without starving render/submit).
+fn worker_count_for(available_threads: usize, env_override: Option<&str>) -> usize {
+    if let Some(n) = env_override
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+    {
+        return n.clamp(1, 32);
+    }
+    available_threads.clamp(4, 8)
+}
 
 /// The scheduler, with its workers started on first use; `None` if not
 /// even one worker could start.
@@ -422,7 +567,9 @@ fn scheduler() -> Option<&'static Scheduler> {
         })
         .as_ref()?;
     STARTED.call_once(|| {
-        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let avail = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let env = std::env::var("VICTORY_DSTORAGE_WORKERS").ok();
+        let workers = worker_count_for(avail, env.as_deref());
         let started = (0..workers)
             .filter(|i| {
                 std::thread::Builder::new()
@@ -431,7 +578,7 @@ fn scheduler() -> Option<&'static Scheduler> {
                     .is_ok()
             })
             .count();
-        tracing::info!(workers = started, "dstorage: workers");
+        tracing::info!(workers = started, available_threads = avail, "dstorage: workers");
     });
     Some(scheduler)
 }
@@ -584,6 +731,7 @@ impl Lanes {
             lane.running.remove(&job.seq);
             if let Err(hr) = result {
                 lane.failures.insert(job.seq, hr);
+                lane.record_error(hr, &job.request);
             }
             lane.flush();
         }
@@ -621,18 +769,99 @@ impl Lanes {
     }
 }
 
+fn lookup_filename(request: &Request) -> String {
+    if request.options & MEMORY_SOURCE != 0 || request.source.is_null() {
+        return String::new();
+    }
+    let files = WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner());
+    let source = request.source as usize;
+    files
+        .iter()
+        .find(|f| f.0 == source)
+        .map_or_else(String::new, |f| f.1.clone())
+}
+
+/// Safely reads up to 63 bytes of a NUL-terminated request name without
+/// faulting if the title freed the pointer before completion.
+fn read_request_name_safe(ptr: *const c_char) -> String {
+    if ptr.is_null() {
+        return String::new();
+    }
+    let mut bytes = Vec::with_capacity(64);
+    for i in 0..63usize {
+        let mut ch = 0u8;
+        let mut read = 0usize;
+        // SAFETY: `ReadProcessMemory` safely returns FALSE instead of faulting
+        // if the address is unmapped.
+        let ok = unsafe {
+            ReadProcessMemory(
+                GetCurrentProcess(),
+                ptr.add(i).cast(),
+                (&raw mut ch).cast(),
+                1,
+                &raw mut read,
+            )
+        };
+        if ok == 0 || read != 1 || ch == 0 {
+            break;
+        }
+        bytes.push(ch);
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
 impl Lane {
+    #[cfg(test)]
     fn new(priority: i8, capacity: u16) -> Lane {
+        Self::new_with_desc(QueueDescV0 {
+            source_type: 0,
+            capacity,
+            priority,
+            name: std::ptr::null(),
+        })
+    }
+
+    fn new_with_desc(desc: QueueDescV0) -> Lane {
         Lane {
-            class: priority.clamp(-1, 1).wrapping_add(1) as usize,
-            capacity: usize::from(capacity),
+            desc,
+            class: desc.priority.clamp(-1, 1).wrapping_add(1) as usize,
+            capacity: usize::from(desc.capacity),
             clock: 0,
             unsubmitted: Vec::new(),
             reads: VecDeque::new(),
             statuses: VecDeque::new(),
             running: BTreeSet::new(),
             failures: BTreeMap::new(),
+            error_event: 0,
+            error_count: 0,
+            first_error: None,
             closed: false,
+        }
+    }
+
+    fn ensure_error_event(&mut self) -> HANDLE {
+        if self.error_event == 0 {
+            let signaled = i32::from(self.error_count > 0);
+            // SAFETY: creates a manual-reset Win32 event owned by this lane.
+            let h = unsafe { CreateEventW(std::ptr::null(), 1, signaled, std::ptr::null()) };
+            self.error_event = h as usize;
+        }
+        self.error_event as HANDLE
+    }
+
+    fn record_error(&mut self, hr: HRESULT, request: &Request) {
+        self.error_count = self.error_count.saturating_add(1);
+        if self.first_error.is_none() {
+            self.first_error = Some(FirstError {
+                hr,
+                filename: lookup_filename(request),
+                request_name: read_request_name_safe(request.name),
+                request: *request,
+            });
+        }
+        if self.error_event != 0 {
+            // SAFETY: valid owned event handle.
+            unsafe { SetEvent(self.error_event as HANDLE) };
         }
     }
 
@@ -876,10 +1105,11 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
             if !bounce {
                 return read_into(request, out).map(|()| size);
             }
-            let mut data = vec![0; size];
-            read_into(request, &mut data)?;
-            out.copy_from_slice(&data);
-            Ok(size)
+            with_bounce_scratch(size, |data| {
+                read_into(request, data)?;
+                out.copy_from_slice(data);
+                Ok(size)
+            })
         })
         .map_err(|hr| fail(hr, "copying"));
     }
@@ -1040,6 +1270,120 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
     result
 }
 
+/// Maximum thread-local scratch capacity retained per worker thread (4 MiB) so
+/// normal streaming chunks reuse memory without keeping rare huge allocations.
+const SCRATCH_RETAIN_CAP: usize = 4 << 20;
+
+fn run_with_tls_scratch<R>(
+    cell: &RefCell<Vec<u8>>,
+    len: usize,
+    f: impl FnOnce(&mut [u8]) -> R,
+) -> R {
+    let mut buf = cell.borrow_mut();
+    buf.resize(len, 0);
+    let result = f(&mut buf[..len]);
+    if buf.capacity() > SCRATCH_RETAIN_CAP {
+        buf.clear();
+        buf.shrink_to(SCRATCH_RETAIN_CAP);
+    }
+    result
+}
+
+fn with_bounce_scratch<R>(len: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
+    thread_local! {
+        static SCRATCH_BOUNCE: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    }
+    SCRATCH_BOUNCE.with(|c| run_with_tls_scratch(c, len, f))
+}
+
+fn with_stage_scratch<R>(len: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
+    thread_local! {
+        static SCRATCH_STAGE: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    }
+    SCRATCH_STAGE.with(|c| run_with_tls_scratch(c, len, f))
+}
+
+/// Safely reads `count` physical page numbers from a title-owned array using
+/// `ReadProcessMemory` so a concurrently unmapped array fails cleanly with
+/// `None` instead of crashing the worker thread with `0xC0000005`.
+fn read_page_array(ptr: *const c_void, count: usize) -> Option<Vec<usize>> {
+    if count == 0 {
+        return Some(Vec::new());
+    }
+    if ptr.is_null() {
+        return None;
+    }
+    let byte_len = count.checked_mul(size_of::<usize>())?;
+    let mut pages = vec![0usize; count];
+    let mut read = 0usize;
+    // SAFETY: `ReadProcessMemory` copies safely from our own address space
+    // without triggering an unhandled access violation on unmapped pages.
+    let ok = unsafe {
+        ReadProcessMemory(
+            GetCurrentProcess(),
+            ptr,
+            pages.as_mut_ptr().cast(),
+            byte_len,
+            &raw mut read,
+        )
+    };
+    (ok != 0 && read == byte_len).then_some(pages)
+}
+
+/// Verifies a virtual destination range `[dest, dest + len)` is mapped and
+/// explicitly pre-commits any lazy `MEM_PRIVATE | MEM_RESERVE` pages before
+/// kernel or worker writes touch them. Returns `Err(E_INVALIDARG)` if any part
+/// of the destination is unmapped (`MEM_FREE`) or cannot be committed.
+fn ensure_virtual_destination_ready(dest: *mut c_void, len: usize) -> Result<(), HRESULT> {
+    if len == 0 {
+        return Ok(());
+    }
+    let start = dest as usize;
+    let Some(end) = start.checked_add(len) else {
+        return Err(E_INVALIDARG);
+    };
+    let mut cur = start;
+    while cur < end {
+        let mut mbi = MEMORY_BASIC_INFORMATION::default();
+        // SAFETY: queries virtual memory metadata for our own process.
+        let queried = unsafe {
+            VirtualQuery(
+                cur as *const c_void,
+                &raw mut mbi,
+                size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
+        };
+        if queried == 0 || mbi.RegionSize == 0 {
+            return Err(E_INVALIDARG);
+        }
+        let region_end = (mbi.BaseAddress as usize).saturating_add(mbi.RegionSize);
+        let sub_end = region_end.min(end);
+        let sub_len = sub_end.saturating_sub(cur);
+        match mbi.State {
+            MEM_COMMIT => {}
+            MEM_RESERVE if mbi.Type == MEM_PRIVATE => {
+                // Pre-commit lazy-reserved private virtual pages so DirectStorage
+                // writes succeed without relying on user-mode VEH faults.
+                // SAFETY: commits only the subrange inside a valid private reservation.
+                let committed = unsafe {
+                    VirtualAlloc(cur as *mut c_void, sub_len, MEM_COMMIT, PAGE_READWRITE)
+                };
+                if committed.is_null() {
+                    tracing::debug!(
+                        addr = format_args!("{cur:#x}"),
+                        len = sub_len,
+                        "dstorage: pre-commit of reserved virtual destination failed"
+                    );
+                    return Err(E_INVALIDARG);
+                }
+            }
+            MEM_FREE | _ => return Err(E_INVALIDARG),
+        }
+        cur = sub_end;
+    }
+    Ok(())
+}
+
 /// Runs `fill` on the destination's first `len` bytes; `fill` returns how
 /// many it produced. GPU-visible destinations are host memory like the
 /// rest (GPU address = CPU address), so an address is written in place;
@@ -1051,13 +1395,14 @@ fn into_destination(
     fill: impl FnOnce(&mut [u8]) -> Result<usize, HRESULT>,
 ) -> Result<(), HRESULT> {
     if request.options & PAGE_DESTINATION == 0 {
+        ensure_virtual_destination_ready(request.destination, len)?;
         // Opens the guarded blocks and tells the GPU side a placed texture
         // there changes. `fill` writes from user mode (a file read is read
         // beside first, see `execute`), so a block guarded again meanwhile
         // faults into the guard instead of failing the write.
         victory_gpu::kernel_will_write(request.destination as usize, len);
-        // SAFETY: the title's destination holds `destination_size` bytes, at
-        // least `len`, and nothing else writes it until completion.
+        // SAFETY: `ensure_virtual_destination_ready` verified `[destination, +len)`
+        // is committed and mapped; nothing else writes it until completion.
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
         let filled = fill(out).map(drop);
         // Said again now that the bytes are there (upstream's c75fdba holds
@@ -1069,17 +1414,14 @@ fn into_destination(
         return filled;
     }
     let offset = (request.page_offset & 0xffff) as usize;
-    // SAFETY: the title passes a page number per 64 KiB of destination,
-    // which holds at least `len` bytes from `offset`.
-    let pages = unsafe {
-        std::slice::from_raw_parts(
-            request.destination.cast::<usize>(),
-            (offset + len).div_ceil(PAGE),
-        )
-    };
+    let page_count = (offset + len).div_ceil(PAGE);
+    let mut pages = read_page_array(request.destination.cast_const(), page_count)
+        .ok_or(E_INVALIDARG)?;
     // Consecutive pages of one allocation (the usual case): written in
-    // place through one view.
-    if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
+    // place through one view when no deferred zero entries are present.
+    if !pages.contains(&0)
+        && let Some(mut window) = super::xmem::page_window(&pages, offset, len)
+    {
         let filled = fill(window.bytes()).map(drop);
         drop(window);
         // The title maps pages where the card reads them and has them
@@ -1087,66 +1429,211 @@ fn into_destination(
         // learn of the bytes only from this (upstream c75fdba, fork PR
         // #571). After a decode that failed part way too: what it wrote
         // is there.
-        super::xmem::pages_written(pages, offset, len);
+        super::xmem::pages_written(&pages, offset, len);
         return filled;
     }
-    let mut data = vec![0; len];
-    let n = fill(&mut data)?;
-    // A page the title has just made, or a view the host refuses for a
-    // moment, comes right a little later: the write is tried again before
-    // the request fails (`VICTORY_DSTORAGE_RETRIES`, 12 tries, about 0.9 s
-    // in all; 0: not tried again, as before). Runs 175-178 lost 12 to 446
-    // reads a launch here, all in one second of the loading; the one build
-    // that tried again (run 165) lost none of 13.
-    static RETRIES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    let retries = *RETRIES.get_or_init(|| {
-        std::env::var("VICTORY_DSTORAGE_RETRIES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(12)
-    });
-    // Since the start: writes that succeeded on a later try, and writes
-    // given up.
-    static RETRIED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
-    let mut written = super::xmem::write_physical(pages, offset, &data[..n]);
-    let mut tries = 0u32;
-    while !written && tries < retries {
-        std::thread::sleep(std::time::Duration::from_millis((2u64 << tries.min(6)).min(128)));
-        tries += 1;
-        written = super::xmem::write_physical(pages, offset, &data[..n]);
-    }
-    if written {
-        if tries > 0 {
-            let on_a_retry = RETRIED[0].fetch_add(1, Ordering::Relaxed) + 1;
-            tracing::info!(
+    with_stage_scratch(len, |data| {
+        let n = fill(data)?;
+        // A page the title has just made, a deferred zero page-array entry, or a
+        // view the host refuses for a moment, comes right a little later: the
+        // write is tried again before the request fails (`VICTORY_DSTORAGE_RETRIES`,
+        // 12 tries, about 0.9 s in all; 0: not tried again).
+        static RETRIES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        let retries = *RETRIES.get_or_init(|| {
+            std::env::var("VICTORY_DSTORAGE_RETRIES")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(12)
+        });
+        static RETRIED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+        let mut written = !pages.contains(&0)
+            && super::xmem::write_physical(&pages, offset, &data[..n]);
+        let mut tries = 0u32;
+        while !written && tries < retries {
+            std::thread::sleep(std::time::Duration::from_millis(
+                (2u64 << tries.min(6)).min(128),
+            ));
+            tries += 1;
+            // Re-read the page array safely via `ReadProcessMemory` so deferred
+            // entries populated after enqueue become visible without risking
+            // `0xC0000005` if the title unmapped the array concurrently.
+            let Some(refreshed) = read_page_array(request.destination.cast_const(), page_count)
+            else {
+                return Err(E_INVALIDARG);
+            };
+            pages = refreshed;
+            written = !pages.contains(&0)
+                && super::xmem::write_physical(&pages, offset, &data[..n]);
+        }
+        if written {
+            if tries > 0 {
+                let on_a_retry = RETRIED[0].fetch_add(1, Ordering::Relaxed) + 1;
+                tracing::info!(
+                    offset,
+                    len,
+                    tries,
+                    on_a_retry,
+                    given_up = RETRIED[1].load(Ordering::Relaxed),
+                    "dstorage: a destination's physical pages written after a retry"
+                );
+            }
+            super::xmem::pages_written(&pages, offset, n);
+            Ok(())
+        } else {
+            let given_up = RETRIED[1].fetch_add(1, Ordering::Relaxed) + 1;
+            tracing::warn!(
+                known = super::xmem::pages_known(&pages, offset, len),
+                tries,
+                given_up,
+                on_a_retry = RETRIED[0].load(Ordering::Relaxed),
+                "dstorage: retries used up (VICTORY_DSTORAGE_RETRIES)"
+            );
+            tracing::warn!(
                 offset,
                 len,
-                tries,
-                on_a_retry,
-                given_up = RETRIED[1].load(Ordering::Relaxed),
-                "dstorage: a destination's physical pages written after a retry"
+                pages = pages.len(),
+                "dstorage: a destination's physical pages could not be written (unknown page or a host failure); its request fails"
             );
+            Err(E_INVALIDARG)
         }
-        // As above, after the write that succeeded.
-        super::xmem::pages_written(pages, offset, n);
-        Ok(())
-    } else {
-        let given_up = RETRIED[1].fetch_add(1, Ordering::Relaxed) + 1;
-        tracing::warn!(
-            known = super::xmem::pages_known(pages, offset, len),
-            tries,
-            given_up,
-            on_a_retry = RETRIED[0].load(Ordering::Relaxed),
-            "dstorage: retries used up (VICTORY_DSTORAGE_RETRIES)"
+    })
+}
+
+extern "system" fn cancel_requests_with_tag(this: QueueRef, mask: u64, value: u64) {
+    // SAFETY: a queue we created and the title still holds.
+    let id = unsafe { &*this }.state.id;
+    let Some(scheduler) = scheduler() else {
+        return;
+    };
+    let mut lanes = scheduler.lock();
+    let Some(lane) = lanes.lanes.get_mut(&id) else {
+        return;
+    };
+    let matches = |req: &Request| (req.tag & mask) == value;
+    lane.unsubmitted
+        .retain(|cmd| !matches!(cmd, Command::Read(r) if matches(r)));
+    lane.reads.retain(|(_, r)| !matches(r));
+    lane.flush();
+    scheduler.finished.notify_all();
+}
+
+/// Returns a duplicated handle to the queue's manual-reset error event; the
+/// caller owns and closes the returned handle.
+extern "system" fn get_error_event(this: QueueRef) -> *mut c_void {
+    // SAFETY: a queue we created and the title still holds.
+    let id = unsafe { &*this }.state.id;
+    let Some(scheduler) = scheduler() else {
+        return std::ptr::null_mut();
+    };
+    let mut lanes = scheduler.lock();
+    let Some(lane) = lanes.lanes.get_mut(&id) else {
+        return std::ptr::null_mut();
+    };
+    let event = lane.ensure_error_event();
+    if event.is_null() {
+        return std::ptr::null_mut();
+    }
+    let mut dup: HANDLE = std::ptr::null_mut();
+    // SAFETY: duplicates our owned event handle into the caller's handle slot.
+    let ok = unsafe {
+        let proc = GetCurrentProcess();
+        DuplicateHandle(proc, event, proc, &raw mut dup, 0, 0, DUPLICATE_SAME_ACCESS)
+    };
+    if ok != 0 { dup } else { std::ptr::null_mut() }
+}
+
+/// Copies the accumulated queue error record (`0x290` bytes), clears the stored
+/// error count and first failure, and resets the queue's error event.
+extern "system" fn retrieve_error_record(this: QueueRef, record: *mut ErrorRecord) {
+    if record.is_null() {
+        return;
+    }
+    // SAFETY: caller provides a writable `DSTORAGE_ERROR_RECORD` (0x290 bytes).
+    let out = unsafe {
+        std::ptr::write_bytes(record, 0, 1);
+        &mut *record
+    };
+    // SAFETY: a queue we created and the title still holds.
+    let id = unsafe { &*this }.state.id;
+    let Some(scheduler) = scheduler() else {
+        out.command_type = DSTORAGE_COMMAND_TYPE_NONE;
+        return;
+    };
+    let mut lanes = scheduler.lock();
+    let Some(lane) = lanes.lanes.get_mut(&id) else {
+        out.command_type = DSTORAGE_COMMAND_TYPE_NONE;
+        return;
+    };
+    let count = std::mem::take(&mut lane.error_count);
+    let first = lane.first_error.take();
+    if lane.error_event != 0 {
+        // SAFETY: valid owned event handle.
+        unsafe { ResetEvent(lane.error_event as HANDLE) };
+    }
+    drop(lanes);
+
+    out.failure_count = count;
+    let Some(first) = first else {
+        out.command_type = DSTORAGE_COMMAND_TYPE_NONE;
+        return;
+    };
+    out.hresult = first.hr;
+    out.command_type = DSTORAGE_COMMAND_TYPE_REQUEST;
+    for (dst, ch) in out
+        .filename
+        .iter_mut()
+        .take(259)
+        .zip(first.filename.encode_utf16())
+    {
+        *dst = ch;
+    }
+    for (dst, &b) in out
+        .request_name
+        .iter_mut()
+        .take(63)
+        .zip(first.request_name.as_bytes())
+    {
+        *dst = b;
+    }
+    // SAFETY: `Request` is `#[repr(C)]` and `0x48 >= 0x38` bytes.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            std::ptr::from_ref(&first.request).cast::<u8>(),
+            out.request_prefix.as_mut_ptr(),
+            out.request_prefix.len(),
         );
-        // Said aloud: the title never reads a request's result
-        // (it only polls for completion), so a destination left unwritten
-        // is a model or texture that silently holds whatever its pages
-        // held before.
-        tracing::warn!(
-            offset,
-            len,
-            pages = pages.len(),
-            "dstorage: a destination's physical pages could not be written (unknown page or a host failure); its request fails"
-        );
-        Err(E_INVALIDARG)
+    }
+}
+
+extern "system" fn query_queue(this: QueueRef, info: *mut QueueInfo) {
+    if info.is_null() {
+        return;
+    }
+    // SAFETY: a queue we created and the title still holds.
+    let id = unsafe { &*this }.state.id;
+    let Some(scheduler) = scheduler() else {
+        return;
+    };
+    let lanes = scheduler.lock();
+    let Some(lane) = lanes.lanes.get(&id) else {
+        return;
+    };
+    let usable = lane.capacity.saturating_sub(1);
+    let empty = usable.saturating_sub(lane.entries()).min(u16::MAX as usize) as u16;
+    let threshold = (lane.capacity / 2).max(1);
+    let until_auto = threshold
+        .saturating_sub(lane.unsubmitted.len())
+        .min(u16::MAX as usize) as u16;
+    let desc = lane.desc;
+    drop(lanes);
+    // SAFETY: caller provides a writable `QueueInfo`.
+    unsafe {
+        *info = QueueInfo {
+            desc,
+            empty_slot_count: empty,
+            request_count_until_auto_submit: until_auto,
+            _pad: 0,
+        };
     }
 }
 
@@ -1156,15 +1643,15 @@ static QUEUE_VTABLE: Methods<12> = Methods([
     missing::<0> as *const (),
     add_ref_instance::<Queue> as *const (),
     release::<Queue> as *const (),
-    enqueue_request as *const (), // 0x18
-    enqueue_status as *const (),  // 0x20
-    missing::<5> as *const (),    // 0x28 (2020: fence signal)
-    submit as *const (),          // 0x30
-    missing::<7> as *const (),    // 0x38 (2020: cancel by tag)
-    close as *const (),           // 0x40
-    missing::<9> as *const (),    // 0x48 (2020: error event)
-    missing::<10> as *const (),   // 0x50 (2020: error record)
-    missing::<11> as *const (),   // 0x58 (2020: queue info)
+    enqueue_request as *const (),          // 0x18
+    enqueue_status as *const (),           // 0x20
+    missing::<5> as *const (),             // 0x28 (2020: fence signal)
+    submit as *const (),                   // 0x30
+    cancel_requests_with_tag as *const (), // 0x38 (2020: cancel by tag)
+    close as *const (),                    // 0x40
+    get_error_event as *const (),          // 0x48 (2020: error event)
+    retrieve_error_record as *const (),    // 0x50 (2020: error record)
+    query_queue as *const (),              // 0x58 (2020: queue info)
 ]);
 
 pub(crate) fn module() -> HleModule {
@@ -1776,5 +2263,227 @@ mod tests {
         assert_eq!(inflate(&bad_body, &mut out), Err(INVALID_DATA));
         assert_eq!(inflate(&packed, &mut out), Ok(plain.len()));
         assert_eq!(out, plain);
+    }
+
+    #[test]
+    fn deferred_and_unmapped_physical_page_array_does_not_crash() {
+        use crate::modules::xmem;
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+
+        // 1. An unmapped page-array pointer fails cleanly with E_INVALIDARG
+        // via `ReadProcessMemory` instead of crashing the worker with 0xC0000005.
+        let unmapped = unsafe { VirtualAlloc(std::ptr::null(), 4096, MEM_RESERVE, PAGE_READWRITE) };
+        assert!(!unmapped.is_null());
+        assert_ne!(unsafe { VirtualFree(unmapped, 0, MEM_RELEASE) }, 0);
+
+        let plain = pattern(128);
+        let (queue, array) = (new_queue(1), status_array(2));
+        let bad_req = request(
+            PAGE_DESTINATION | MEMORY_SOURCE,
+            unmapped,
+            plain.len(),
+            plain.as_ptr().cast(),
+            0,
+            plain.len(),
+        );
+        enqueue(queue, &bad_req);
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), E_INVALIDARG);
+
+        // 2. A deferred physical page-array entry (0 at enqueue, populated
+        // concurrently shortly after submit) succeeds via safe ReadProcessMemory retry.
+        let mut allocated = [0usize; 1];
+        let mut count = 1usize;
+        assert_eq!(
+            xmem::XMemAllocatePhysicalPages(0, &mut count, allocated.as_mut_ptr()),
+            1
+        );
+        let page_num = allocated[0];
+        let deferred_box = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let deferred_ptr = std::sync::Arc::as_ptr(&deferred_box) as *mut c_void;
+
+        let req = request(
+            PAGE_DESTINATION | MEMORY_SOURCE,
+            deferred_ptr,
+            plain.len(),
+            plain.as_ptr().cast(),
+            0,
+            plain.len(),
+        );
+        enqueue(queue, &req);
+        enqueue_status(queue, array, 1);
+        void(queue, 0x30);
+
+        let writer = deferred_box.clone();
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            writer.store(page_num, Ordering::Release);
+        });
+        assert_eq!(wait(array, 1), S_OK);
+        handle.join().unwrap();
+
+        let mapped = xmem::XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            PAGE,
+            0x2000 | 0x2040_0000,
+            0,
+            0x04,
+        );
+        assert!(!mapped.is_null());
+        assert_eq!(xmem::XMemMapPhysicalPages(mapped, 1, &page_num), mapped);
+        let seen = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>(), plain.len()) };
+        assert_eq!(seen, plain);
+        assert_eq!(
+            xmem::XMemMapPhysicalPages(mapped, 1, std::ptr::null()),
+            mapped
+        );
+        assert_eq!(xmem::XMemFreePhysicalPages(1, &page_num), 1);
+        void(queue, 0x40);
+    }
+
+    #[test]
+    fn lazy_reserved_virtual_destination_is_precommitted() {
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+
+        // Reserve uncommitted private virtual pages (simulating lazy commit).
+        let reserved = unsafe { VirtualAlloc(std::ptr::null(), PAGE, MEM_RESERVE, PAGE_READWRITE) };
+        assert!(!reserved.is_null());
+
+        let plain = pattern(4096);
+        let (_dir, file) = file_with(&plain);
+        let (queue, array) = (new_queue(0), status_array(2));
+
+        enqueue(queue, &request(0, reserved, plain.len(), file, 0, plain.len()));
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), S_OK);
+
+        let seen = unsafe { std::slice::from_raw_parts(reserved.cast::<u8>(), plain.len()) };
+        assert_eq!(seen, plain);
+
+        // Free the reservation and confirm a write into unmapped memory fails
+        // cleanly with E_INVALIDARG instead of faulting the worker thread.
+        assert_ne!(unsafe { VirtualFree(reserved, 0, MEM_RELEASE) }, 0);
+        enqueue(queue, &request(0, reserved, plain.len(), file, 0, plain.len()));
+        enqueue_status(queue, array, 1);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 1), E_INVALIDARG);
+        void(queue, 0x40);
+    }
+
+    #[test]
+    fn error_event_duplicates_handle_and_retrieve_clears_error() {
+        use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+        use windows_sys::Win32::System::Threading::WaitForSingleObject;
+
+        let contents = pattern(64);
+        let (_dir, file) = file_with(&contents);
+        let (queue, array) = (new_queue(0), status_array(1));
+
+        let get_event: extern "system" fn(*mut c_void) -> *mut c_void = call(queue, 0x48);
+        let retrieve: extern "system" fn(*mut c_void, *mut ErrorRecord) = call(queue, 0x50);
+
+        let ev1 = get_event(queue);
+        let ev2 = get_event(queue);
+        assert!(!ev1.is_null() && !ev2.is_null());
+        assert_ne!(ev1, ev2, "GetErrorEvent must return a fresh duplicated handle");
+        assert_eq!(unsafe { WaitForSingleObject(ev1, 0) }, WAIT_TIMEOUT);
+
+        // Trigger a read past EOF with a named request.
+        let mut dst = [0u8; 32];
+        let mut req = request(0, dst.as_mut_ptr().cast(), 32, file, 60, 32);
+        req.name = c"streaming_chunk_01".as_ptr();
+        enqueue(queue, &req);
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), END_OF_FILE);
+
+        assert_eq!(unsafe { WaitForSingleObject(ev1, 1000) }, WAIT_OBJECT_0);
+        assert_eq!(unsafe { WaitForSingleObject(ev2, 0) }, WAIT_OBJECT_0);
+
+        // RetrieveErrorRecord populates the 0x290 record, clears error count, and resets event.
+        let mut rec: ErrorRecord = unsafe { std::mem::zeroed() };
+        retrieve(queue, &raw mut rec);
+        assert_eq!(rec.failure_count, 1);
+        assert_eq!(rec.hresult, END_OF_FILE);
+        assert_eq!(rec.command_type, DSTORAGE_COMMAND_TYPE_REQUEST);
+        let req_name = CStr::from_bytes_until_nul(&rec.request_name)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(req_name, "streaming_chunk_01");
+        assert_eq!(unsafe { WaitForSingleObject(ev1, 0) }, WAIT_TIMEOUT);
+
+        // A second RetrieveErrorRecord reports zero failures.
+        retrieve(queue, &raw mut rec);
+        assert_eq!(rec.failure_count, 0);
+        assert_eq!(rec.command_type, DSTORAGE_COMMAND_TYPE_NONE);
+
+        // Closing caller-owned duplicated handles does not invalidate internal event.
+        unsafe {
+            CloseHandle(ev1);
+            CloseHandle(ev2);
+        }
+        let ev3 = get_event(queue);
+        assert!(!ev3.is_null());
+        unsafe { CloseHandle(ev3) };
+        void(queue, 0x40);
+    }
+
+    #[test]
+    fn v0_queue_cancel_by_tag_and_query_info() {
+        let contents = pattern(256);
+        let (_dir, file) = file_with(&contents);
+
+        // Create queue via v0 factory slot 0x18 (0x18-byte QueueDescV0).
+        let create_v0: extern "system" fn(*mut c_void, *const QueueDescV0, *const Guid, Out) -> HRESULT =
+            call(factory(), 0x18);
+        let desc = QueueDescV0 {
+            source_type: 0,
+            capacity: 16,
+            priority: 0,
+            name: c"v0_q".as_ptr(),
+        };
+        let mut queue = std::ptr::null_mut();
+        assert_eq!(create_v0(factory(), &desc, std::ptr::null(), &mut queue), S_OK);
+
+        let query: extern "system" fn(*mut c_void, *mut QueueInfo) = call(queue, 0x58);
+        let cancel: extern "system" fn(*mut c_void, u64, u64) = call(queue, 0x38);
+
+        let mut info: QueueInfo = unsafe { std::mem::zeroed() };
+        query(queue, &raw mut info);
+        assert_eq!(info.empty_slot_count, 15);
+        assert_eq!(info.request_count_until_auto_submit, 8);
+
+        let mut cancelled_out = [0xEEu8; 32];
+        let mut kept_out = [0u8; 32];
+        let mut r_cancel = request(0, cancelled_out.as_mut_ptr().cast(), 32, file, 0, 32);
+        r_cancel.tag = 0xAA00_0001;
+        let mut r_keep = request(0, kept_out.as_mut_ptr().cast(), 32, file, 64, 32);
+        r_keep.tag = 0xBB00_0002;
+
+        let array = status_array(1);
+        enqueue(queue, &r_cancel);
+        enqueue(queue, &r_keep);
+        enqueue_status(queue, array, 0);
+
+        // Cancel only requests matching high tag nibble 0xAA00_0000.
+        cancel(queue, 0xFFFF_0000, 0xAA00_0000);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), S_OK);
+        assert!(cancelled_out.iter().all(|&b| b == 0xEE));
+        assert_eq!(kept_out, contents[64..96]);
+        void(queue, 0x40);
+    }
+
+    #[test]
+    fn worker_count_scales_for_multicore_and_respects_env() {
+        assert_eq!(worker_count_for(2, None), 4);
+        assert_eq!(worker_count_for(8, None), 8);
+        assert_eq!(worker_count_for(16, None), 8); // 7800X3D 8C/16T -> 8 workers (1/physical core)
+        assert_eq!(worker_count_for(16, Some("12")), 12);
+        assert_eq!(worker_count_for(16, Some("0")), 8);
+        assert_eq!(worker_count_for(16, Some("99")), 32);
     }
 }

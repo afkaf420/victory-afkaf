@@ -767,9 +767,14 @@ impl State {
         dword: u32,
         memory: Option<&crate::memory::Ready>,
     ) -> u32 {
-        use victory_shader::emit::{USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
+        use victory_shader::emit::{
+            USER_MEMORY_APERTURE_HI, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+        };
         if kind == USER_MEMORY_BASE {
             return memory.map_or(0, |m| m.base);
+        }
+        if kind == USER_MEMORY_APERTURE_HI {
+            return memory.map_or_else(crate::sparse_uma::aperture_hi, |m| m.aperture_hi);
         }
         if kind == USER_VIEW_BIAS {
             // The view begins on 16 bytes of the copy the address finds
@@ -813,6 +818,9 @@ impl State {
             0 => None,
             h => crate::descriptor::heap(h as This).host(),
         }?;
+        if crate::sparse_uma::active() {
+            return crate::memory::ready(list, heap, &[], &[], writes);
+        }
         let (mut addresses, mut constants) = (Vec::new(), Vec::new());
         for root in self.roots_ref(compute) {
             match root {
@@ -1002,8 +1010,25 @@ impl State {
             // copied back into title memory afterwards.
             let writes = (t.stores || !write_skip())
                 && !crate::pipeline::builder_quarantined(self.pipeline as This);
-            // Title memory by address: what the shader finds it by.
-            let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
+            // Title memory by address: what the shader finds it by (either legacy
+            // `SLOT_MEMORY` directory or Stage M3 direct `USER_MEMORY_BASE` /
+            // `USER_MEMORY_APERTURE_HI` sparse VRAM windows).
+            let uses_memory = t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY)
+                || t.host.user_data.iter().any(|u| {
+                    matches!(
+                        u.root,
+                        RootType::Other(k)
+                            if k == victory_shader::emit::USER_MEMORY_BASE
+                                || k == victory_shader::emit::USER_MEMORY_APERTURE_HI
+                    )
+                });
+            let memory = if uses_memory {
+                // Ensure visibility between consecutive sparse-UMA passes when
+                // an earlier dispatch on this list wrote through raw window UAVs
+                // (console PipelineSync is a no-op in `list.rs`).
+                if crate::sparse_uma::active() && list.sparse_uma_wrote() {
+                    list.uav_barrier_all();
+                }
                 let Some(ready) = self.memory_ready(list, compute, writes) else {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
                     return false;
@@ -1068,6 +1093,22 @@ impl State {
                                 }
                             },
                             None => once!("a shader picks buffers from a view heap that is not set"),
+                        }
+                        continue;
+                    }
+                    if srv && slot == victory_shader::emit::SLOT_VIEWS {
+                        // Ours: 16-byte `[addr_lo, addr_hi, num_records, stride]`
+                        // metadata per view-heap slot (`t252`), lazily allocated.
+                        match self.heap_views(list) {
+                            // SAFETY: an open list; the list holds the upload buffer.
+                            Some(gpu) => unsafe {
+                                if compute {
+                                    l.SetComputeRootShaderResourceView(param, gpu);
+                                } else {
+                                    l.SetGraphicsRootShaderResourceView(param, gpu);
+                                }
+                            },
+                            None => once!("a shader reads descriptor metadata from a view heap that is not set"),
                         }
                         continue;
                     }
@@ -1347,6 +1388,25 @@ impl State {
             }
         }
         true
+    }
+
+    /// For a shader that reads descriptor metadata (`SLOT_VIEWS`, `t252`) from
+    /// the bound view heap: lazily materializes the 16-byte-per-slot upload
+    /// table and pins its buffer on `list`.
+    fn heap_views(&self, list: &HostList) -> Option<u64> {
+        let heap = self
+            .heaps
+            .iter()
+            .filter(|&&h| h != 0)
+            .map(|&h| crate::descriptor::heap(h as This))
+            .find(|h| !h.samplers())?;
+        let host = heap.host()?;
+        let (gpu, buffer) = host.views_gpu()?;
+        const ONCE: usize = usize::MAX - 0x5f;
+        if list.first_use(ONCE) {
+            list.keep(&buffer);
+        }
+        Some(gpu)
     }
 
     /// For a shader that picks buffers from the view heap by an index it

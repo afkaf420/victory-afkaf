@@ -13,6 +13,24 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
+/// Backing storage for the per-heap `victory_shader::emit::SLOT_VIEWS` table.
+/// Kept as a lean sparse map in RAM until a shader actually binds `t252`,
+/// avoiding 32 MiB of upload heap memory on heaps that never run `SLOT_VIEWS`
+/// shaders.
+enum ViewsTable {
+    Pending(std::collections::HashMap<u32, [u32; 4]>),
+    Live {
+        buffer: ID3D12Resource,
+        gpu: u64,
+        data: usize,
+    },
+    Unavailable,
+}
+
+// SAFETY: `ID3D12Resource` is free-threaded and `data` is its persistent upload
+// mapping, accessed only while holding `HostHeap::views`.
+unsafe impl Send for ViewsTable {}
+
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
@@ -54,6 +72,17 @@ pub(crate) struct HostHeap {
     /// (`victory_shader::emit::SLOT_STRIDES`): an upload buffer of
     /// `SLOT_STRIDES_COUNT` dwords, its GPU address and its mapping.
     strides: Option<(ID3D12Resource, u64, usize)>,
+    /// View heaps: per-slot `[addr_lo, addr_hi, num_records, stride]` metadata
+    /// for [`victory_shader::emit::SLOT_VIEWS`] (`t252`), lazily promoted from a sparse RAM map to a
+    /// persistent upload buffer on first bind.
+    views: Mutex<ViewsTable>,
+    /// Fixed base slot of the 16 sparse-UMA raw UAV slots right below
+    /// `null_slot` (`null_slot - 16`: `+0` = null raw UAV, `+1..=12` = twelve
+    /// 2 GiB reserved window UAVs); `None` on sampler heaps.
+    sparse_base: Option<u32>,
+    /// Whether the sparse-UMA raw UAV descriptors at `sparse_base..+13` have
+    /// been populated in this heap.
+    sparse_installed: Mutex<bool>,
     /// Title slots holding buffer views. Such a view gets its host slot
     /// (and its memory a host copy) only when something reads it: a draw
     /// through a table, or [`HostHeap::buffer_slots`] for shaders that pick
@@ -763,6 +792,98 @@ fn view_stride(view: &View) -> Option<u32> {
     })
 }
 
+/// 16-byte [`victory_shader::emit::SLOT_VIEWS`] descriptor metadata `[addr_lo, addr_hi, num_records, stride]`
+/// for a buffer or constant buffer view; `None` for texture/sampler views.
+///
+/// Layout matches RDNA2 `V#` semantics:
+/// - `addr_lo` / `addr_hi`: 48-bit title GPU base address of the view (`base + FirstElement * element_bytes`).
+/// - `num_records`: byte length for raw buffers (`NumElements * 4`) and CBVs, element count (`NumElements`) for structured and typed buffers.
+/// - `stride`: bytes per element (structured stride, `1` for raw, format element bytes for typed, `0` for CBVs).
+fn view_record(view: &View) -> Option<[u32; 4]> {
+    const BUFFER: u32 = 1;
+    match view {
+        &View::Constant(address, size) => Some([address as u32, (address >> 32) as u32, size, 0]),
+        View::Shader(r, None) | View::Unordered(r, _, None) => {
+            let (ptr, len) = crate::resource::buffer_bytes(*r as crate::object::This)?;
+            let addr = ptr as u64;
+            Some([
+                addr as u32,
+                (addr >> 32) as u32,
+                len.min(u64::from(u32::MAX)) as u32,
+                1,
+            ])
+        }
+        View::Shader(r, Some(words)) if words[1] == BUFFER => {
+            let base = crate::resource::buffer_bytes(*r as crate::object::This)?.0 as u64;
+            Some(buffer_srv_record(base, words))
+        }
+        View::Unordered(r, _, Some(words)) if words[1] == BUFFER => {
+            let base = crate::resource::buffer_bytes(*r as crate::object::This)?.0 as u64;
+            Some(buffer_uav_record(base, words))
+        }
+        View::Placed(unordered, resource, desc) if resource[0] == BUFFER => {
+            let base = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+            let words: &[u32; 10] = desc[..10].try_into().ok()?;
+            Some(if *unordered {
+                buffer_uav_record(base, words)
+            } else {
+                buffer_srv_record(base, words)
+            })
+        }
+        _ => None,
+    }
+}
+
+fn buffer_srv_record(base: u64, words: &[u32; 10]) -> [u32; 4] {
+    let d = srv_desc(words);
+    // SAFETY: `words[1] == BUFFER`, so the `Buffer` union member is active.
+    let b = unsafe { d.Anonymous.Buffer };
+    let raw = b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
+    let elem = element_size(&d);
+    let addr = base.saturating_add(b.FirstElement.saturating_mul(elem));
+    let stride = if b.StructureByteStride > 0 {
+        b.StructureByteStride
+    } else if raw {
+        1
+    } else {
+        elem as u32
+    };
+    let num_records = if raw {
+        b.NumElements.saturating_mul(4)
+    } else {
+        b.NumElements
+    };
+    [addr as u32, (addr >> 32) as u32, num_records, stride]
+}
+
+fn buffer_uav_record(base: u64, words: &[u32; 10]) -> [u32; 4] {
+    let d = uav_desc(words);
+    // SAFETY: `words[1] == BUFFER`, so the `Buffer` union member is active.
+    let b = unsafe { d.Anonymous.Buffer };
+    let raw = b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
+    let elem = if b.StructureByteStride > 0 {
+        u64::from(b.StructureByteStride)
+    } else if raw {
+        4
+    } else {
+        crate::resource::element(d.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
+    };
+    let addr = base.saturating_add(b.FirstElement.saturating_mul(elem));
+    let stride = if b.StructureByteStride > 0 {
+        b.StructureByteStride
+    } else if raw {
+        1
+    } else {
+        elem as u32
+    };
+    let num_records = if raw {
+        b.NumElements.saturating_mul(4)
+    } else {
+        b.NumElements
+    };
+    [addr as u32, (addr >> 32) as u32, num_records, stride]
+}
+
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
 /// device-removed reports: a shader indexing a heap past its end faults.
 static GPU_RANGES: Mutex<Vec<(u64, u64, u64, bool)>> = Mutex::new(Vec::new());
@@ -884,9 +1005,9 @@ impl HostHeap {
         } else {
             victory_shader::emit::view_heap_limit()
         };
-        let (heap, count, size) = if null == 0 {
+        let (heap, count, size, sparse_base) = if null == 0 {
             match make(count + extra) {
-                Ok(heap) => (heap, count, count + extra),
+                Ok(heap) => (heap, count, count + extra, None),
                 Err(e) => {
                     tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
                     return None;
@@ -894,16 +1015,21 @@ impl HostHeap {
             }
         } else {
             let size = null + 1;
-            let fitted = if count + extra <= null {
+            // Reserve 16 fixed slots right below `null_slot` for Stage M3
+            // sparse UMA (`+0` = null raw UAV, `+1..=12` = 12 x 2 GiB windows)
+            // with zero collision against console slot 0 or `null_slot`.
+            let sparse_base = null.checked_sub(crate::sparse_uma::SPARSE_SLOTS);
+            let ceiling = sparse_base.unwrap_or(null);
+            let fitted = if count + extra <= ceiling {
                 count
             } else {
                 // shortcut: descriptors past the host's limit are left out; a title that reaches
                 // them needs remapping. They read the null slot instead.
                 tracing::warn!(count, "host view heap capped at {size}; views past it read a null slot");
-                null - extra
+                ceiling - extra
             };
             match make(size) {
-                Ok(heap) => (heap, fitted, size),
+                Ok(heap) => (heap, fitted, size, sparse_base),
                 Err(e) => {
                     tracing::warn!(error = %e, count, size, "no host view heap");
                     return None;
@@ -952,6 +1078,13 @@ impl HostHeap {
             free: std::sync::atomic::AtomicU32::new(DYNAMIC),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
+            views: Mutex::new(if sampler {
+                ViewsTable::Unavailable
+            } else {
+                ViewsTable::Pending(std::collections::HashMap::new())
+            }),
+            sparse_base,
+            sparse_installed: Mutex::new(false),
             buffers: Mutex::default(),
             changed: Mutex::default(),
             textures: Mutex::default(),
@@ -978,6 +1111,9 @@ impl HostHeap {
             tracing::warn!(error = %e, "host descriptor heap not made null");
         }
         tracing::debug!(ms = started.elapsed().as_millis(), "host descriptor heap made null");
+        if !sampler && crate::sparse_uma::active() {
+            let _ = h.ensure_sparse_views();
+        }
         Some(h)
     }
 
@@ -1118,6 +1254,107 @@ impl HostHeap {
     /// The table's buffer, for a list to hold.
     pub(crate) fn strides_buffer(&self) -> Option<&ID3D12Resource> {
         self.strides.as_ref().map(|s| &s.0)
+    }
+
+    /// Populates the 16 fixed Stage M3 sparse-UMA descriptor slots right below
+    /// `null_slot` (`SPARSE_BASE = null_slot - 16`: `+0` = null raw UAV,
+    /// `+1..=12` = twelve 2 GiB reserved window raw UAVs) once per view heap
+    /// and returns `SPARSE_BASE`.
+    pub(crate) fn ensure_sparse_views(&self) -> Option<u32> {
+        let base = self.sparse_base?;
+        let mut installed = self.sparse_installed.lock().unwrap_or_else(|e| e.into_inner());
+        if *installed {
+            return Some(base);
+        }
+        let windows = crate::sparse_uma::window_resources()?;
+        self.null_raw_uav_at(base);
+        for (w, res) in windows.iter().enumerate() {
+            self.raw_uav_at(base + 1 + w as u32, res, 0, crate::sparse_uma::WINDOW_BYTES);
+        }
+        *installed = true;
+        Some(base)
+    }
+
+    /// The GPU address and upload buffer of the per-slot 16-byte [`victory_shader::emit::SLOT_VIEWS`]
+    /// metadata table (`t252`), lazily allocated and populated from tracked
+    /// views on first bind.
+    pub(crate) fn views_gpu(&self) -> Option<(u64, ID3D12Resource)> {
+        if self.sampler {
+            return None;
+        }
+        let mut table = self.views.lock().unwrap_or_else(|e| e.into_inner());
+        match &*table {
+            ViewsTable::Live { buffer, gpu, .. } => return Some((*gpu, buffer.clone())),
+            ViewsTable::Unavailable => return None,
+            ViewsTable::Pending(_) => {}
+        }
+        let Some(host) = host() else {
+            *table = ViewsTable::Unavailable;
+            return None;
+        };
+        let bytes = u64::from(victory_shader::emit::SLOT_STRIDES_COUNT) * 16;
+        let Some((buffer, data)) = host.upload_buffer(bytes) else {
+            *table = ViewsTable::Unavailable;
+            return None;
+        };
+        // SAFETY: `data` maps the full `bytes`-long upload buffer; `buffer` is live.
+        let gpu = unsafe {
+            std::ptr::write_bytes(data, 0, bytes as usize);
+            buffer.GetGPUVirtualAddress()
+        };
+        crate::host::name(&buffer, || "view metadata by view heap slot (SLOT_VIEWS)".to_owned());
+        if let ViewsTable::Pending(pending) = std::mem::replace(
+            &mut *table,
+            ViewsTable::Live {
+                buffer: buffer.clone(),
+                gpu,
+                data: data as usize,
+            },
+        ) {
+            for (index, rec) in pending {
+                if index < victory_shader::emit::SLOT_STRIDES_COUNT {
+                    // SAFETY: `index < SLOT_STRIDES_COUNT`, 4 dwords per slot inside mapping.
+                    unsafe {
+                        let dst = data.cast::<u32>().add(index as usize * 4);
+                        for (k, &word) in rec.iter().enumerate() {
+                            dst.add(k).write_volatile(word);
+                        }
+                    }
+                }
+            }
+        }
+        Some((gpu, buffer))
+    }
+
+    /// Records the 16-byte `[addr_lo, addr_hi, num_records, stride]` entry for
+    /// view-heap slot `index` (`None` clears the slot to zeros).
+    fn write_view_record(&self, index: u32, record: Option<[u32; 4]>) {
+        if self.sampler || index >= victory_shader::emit::SLOT_STRIDES_COUNT {
+            return;
+        }
+        let mut table = self.views.lock().unwrap_or_else(|e| e.into_inner());
+        match &mut *table {
+            ViewsTable::Pending(map) => match record {
+                Some(rec) => {
+                    map.insert(index, rec);
+                }
+                None => {
+                    map.remove(&index);
+                }
+            },
+            ViewsTable::Live { data, .. } => {
+                let rec = record.unwrap_or([0; 4]);
+                // SAFETY: `index < SLOT_STRIDES_COUNT`, 4 dwords per slot inside
+                // the live persistent upload mapping.
+                unsafe {
+                    let dst = (*data as *mut u32).add(index as usize * 4);
+                    for (k, &word) in rec.iter().enumerate() {
+                        dst.add(k).write_volatile(word);
+                    }
+                }
+            }
+            ViewsTable::Unavailable => {}
+        }
     }
 
     /// Up to `max` title slots whose texture view is due at `frame`, each
@@ -1604,6 +1841,7 @@ impl HostHeap {
             // dword, either value is one the slot had).
             unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0)) };
         }
+        self.write_view_record(index, view.and_then(view_record));
         let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
         let was = if stride.is_some() {
             buffers.insert(index);
@@ -3321,5 +3559,76 @@ mod tests {
         heap.release(p2, 2);
         assert_eq!(heap.dynamic(4), Some(p1));
         assert_eq!(heap.dynamic(1), None);
+    }
+
+    #[test]
+    fn slot_views_records_16_byte_metadata_and_materializes_lazily() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        // Reserved 16 sparse-UMA slots strictly below `null_slot` and past `count + dynamic`.
+        let null = victory_shader::emit::view_heap_limit();
+        assert!(null > 0);
+        assert_eq!(heap.sparse_base, Some(null - crate::sparse_uma::SPARSE_SLOTS));
+        assert!(heap.count + heap.dynamic <= heap.sparse_base.unwrap());
+
+        // Before any shader binds `SLOT_VIEWS`, the table stays a lean `Pending` map.
+        assert!(matches!(*heap.views.lock().unwrap(), ViewsTable::Pending(_)));
+
+        // 1. Placed raw SRV: base 0x10_0000_0000, FirstElement=4 (16 B), NumElements=100 (400 B).
+        let base = 0x10_0000_0000u64;
+        let mut raw_desc = [0u32; 16];
+        raw_desc[0] = 39; // DXGI_FORMAT_R32_TYPELESS
+        raw_desc[1] = 1;  // D3D12_SRV_DIMENSION_BUFFER
+        raw_desc[2] = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        raw_desc[4] = 4;  // FirstElement lo
+        raw_desc[6] = 100; // NumElements
+        raw_desc[8] = 1;  // D3D12_BUFFER_SRV_FLAG_RAW
+        raw_desc[10] = base as u32;
+        raw_desc[11] = (base >> 32) as u32;
+        let mut buf_res = [0u32; 14];
+        buf_res[0] = 1; // BUFFER
+        buf_res[4] = 4096;
+        let raw_view = View::Placed(false, buf_res, raw_desc);
+        assert_eq!(view_record(&raw_view), Some([16, 0x10, 400, 1]));
+        let _ = heap.note_buffer(2, Some(&raw_view), false);
+
+        // 2. Placed structured UAV: base 0x12_0000_0000, FirstElement=2, NumElements=50, Stride=64.
+        let sbase = 0x12_0000_0000u64;
+        let mut str_desc = [0u32; 16];
+        str_desc[0] = 0;  // DXGI_FORMAT_UNKNOWN
+        str_desc[1] = 1;  // D3D12_UAV_DIMENSION_BUFFER
+        str_desc[2] = 2;  // FirstElement lo (UAV has no Shader4ComponentMapping!)
+        str_desc[4] = 50; // NumElements
+        str_desc[5] = 64; // StructureByteStride
+        str_desc[10] = sbase as u32;
+        str_desc[11] = (sbase >> 32) as u32;
+        let str_view = View::Placed(true, buf_res, str_desc);
+        assert_eq!(view_record(&str_view), Some([128, 0x12, 50, 64]));
+        let _ = heap.note_buffer(5, Some(&str_view), false);
+
+        // 3. Constant buffer view at slot 6.
+        let cbv = View::Constant(0x14_0000_2000, 256);
+        assert_eq!(view_record(&cbv), Some([0x2000, 0x14, 256, 0]));
+        let _ = heap.note_buffer(6, Some(&cbv), false);
+
+        // Materialize upload buffer lazily on first bind (`views_gpu`) and verify exact 16-byte stride (`slot << 4`).
+        let (gpu, _buf) = heap.views_gpu().expect("SLOT_VIEWS upload buffer");
+        assert_ne!(gpu, 0);
+        let data = match &*heap.views.lock().unwrap() {
+            ViewsTable::Live { data, .. } => *data as *const u32,
+            _ => panic!("expected ViewsTable::Live after views_gpu()"),
+        };
+        // SAFETY: `data` maps `SLOT_STRIDES_COUNT * 16` bytes; reading slots 2, 5, 6 (4 dwords each).
+        unsafe {
+            assert_eq!(std::slice::from_raw_parts(data.add(2 * 4), 4), &[16, 0x10, 400, 1]);
+            assert_eq!(std::slice::from_raw_parts(data.add(5 * 4), 4), &[128, 0x12, 50, 64]);
+            assert_eq!(std::slice::from_raw_parts(data.add(6 * 4), 4), &[0x2000, 0x14, 256, 0]);
+        }
+        // Clearing slot 2 zeroes all 4 dwords in the live table.
+        let _ = heap.note_buffer(2, None, false);
+        unsafe {
+            assert_eq!(std::slice::from_raw_parts(data.add(2 * 4), 4), &[0, 0, 0, 0]);
+        }
     }
 }

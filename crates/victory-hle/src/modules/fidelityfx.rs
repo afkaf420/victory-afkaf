@@ -1354,6 +1354,26 @@ mod runtime {
             .as_ref()
     }
 
+    unsafe extern "C" fn sl_log_callback(log_type: u32, msg: *const c_char) {
+        if msg.is_null() {
+            return;
+        }
+        // SAFETY: Streamline passes a NUL-terminated ASCII/UTF-8 log message.
+        let text = unsafe { std::ffi::CStr::from_ptr(msg) }
+            .to_string_lossy()
+            .trim_end()
+            .to_string();
+        match log_type {
+            2 => tracing::error!(target: "victory_hle::fidelityfx::sl", "{text}"),
+            1 => tracing::warn!(target: "victory_hle::fidelityfx::sl", "{text}"),
+            _ => tracing::debug!(target: "victory_hle::fidelityfx::sl", "{text}"),
+        }
+        #[cfg(test)]
+        if log_type >= 1 {
+            eprintln!("[sl:{log_type}] {text}");
+        }
+    }
+
     impl StreamlineRuntime {
         fn ensure_device(&self, host_device: *mut c_void) -> Result<(Option<PfnSlDlssSetOptions>, Option<PfnSlDlssGetState>), u32> {
             let mut guard = self.device_state.lock().unwrap_or_else(|e| e.into_inner());
@@ -1379,7 +1399,7 @@ mod runtime {
                 path_to_logs_and_data: null(),
                 allocate_callback: null(),
                 release_callback: null(),
-                log_message_callback: null(),
+                log_message_callback: sl_log_callback as *const c_void,
                 flags: SL_PREF_DISABLE_CL_STATE_TRACKING | SL_PREF_USE_FRAME_BASED_TAGGING,
                 features_to_load: features.as_ptr(),
                 num_features_to_load: features.len() as u32,
@@ -1877,7 +1897,12 @@ mod runtime {
                             estimated_vram_usage_in_bytes: 0,
                         };
                         // SAFETY: valid viewport and output state struct.
-                        if unsafe { get_state(&raw const vp, &raw mut state) } == SL_RESULT_OK {
+                        // Streamline lazily allocates NGX DLSS resources on the first
+                        // `slEvaluateFeature`, reporting 0 before that; keep the
+                        // fallback estimate until NGX reports a live allocation.
+                        if unsafe { get_state(&raw const vp, &raw mut state) } == SL_RESULT_OK
+                            && state.estimated_vram_usage_in_bytes > 0
+                        {
                             total = state.estimated_vram_usage_in_bytes;
                         }
                     }
@@ -2305,6 +2330,523 @@ mod runtime {
             _ => FFX_API_RETURN_NO_PROVIDER,
         }
     }
+    #[cfg(test)]
+    pub(super) fn run_live_fsr3_smoke(loader_path: &Path, host_device: *mut c_void) {
+        let fsr = load_fsr3(loader_path).expect("load_fsr3 failed");
+
+        let mut override_ver = [0u64; 3];
+        override_ver[0] = FFX_API_DESC_TYPE_OVERRIDE_VERSION;
+        override_ver[1] = 0;
+        override_ver[2] = 0x0003_0001_0005;
+
+        let mut console_ver = [0u64; 3];
+        console_ver[0] = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE_VERSION;
+        console_ver[1] = override_ver.as_mut_ptr() as u64;
+        console_ver[2] = 0x00C0_1005;
+
+        let mut backend = FfxCreateBackendDX12Desc {
+            header: FfxApiHeader {
+                type_: FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_CONSOLE_ALT,
+                p_next: console_ver.as_mut_ptr().cast(),
+            },
+            device: 0x1234 as *mut c_void,
+        };
+        // Exercise 1280x720 -> 2560x1440 (above typical 1080p console targets).
+        let upscale = FfxCreateContextDescUpscale {
+            header: FfxApiHeader {
+                type_: FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE,
+                p_next: &raw mut backend.header,
+            },
+            flags: FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE
+                | FFX_UPSCALE_ENABLE_DEPTH_INVERTED
+                | FFX_UPSCALE_ENABLE_DEPTH_INFINITE,
+            max_render_size: FfxApiDimensions2D {
+                width: 1280,
+                height: 720,
+            },
+            max_upscale_size: FfxApiDimensions2D {
+                width: 2560,
+                height: 1440,
+            },
+            _pad: 0,
+            fp_message: None,
+        };
+
+        let cfg = UpscalerConfig::parse(Some("fsr3"), None, None, None);
+        // SAFETY: valid console-style create chain built on stack above.
+        let mut chain =
+            unsafe { rewrite_create_chain(&raw const upscale.header, host_device, &cfg) }
+                .expect("rewrite_create_chain failed");
+        assert_eq!(chain.stripped_nodes, 2);
+
+        let mut pc_ctx: *mut c_void = null_mut();
+        let head = chain.link_head();
+        // SAFETY: valid PC DX12 create chain and host ID3D12Device*.
+        let rc = unsafe { (fsr.create_context)(&raw mut pc_ctx, head, null()) };
+        assert_eq!(
+            rc,
+            FFX_API_RETURN_OK,
+            "PC FSR3 ffxCreateContext failed (loader = {})",
+            loader_path.display()
+        );
+        assert!(!pc_ctx.is_null());
+
+        let mut provider = FfxQueryGetProviderVersion {
+            header: FfxApiHeader {
+                type_: FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION,
+                p_next: null_mut(),
+            },
+            version_id: 0,
+            version_name: null(),
+        };
+        assert_eq!(
+            unsafe { (fsr.query)(&raw mut pc_ctx, &raw mut provider.header) },
+            FFX_API_RETURN_OK
+        );
+        let provider_name = if provider.version_name.is_null() {
+            "<null>".to_string()
+        } else {
+            unsafe { std::ffi::CStr::from_ptr(provider.version_name) }
+                .to_string_lossy()
+                .into_owned()
+        };
+        eprintln!(
+            "live PC FSR3 provider: id={:#x} name={provider_name} (loader={})",
+            provider.version_id,
+            loader_path.display()
+        );
+
+        let mut phase_count = 0i32;
+        let mut q_phase = FfxQueryDescUpscaleGetJitterPhaseCount {
+            header: FfxApiHeader {
+                type_: FFX_API_QUERY_DESC_TYPE_UPSCALE_GETJITTERPHASECOUNT,
+                p_next: null_mut(),
+            },
+            render_width: 1280,
+            display_width: 2560,
+            out_phase_count: &raw mut phase_count,
+        };
+        assert_eq!(
+            unsafe { (fsr.query)(&raw mut pc_ctx, &raw mut q_phase.header) },
+            FFX_API_RETURN_OK
+        );
+        assert_eq!(phase_count, 32);
+
+        let (mut jx, mut jy) = (0.0f32, 0.0f32);
+        let mut q_jitter = FfxQueryDescUpscaleGetJitterOffset {
+            header: FfxApiHeader {
+                type_: FFX_API_QUERY_DESC_TYPE_UPSCALE_GETJITTEROFFSET,
+                p_next: null_mut(),
+            },
+            index: 0,
+            phase_count,
+            out_x: &raw mut jx,
+            out_y: &raw mut jy,
+        };
+        assert_eq!(
+            unsafe { (fsr.query)(&raw mut pc_ctx, &raw mut q_jitter.header) },
+            FFX_API_RETURN_OK
+        );
+        assert!((-0.5..=0.5).contains(&jx) && (-0.5..=0.5).contains(&jy));
+
+        let mut mem = FfxApiEffectMemoryUsage::default();
+        let mut q_mem = FfxQueryDescUpscaleGetGpuMemoryUsage {
+            header: FfxApiHeader {
+                type_: FFX_API_QUERY_DESC_TYPE_UPSCALE_GPU_MEMORY_USAGE,
+                p_next: null_mut(),
+            },
+            gpu_memory_usage_upscaler: &raw mut mem,
+        };
+        assert_eq!(
+            unsafe { (fsr.query)(&raw mut pc_ctx, &raw mut q_mem.header) },
+            FFX_API_RETURN_OK
+        );
+        assert!(mem.total_usage_in_bytes > 0);
+        eprintln!(
+            "live PC FSR3 1440p context VRAM: {} MiB (aliasable {} MiB)",
+            mem.total_usage_in_bytes >> 20,
+            mem.aliasable_usage_in_bytes >> 20
+        );
+
+        assert_eq!(
+            unsafe { (fsr.destroy_context)(&raw mut pc_ctx, null()) },
+            FFX_API_RETURN_OK
+        );
+    }
+
+    #[cfg(test)]
+    pub(super) fn run_live_dlss_eval_smoke(
+        interposer_path: &Path,
+        host_device: *mut c_void,
+    ) -> u64 {
+        // Reuse the process-wide Streamline runtime if already selected by `active_runtime()`,
+        // otherwise load it once in a test-local singleton so `slInit` is never called twice.
+        static TEST_SL: OnceLock<Option<StreamlineRuntime>> = OnceLock::new();
+        let sl: &StreamlineRuntime = match active_runtime() {
+            Some(BackendRuntime::Dlss(rt)) => rt,
+            _ => TEST_SL
+                .get_or_init(|| load_streamline(interposer_path))
+                .as_ref()
+                .expect("load_streamline failed"),
+        };
+
+        let (set_options, get_state) = sl
+            .ensure_device(host_device)
+            .expect("Streamline ensure_device (slInit + slSetD3DDevice) failed");
+        let set_options = set_options.expect("slDLSSSetOptions feature function missing");
+        let get_state = get_state.expect("slDLSSGetState feature function missing");
+
+        let viewport_id = sl.next_viewport.fetch_add(1, Ordering::Relaxed);
+        let vp = SlViewportHandle {
+            base: SlBaseStructure {
+                next: null_mut(),
+                struct_type: SL_GUID_VIEWPORT_HANDLE,
+                struct_version: SL_STRUCT_V1,
+            },
+            value: viewport_id,
+            _pad: 0,
+        };
+
+        let (rw, rh) = (1280u32, 720u32);
+        let (ow, oh) = (2560u32, 1440u32);
+
+        let opts = SlDlssOptions {
+            base: SlBaseStructure {
+                next: null_mut(),
+                struct_type: SL_GUID_DLSS_OPTIONS,
+                struct_version: SL_STRUCT_V3,
+            },
+            mode: UpscaleQuality::Performance.sl_dlss_mode(),
+            output_width: ow,
+            output_height: oh,
+            sharpness: 0.0,
+            pre_exposure: 1.0,
+            exposure_scale: 1.0,
+            color_buffers_hdr: SL_BOOL_TRUE,
+            indicator_invert_axis_x: SL_BOOL_FALSE,
+            indicator_invert_axis_y: SL_BOOL_FALSE,
+            _pad0: 0,
+            dlaa_preset: 0,
+            quality_preset: 0,
+            balanced_preset: 0,
+            performance_preset: 0,
+            ultra_performance_preset: 0,
+            ultra_quality_preset: 0,
+            use_auto_exposure: SL_BOOL_FALSE,
+            alpha_upscaling_enabled: SL_BOOL_FALSE,
+            _pad1: [0; 2],
+        };
+        let r_opts = unsafe { set_options(&raw const vp, &raw const opts) };
+        assert_eq!(r_opts, SL_RESULT_OK, "slDLSSSetOptions failed: {r_opts}");
+
+        let mut state = SlDlssState {
+            base: SlBaseStructure {
+                next: null_mut(),
+                struct_type: SL_GUID_DLSS_STATE,
+                struct_version: SL_STRUCT_V1,
+            },
+            estimated_vram_usage_in_bytes: 0,
+        };
+        let r_state = unsafe { get_state(&raw const vp, &raw mut state) };
+        assert_eq!(r_state, SL_RESULT_OK, "slDLSSGetState failed: {r_state}");
+        eprintln!(
+            "live NVIDIA DLSS 1440p state: estimated VRAM = {} MiB ({} B)",
+            state.estimated_vram_usage_in_bytes >> 20,
+            state.estimated_vram_usage_in_bytes
+        );
+
+        // Allocate real host D3D12 textures + command list on the RTX 3090 and
+        // record a genuine `slEvaluateFeature(kFeatureDLSS)` Tensor-Core pass.
+        #[repr(C)]
+        struct D3d12HeapProperties {
+            type_: u32,
+            cpu_page_property: u32,
+            memory_pool_preference: u32,
+            creation_node_mask: u32,
+            visible_node_mask: u32,
+        }
+        #[repr(C)]
+        struct DxgiSampleDesc {
+            count: u32,
+            quality: u32,
+        }
+        #[repr(C)]
+        struct D3d12ResourceDesc {
+            dimension: u32,
+            alignment: u64,
+            width: u64,
+            height: u32,
+            depth_or_array_size: u16,
+            mip_levels: u16,
+            format: u32,
+            sample_desc: DxgiSampleDesc,
+            layout: u32,
+            flags: u32,
+        }
+
+        // SAFETY: helper invokes standard COM vtable entries on live D3D12 objects.
+        unsafe fn com_slot<F: Copy>(obj: *mut c_void, slot: usize) -> F {
+            unsafe {
+                let vtbl = *(obj.cast::<*const *const c_void>());
+                std::mem::transmute_copy(&*vtbl.add(slot))
+            }
+        }
+        unsafe fn com_release(obj: *mut c_void) {
+            if !obj.is_null() {
+                let rel: unsafe extern "system" fn(*mut c_void) -> u32 =
+                    unsafe { com_slot(obj, 2) };
+                unsafe { rel(obj) };
+            }
+        }
+
+        static IID_COMMAND_ALLOCATOR: [u8; 16] = [
+            0xe4, 0xde, 0x02, 0x61, 0x59, 0xaf, 0x09, 0x4b, 0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0,
+            0x9b, 0x24,
+        ];
+        static IID_GRAPHICS_CMD_LIST: [u8; 16] = [
+            0x0f, 0x0d, 0x16, 0x5b, 0x1b, 0xac, 0x85, 0x41, 0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5,
+            0xa4, 0x55,
+        ];
+        static IID_RESOURCE: [u8; 16] = [
+            0xbe, 0x42, 0x64, 0x69, 0x2e, 0xa7, 0x59, 0x40, 0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04,
+            0x0f, 0xad,
+        ];
+
+        type PfnCreateAlloc = unsafe extern "system" fn(
+            *mut c_void,
+            u32,
+            *const [u8; 16],
+            *mut *mut c_void,
+        ) -> i32;
+        type PfnCreateList = unsafe extern "system" fn(
+            *mut c_void,
+            u32,
+            u32,
+            *mut c_void,
+            *mut c_void,
+            *const [u8; 16],
+            *mut *mut c_void,
+        ) -> i32;
+        type PfnCreateCommitted = unsafe extern "system" fn(
+            *mut c_void,
+            *const D3d12HeapProperties,
+            u32,
+            *const D3d12ResourceDesc,
+            u32,
+            *const c_void,
+            *const [u8; 16],
+            *mut *mut c_void,
+        ) -> i32;
+        type PfnCloseList = unsafe extern "system" fn(*mut c_void) -> i32;
+
+        let create_tex = |w: u32, h: u32, fmt: u32, flags: u32, state: u32| -> (*mut c_void, TextureDesc) {
+            let hp = D3d12HeapProperties {
+                type_: 1, // DEFAULT
+                cpu_page_property: 0,
+                memory_pool_preference: 0,
+                creation_node_mask: 1,
+                visible_node_mask: 1,
+            };
+            let desc = D3d12ResourceDesc {
+                dimension: 3, // TEXTURE2D
+                alignment: 0,
+                width: u64::from(w),
+                height: h,
+                depth_or_array_size: 1,
+                mip_levels: 1,
+                format: fmt,
+                sample_desc: DxgiSampleDesc {
+                    count: 1,
+                    quality: 0,
+                },
+                layout: 0,
+                flags,
+            };
+            let mut res: *mut c_void = null_mut();
+            let f: PfnCreateCommitted = unsafe { com_slot(host_device, 27) };
+            let hr = unsafe {
+                f(
+                    host_device,
+                    &raw const hp,
+                    0,
+                    &raw const desc,
+                    state,
+                    null(),
+                    &raw const IID_RESOURCE,
+                    &raw mut res,
+                )
+            };
+            assert_eq!(hr, 0, "CreateCommittedResource({w}x{h} fmt={fmt}) failed: {hr:#x}");
+            (
+                res,
+                TextureDesc {
+                    dimension: 3,
+                    width: u64::from(w),
+                    height: h,
+                    depth_or_array_size: 1,
+                    mip_levels: 1,
+                    dxgi_format: fmt,
+                    flags,
+                },
+            )
+        };
+
+        let mut alloc: *mut c_void = null_mut();
+        let f_alloc: PfnCreateAlloc = unsafe { com_slot(host_device, 9) };
+        let hr_alloc =
+            unsafe { f_alloc(host_device, 0, &raw const IID_COMMAND_ALLOCATOR, &raw mut alloc) };
+        assert_eq!(hr_alloc, 0, "CreateCommandAllocator failed: {hr_alloc:#x}");
+
+        let mut cmd_list: *mut c_void = null_mut();
+        let f_list: PfnCreateList = unsafe { com_slot(host_device, 12) };
+        let hr_list = unsafe {
+            f_list(
+                host_device,
+                0,
+                0,
+                alloc,
+                null_mut(),
+                &raw const IID_GRAPHICS_CMD_LIST,
+                &raw mut cmd_list,
+            )
+        };
+        assert_eq!(hr_list, 0, "CreateCommandList failed: {hr_list:#x}");
+
+        let (tex_color, td_color) = create_tex(rw, rh, 10, 0, D3D12_STATE_NON_PIXEL_SHADER_RESOURCE);
+        let (tex_depth, td_depth) = create_tex(rw, rh, 41, 0, D3D12_STATE_NON_PIXEL_SHADER_RESOURCE);
+        let (tex_mvec, td_mvec) = create_tex(rw, rh, 34, 0, D3D12_STATE_NON_PIXEL_SHADER_RESOURCE);
+        let (tex_out, td_out) = create_tex(ow, oh, 10, 0x4, D3D12_STATE_UNORDERED_ACCESS);
+
+        let frame_idx = sl.frame_counter.fetch_add(1, Ordering::Relaxed);
+        let mut frame_token: *mut c_void = null_mut();
+        let r_tok = unsafe { (sl.sl_get_new_frame_token)(&raw mut frame_token, &raw const frame_idx) };
+        assert_eq!(r_tok, SL_RESULT_OK, "slGetNewFrameToken failed: {r_tok}");
+        assert!(!frame_token.is_null());
+
+        let (jx, jy) = jitter_offset(0, jitter_phase_count(rw, ow));
+        let ident = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let consts = SlConstants {
+            base: SlBaseStructure {
+                next: null_mut(),
+                struct_type: SL_GUID_CONSTANTS,
+                struct_version: SL_STRUCT_V2,
+            },
+            camera_view_to_clip: ident,
+            clip_to_camera_view: ident,
+            clip_to_lens_clip: ident,
+            clip_to_prev_clip: ident,
+            prev_clip_to_clip: ident,
+            jitter_offset: [jx, jy],
+            mvec_scale: [1.0, 1.0],
+            camera_pinhole_offset: [0.0, 0.0],
+            camera_pos: [0.0, 0.0, 0.0],
+            camera_up: [0.0, 1.0, 0.0],
+            camera_right: [1.0, 0.0, 0.0],
+            camera_fwd: [0.0, 0.0, 1.0],
+            camera_near: 0.1,
+            camera_far: 1000.0,
+            camera_fov: 1.0472,
+            camera_aspect_ratio: (rw as f32) / (rh as f32),
+            motion_vectors_invalid_value: SL_INVALID_FLOAT,
+            depth_inverted: SL_BOOL_TRUE,
+            camera_motion_included: SL_BOOL_TRUE,
+            motion_vectors_3d: SL_BOOL_FALSE,
+            reset: SL_BOOL_TRUE,
+            orthographic_projection: SL_BOOL_FALSE,
+            motion_vectors_dilated: SL_BOOL_FALSE,
+            motion_vectors_jittered: SL_BOOL_FALSE,
+            _pad0: 0,
+            min_relative_linear_depth_object_separation: 40.0,
+        };
+        let r_const = unsafe { (sl.sl_set_constants)(&raw const consts, frame_token, &raw const vp) };
+        assert_eq!(r_const, SL_RESULT_OK, "slSetConstants failed: {r_const}");
+
+        let mut sl_color = make_sl_resource(tex_color, td_color, D3D12_STATE_NON_PIXEL_SHADER_RESOURCE);
+        let mut sl_depth = make_sl_resource(tex_depth, td_depth, D3D12_STATE_NON_PIXEL_SHADER_RESOURCE);
+        let mut sl_mvec = make_sl_resource(tex_mvec, td_mvec, D3D12_STATE_NON_PIXEL_SHADER_RESOURCE);
+        let mut sl_out = make_sl_resource(tex_out, td_out, D3D12_STATE_UNORDERED_ACCESS);
+
+        let tags = [
+            make_sl_tag(&raw mut sl_color, SL_BUF_SCALING_INPUT_COLOR, rw, rh),
+            make_sl_tag(&raw mut sl_depth, SL_BUF_DEPTH, rw, rh),
+            make_sl_tag(&raw mut sl_mvec, SL_BUF_MOTION_VECTORS, rw, rh),
+            make_sl_tag(&raw mut sl_out, SL_BUF_SCALING_OUTPUT_COLOR, ow, oh),
+        ];
+        let r_tag = if let Some(tag_for_frame) = sl.sl_set_tag_for_frame {
+            unsafe {
+                tag_for_frame(
+                    frame_token,
+                    &raw const vp,
+                    tags.as_ptr(),
+                    tags.len() as u32,
+                    cmd_list,
+                )
+            }
+        } else {
+            unsafe {
+                sl.sl_set_tag.expect("slSetTag missing")(
+                    &raw const vp,
+                    tags.as_ptr(),
+                    tags.len() as u32,
+                    cmd_list,
+                )
+            }
+        };
+        assert_eq!(r_tag, SL_RESULT_OK, "slSetTagForFrame failed: {r_tag}");
+
+        let inputs: [*const SlBaseStructure; 1] = [&raw const vp.base];
+        let r_eval = unsafe {
+            (sl.sl_evaluate_feature)(
+                SL_FEATURE_DLSS,
+                frame_token,
+                inputs.as_ptr(),
+                inputs.len() as u32,
+                cmd_list,
+            )
+        };
+        assert_eq!(r_eval, SL_RESULT_OK, "slEvaluateFeature(kFeatureDLSS) failed: {r_eval}");
+
+        let f_close: PfnCloseList = unsafe { com_slot(cmd_list, 9) };
+        let hr_close = unsafe { f_close(cmd_list) };
+        assert_eq!(hr_close, 0, "ID3D12GraphicsCommandList::Close failed: {hr_close:#x}");
+
+        let mut post_state = SlDlssState {
+            base: SlBaseStructure {
+                next: null_mut(),
+                struct_type: SL_GUID_DLSS_STATE,
+                struct_version: SL_STRUCT_V1,
+            },
+            estimated_vram_usage_in_bytes: 0,
+        };
+        let r_post = unsafe { get_state(&raw const vp, &raw mut post_state) };
+        assert_eq!(r_post, SL_RESULT_OK, "post-eval slDLSSGetState failed: {r_post}");
+        eprintln!(
+            "live NVIDIA DLSS 1440p post-eval state: estimated VRAM = {} MiB ({} B)",
+            post_state.estimated_vram_usage_in_bytes >> 20,
+            post_state.estimated_vram_usage_in_bytes
+        );
+
+        if let Some(free_fn) = sl.sl_free_resources {
+            let _ = unsafe { free_fn(SL_FEATURE_DLSS, &raw const vp) };
+        }
+        unsafe {
+            com_release(tex_out);
+            com_release(tex_mvec);
+            com_release(tex_depth);
+            com_release(tex_color);
+            com_release(cmd_list);
+            com_release(alloc);
+        }
+
+        post_state
+            .estimated_vram_usage_in_bytes
+            .max(state.estimated_vram_usage_in_bytes)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2584,161 +3126,122 @@ mod tests {
     }
 
     #[cfg(windows)]
+    fn ensure_host_device_for_test() -> Option<*mut c_void> {
+        if let Some(dev) = host_device_raw() {
+            return Some(dev);
+        }
+        let mut dev = null();
+        let _ = victory_gpu::device::create(
+            null(),
+            null(),
+            &raw const victory_gpu::device::IID,
+            &raw mut dev,
+        );
+        host_device_raw()
+    }
+
+    #[cfg(windows)]
     #[test]
     fn live_pc_fsr3_context_create_query_destroy() {
-        let cfg = config();
-        let dirs = search_dirs(cfg);
-        let Some(SelectedBackend::Fsr3(loader_path)) = discover_backend_in(cfg, &dirs) else {
+        let fsr_cfg = UpscalerConfig::parse(
+            Some("fsr3"),
+            config().dir.as_deref().and_then(Path::to_str),
+            None,
+            None,
+        );
+        let dirs = search_dirs(&fsr_cfg);
+        let Some(SelectedBackend::Fsr3(loader_path)) = discover_backend_in(&fsr_cfg, &dirs) else {
             eprintln!("skipping live PC FSR3 smoke test: amd_fidelityfx_loader_dx12.dll not found");
             return;
         };
-        if host_device_raw().is_none() {
-            // Initialise the host D3D12 device through the standard console entry.
-            let mut dev = null();
-            let _ = victory_gpu::device::create(
-                null(),
-                null(),
-                &raw const victory_gpu::device::IID,
-                &raw mut dev,
-            );
-        }
-        if host_device_raw().is_none() {
+        let Some(host_device) = ensure_host_device_for_test() else {
             eprintln!("skipping live PC FSR3 smoke test: no host D3D12 adapter available");
             return;
+        };
+        runtime::run_live_fsr3_smoke(&loader_path, host_device);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn live_nvidia_dlss_streamline_init_and_eval() {
+        let dlss_cfg = UpscalerConfig::parse(
+            Some("dlss"),
+            config().dir.as_deref().and_then(Path::to_str),
+            None,
+            None,
+        );
+        let dirs = search_dirs(&dlss_cfg);
+        let Some(SelectedBackend::Dlss(interposer_path)) = discover_backend_in(&dlss_cfg, &dirs)
+        else {
+            eprintln!("skipping live NVIDIA DLSS test: Streamline DLLs not found");
+            return;
+        };
+        let Some(host_device) = ensure_host_device_for_test() else {
+            eprintln!("skipping live NVIDIA DLSS test: no host D3D12 adapter available");
+            return;
+        };
+
+        // 1. If the active process backend is DLSS (the default `auto` or `dlss`),
+        // exercise the public HLE exports (`ffxCreateContext` / `ffxQuery` / `ffxDestroyContext`).
+        let active_cfg = config();
+        if matches!(
+            discover_backend_in(active_cfg, &search_dirs(active_cfg)),
+            Some(SelectedBackend::Dlss(_))
+        ) {
+            let mut backend = FfxCreateBackendDX12Desc {
+                header: FfxApiHeader {
+                    type_: FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_CONSOLE_ALT,
+                    p_next: null_mut(),
+                },
+                device: 0x1234 as *mut c_void,
+            };
+            let mut upscale = FfxCreateContextDescUpscale {
+                header: FfxApiHeader {
+                    type_: FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE,
+                    p_next: &raw mut backend.header,
+                },
+                flags: FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE
+                    | FFX_UPSCALE_ENABLE_DEPTH_INVERTED
+                    | FFX_UPSCALE_ENABLE_DEPTH_INFINITE,
+                max_render_size: FfxApiDimensions2D {
+                    width: 1280,
+                    height: 720,
+                },
+                max_upscale_size: FfxApiDimensions2D {
+                    width: 2560,
+                    height: 1440,
+                },
+                _pad: 0,
+                fp_message: None,
+            };
+            let mut ctx: *mut c_void = null_mut();
+            assert_eq!(
+                ffxCreateContext(&raw mut ctx, &raw mut upscale.header, null()),
+                FFX_API_RETURN_OK
+            );
+            assert!(!ctx.is_null());
+
+            let mut mem = FfxApiEffectMemoryUsage::default();
+            let mut q_mem = FfxQueryDescUpscaleGetGpuMemoryUsage {
+                header: FfxApiHeader {
+                    type_: FFX_API_QUERY_DESC_TYPE_UPSCALE_GPU_MEMORY_USAGE,
+                    p_next: null_mut(),
+                },
+                gpu_memory_usage_upscaler: &raw mut mem,
+            };
+            assert_eq!(
+                ffxQuery(&raw mut ctx, &raw mut q_mem.header),
+                FFX_API_RETURN_OK
+            );
+            assert!(mem.total_usage_in_bytes > 0);
+            assert_eq!(ffxDestroyContext(&raw mut ctx, null()), FFX_API_RETURN_OK);
+            assert!(ctx.is_null());
         }
 
-        let mut override_ver = OverrideVersionDesc {
-            header: FfxApiHeader {
-                type_: FFX_API_DESC_TYPE_OVERRIDE_VERSION,
-                p_next: null_mut(),
-            },
-            version_id: 0x0003_0001_0005,
-        };
-        let mut console_ver = ConsoleVersionDesc {
-            header: FfxApiHeader {
-                type_: FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE_VERSION,
-                p_next: &raw mut override_ver.header,
-            },
-            version: 0x00C0_1005,
-            _pad: 0,
-        };
-        let mut backend = FfxCreateBackendDX12Desc {
-            header: FfxApiHeader {
-                type_: FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_CONSOLE_ALT,
-                p_next: &raw mut console_ver.header,
-            },
-            device: 0x1234 as *mut c_void,
-        };
-        // Exercise 1280x720 -> 2560x1440 (above typical 1080p console targets).
-        let mut upscale = FfxCreateContextDescUpscale {
-            header: FfxApiHeader {
-                type_: FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE,
-                p_next: &raw mut backend.header,
-            },
-            flags: FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE
-                | FFX_UPSCALE_ENABLE_DEPTH_INVERTED
-                | FFX_UPSCALE_ENABLE_DEPTH_INFINITE,
-            max_render_size: FfxApiDimensions2D {
-                width: 1280,
-                height: 720,
-            },
-            max_upscale_size: FfxApiDimensions2D {
-                width: 2560,
-                height: 1440,
-            },
-            _pad: 0,
-            fp_message: None,
-        };
-
-        let mut ctx: *mut c_void = null_mut();
-        let rc = ffxCreateContext(&raw mut ctx, &raw mut upscale.header, null());
-        assert_eq!(
-            rc,
-            FFX_API_RETURN_OK,
-            "PC FSR3 ffxCreateContext failed (loader = {})",
-            loader_path.display()
-        );
-        assert!(!ctx.is_null());
-
-        let mut provider = FfxQueryGetProviderVersion {
-            header: FfxApiHeader {
-                type_: FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION,
-                p_next: null_mut(),
-            },
-            version_id: 0,
-            version_name: null(),
-        };
-        assert_eq!(
-            ffxQuery(&raw mut ctx, &raw mut provider.header),
-            FFX_API_RETURN_OK
-        );
-        let provider_name = if provider.version_name.is_null() {
-            "<null>".to_string()
-        } else {
-            // SAFETY: provider writes a static NUL-terminated C string.
-            unsafe { std::ffi::CStr::from_ptr(provider.version_name) }
-                .to_string_lossy()
-                .into_owned()
-        };
-        eprintln!(
-            "live PC FSR3 provider: id={:#x} name={provider_name} (loader={})",
-            provider.version_id,
-            loader_path.display()
-        );
-
-        let mut phase_count = 0i32;
-        let mut q_phase = FfxQueryDescUpscaleGetJitterPhaseCount {
-            header: FfxApiHeader {
-                type_: FFX_API_QUERY_DESC_TYPE_UPSCALE_GETJITTERPHASECOUNT,
-                p_next: null_mut(),
-            },
-            render_width: 1280,
-            display_width: 2560,
-            out_phase_count: &raw mut phase_count,
-        };
-        assert_eq!(
-            ffxQuery(&raw mut ctx, &raw mut q_phase.header),
-            FFX_API_RETURN_OK
-        );
-        assert_eq!(phase_count, 32);
-
-        let (mut jx, mut jy) = (0.0f32, 0.0f32);
-        let mut q_jitter = FfxQueryDescUpscaleGetJitterOffset {
-            header: FfxApiHeader {
-                type_: FFX_API_QUERY_DESC_TYPE_UPSCALE_GETJITTEROFFSET,
-                p_next: null_mut(),
-            },
-            index: 0,
-            phase_count,
-            out_x: &raw mut jx,
-            out_y: &raw mut jy,
-        };
-        assert_eq!(
-            ffxQuery(&raw mut ctx, &raw mut q_jitter.header),
-            FFX_API_RETURN_OK
-        );
-        assert!((-0.5..=0.5).contains(&jx) && (-0.5..=0.5).contains(&jy));
-
-        let mut mem = FfxApiEffectMemoryUsage::default();
-        let mut q_mem = FfxQueryDescUpscaleGetGpuMemoryUsage {
-            header: FfxApiHeader {
-                type_: FFX_API_QUERY_DESC_TYPE_UPSCALE_GPU_MEMORY_USAGE,
-                p_next: null_mut(),
-            },
-            gpu_memory_usage_upscaler: &raw mut mem,
-        };
-        assert_eq!(
-            ffxQuery(&raw mut ctx, &raw mut q_mem.header),
-            FFX_API_RETURN_OK
-        );
-        assert!(mem.total_usage_in_bytes > 0);
-        eprintln!(
-            "live PC FSR3 1440p context VRAM: {} MiB (aliasable {} MiB)",
-            mem.total_usage_in_bytes >> 20,
-            mem.aliasable_usage_in_bytes >> 20
-        );
-
-        assert_eq!(ffxDestroyContext(&raw mut ctx, null()), FFX_API_RETURN_OK);
-        assert!(ctx.is_null());
+        // 2. Run a real `slInit` -> `slSetD3DDevice` -> `slDLSSSetOptions` ->
+        // `slDLSSGetState` -> `slSetConstants` -> `slSetTagForFrame` ->
+        // `slEvaluateFeature(kFeatureDLSS)` pass on real D3D12 textures.
+        let vram = runtime::run_live_dlss_eval_smoke(&interposer_path, host_device);
+        assert!(vram > 0, "expected positive DLSS VRAM estimate from slDLSSGetState");
     }
 }

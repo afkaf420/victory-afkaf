@@ -51,6 +51,8 @@ mod memory;
 #[cfg(windows)]
 mod shadow;
 #[cfg(windows)]
+pub mod sparse_uma;
+#[cfg(windows)]
 mod tiles;
 pub mod signature;
 #[cfg(windows)]

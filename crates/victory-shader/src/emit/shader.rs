@@ -47,12 +47,19 @@ pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
 pub const SLOT_MEMORY: u8 = 254;
 /// See [`SLOT_MEMORY`].
 pub const SLOT_FAULTS: u8 = 253;
+/// The root SRV `t<SLOT_VIEWS>` in [`ROOT_CBV_SPACE`] of a shader that reads
+/// buffer descriptor metadata (title address, record count, stride) out of a
+/// dynamically indexed descriptor table or the view heap (`ResourceHeap`):
+/// a raw buffer of [`SLOT_STRIDES_COUNT`] 16-byte entries, entry `i` holding
+/// `[addr_lo, addr_hi, num_records, stride]` for view-heap slot `i`.
+pub const SLOT_VIEWS: u8 = 252;
 /// Entries of the [`SLOT_MEMORY`] directory: title addresses below 128 GiB.
 pub const MEMORY_PAGES: u32 = 1 << 21;
 /// Dwords of the [`SLOT_FAULTS`] buffer.
 pub const MEMORY_FAULTS: u32 = 4096;
 /// `RootType::Other` code of a user-data dword the host computes: the view
-/// heap slot of the memory copies' views ([`SLOT_MEMORY`]).
+/// heap slot of the memory copies' views ([`SLOT_MEMORY`]) or the base slot
+/// `SPARSE_BASE` of the 12 × 2 GiB sparse VRAM windows (`VICTORY_SPARSE_UMA=1`).
 pub const USER_MEMORY_BASE: u32 = 0x100;
 /// `RootType::Other` code of a user-data dword the host computes: the low
 /// 32 bits of the title address of the buffer view at dword `dword` of the
@@ -69,6 +76,11 @@ pub const USER_VIEW_ADDRESS: u32 = 0x101;
 /// view. Asked for every root UAV, and for the root SRVs of programs with
 /// a spilled user-data table.
 pub const USER_VIEW_BIAS: u32 = 0x103;
+/// `RootType::Other` code of a user-data dword the host computes when
+/// `VICTORY_SPARSE_UMA=1`: bits 32..63 (`aperture_base >> 32`) of the
+/// 32 GiB-aligned 24 GiB sparse GDDR6X VRAM aperture (`12 × 2 GiB` raw UAVs
+/// at `USER_MEMORY_BASE + 1..=12`, null raw UAV at `USER_MEMORY_BASE + 0`).
+pub const USER_MEMORY_APERTURE_HI: u32 = 0x104;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {

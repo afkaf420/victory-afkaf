@@ -138,21 +138,55 @@ pub extern "system" fn XMemVirtualAlloc(
     }
     // SAFETY: the title's own arguments, cleaned of console bits; the
     // parameter points at `requirements`, which outlives the call.
-    let at = unsafe {
-        VirtualAlloc2(
-            GetCurrentProcess(),
-            base,
-            size,
-            kind,
-            protect,
-            if constrained {
-                &mut parameter
-            } else {
-                std::ptr::null_mut()
-            },
-            constrained.into(),
-        )
-    };
+    // Under Stage M3 (`VICTORY_SPARSE_UMA=1`), place non-32-bit reservations
+    // inside the 32 GiB-aligned 24 GiB sparse VRAM aperture first, falling
+    // back to the full 40-bit range if a reservation does not fit.
+    let sparse_range = (constrained && flags & ADDRESS_32BIT == 0)
+        .then(victory_gpu::sparse_uma::aperture)
+        .flatten();
+    let mut at = std::ptr::null_mut();
+    if let Some((ap_base, ap_len)) = sparse_range {
+        let mut ap_req = MEM_ADDRESS_REQUIREMENTS {
+            LowestStartingAddress: ap_base as *mut c_void,
+            HighestEndingAddress: (ap_base + ap_len - 1) as *mut c_void,
+            Alignment: requirements.Alignment,
+        };
+        let mut ap_param = MEM_EXTENDED_PARAMETER::default();
+        ap_param.Anonymous1._bitfield = MemExtendedParameterAddressRequirements as u64;
+        ap_param.Anonymous2.Pointer = (&raw mut ap_req).cast();
+        // SAFETY: `ap_req` outlives the call; arguments cleaned of console bits.
+        at = unsafe {
+            VirtualAlloc2(
+                GetCurrentProcess(),
+                base,
+                size,
+                kind,
+                protect,
+                &mut ap_param,
+                1,
+            )
+        };
+    }
+    if at.is_null() {
+        at = unsafe {
+            VirtualAlloc2(
+                GetCurrentProcess(),
+                base,
+                size,
+                kind,
+                protect,
+                if constrained {
+                    &mut parameter
+                } else {
+                    std::ptr::null_mut()
+                },
+                constrained.into(),
+            )
+        };
+    }
+    if !at.is_null() && !placeholder && (kind & MEM_COMMIT) != 0 {
+        victory_gpu::sparse_uma::on_map(at as usize, size);
+    }
     if base.is_null() {
         tracing::debug!(
             size,
@@ -1018,6 +1052,7 @@ fn map_private(physical: &mut Physical, base: usize, len: usize, slice: Slice) -
         return false;
     }
     victory_gpu::title_memory_remapped(base, len);
+    victory_gpu::sparse_uma::on_map(base, len);
     for k in 0..len.div_ceil(PAGE) {
         physical.shown.entry(slice.key(k)).or_default().push(base + k * PAGE);
     }
@@ -1095,6 +1130,7 @@ fn map_section(physical: &mut Physical, base: usize, len: usize, slice: Slice) -
     }
     // New contents, read-write: the GPU side's copies no longer guard it.
     victory_gpu::title_memory_remapped(base, len);
+    victory_gpu::sparse_uma::on_map(base, len);
     // What the range shows now, for the GPU side's in-place census.
     victory_gpu::title_memory_view(base, len, slice.section.0 as usize, (slice.index * PAGE) as u64);
     for k in 0..len.div_ceil(PAGE) {
@@ -1180,6 +1216,11 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         let Some((size, slice, is_private)) = physical.views.remove(&at) else {
             continue;
         };
+        let unmap_start = base.max(at);
+        let unmap_end = end.min(at + size);
+        if unmap_start < unmap_end {
+            victory_gpu::sparse_uma::on_unmap(unmap_start, unmap_end - unmap_start);
+        }
         for k in 0..size.div_ceil(PAGE) {
             let key = slice.key(k);
             if let Some(addresses) = physical.shown.get_mut(&key) {
