@@ -83,6 +83,11 @@ pub(crate) struct HostHeap {
     /// Whether the sparse-UMA raw UAV descriptors at `sparse_base..+13` have
     /// been populated in this heap.
     sparse_installed: Mutex<bool>,
+    /// Fixed base slot of the 64 DXR 1.1 host TLAS SRV slots right below
+    /// `sparse_base` (`null_slot - 16 - 64`); `None` on sampler heaps.
+    tlas_base: Option<u32>,
+    /// Last `dxr::tlas_generation()` synced into `tlas_base..+64` of this heap.
+    tlas_gen: std::sync::atomic::AtomicU64,
     /// Title slots holding buffer views. Such a view gets its host slot
     /// (and its memory a host copy) only when something reads it: a draw
     /// through a table, or [`HostHeap::buffer_slots`] for shaders that pick
@@ -1005,9 +1010,9 @@ impl HostHeap {
         } else {
             victory_shader::emit::view_heap_limit()
         };
-        let (heap, count, size, sparse_base) = if null == 0 {
+        let (heap, count, size, sparse_base, tlas_base) = if null == 0 {
             match make(count + extra) {
-                Ok(heap) => (heap, count, count + extra, None),
+                Ok(heap) => (heap, count, count + extra, None, None),
                 Err(e) => {
                     tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
                     return None;
@@ -1017,9 +1022,12 @@ impl HostHeap {
             let size = null + 1;
             // Reserve 16 fixed slots right below `null_slot` for Stage M3
             // sparse UMA (`+0` = null raw UAV, `+1..=12` = 12 x 2 GiB windows)
-            // with zero collision against console slot 0 or `null_slot`.
+            // and 64 fixed slots right below `sparse_base` for Tier-2 DXR 1.1
+            // host TLAS SRVs (`TLAS_BASE..TLAS_BASE+64`), with zero collision
+            // against console slot 0 or `null_slot`.
             let sparse_base = null.checked_sub(crate::sparse_uma::SPARSE_SLOTS);
-            let ceiling = sparse_base.unwrap_or(null);
+            let tlas_base = sparse_base.and_then(|sb| sb.checked_sub(crate::dxr::TLAS_SLOTS));
+            let ceiling = tlas_base.or(sparse_base).unwrap_or(null);
             let fitted = if count + extra <= ceiling {
                 count
             } else {
@@ -1029,7 +1037,7 @@ impl HostHeap {
                 ceiling - extra
             };
             match make(size) {
-                Ok(heap) => (heap, fitted, size, sparse_base),
+                Ok(heap) => (heap, fitted, size, sparse_base, tlas_base),
                 Err(e) => {
                     tracing::warn!(error = %e, count, size, "no host view heap");
                     return None;
@@ -1085,6 +1093,8 @@ impl HostHeap {
             }),
             sparse_base,
             sparse_installed: Mutex::new(false),
+            tlas_base,
+            tlas_gen: std::sync::atomic::AtomicU64::new(0),
             buffers: Mutex::default(),
             changed: Mutex::default(),
             textures: Mutex::default(),
@@ -1113,6 +1123,9 @@ impl HostHeap {
         tracing::debug!(ms = started.elapsed().as_millis(), "host descriptor heap made null");
         if !sampler && crate::sparse_uma::active() {
             let _ = h.ensure_sparse_views();
+        }
+        if !sampler && crate::dxr::active() {
+            h.sync_tlas_views();
         }
         Some(h)
     }
@@ -1273,6 +1286,31 @@ impl HostHeap {
         }
         *installed = true;
         Some(base)
+    }
+
+    /// Synchronizes the 64 fixed DXR 1.1 host TLAS SRV slots right below
+    /// `sparse_base` (`tlas_base..tlas_base+64`) with `crate::dxr` whenever the
+    /// global TLAS generation advances.
+    pub(crate) fn sync_tlas_views(&self) {
+        let Some(base) = self.tlas_base else {
+            return;
+        };
+        let cur = crate::dxr::tlas_generation();
+        if self.tlas_gen.load(std::sync::atomic::Ordering::Acquire) == cur {
+            return;
+        }
+        let Some(host) = host() else {
+            return;
+        };
+        let (generation, slots) = crate::dxr::snapshot_tlas_slots();
+        for (i, &gpu_va) in slots.iter().enumerate() {
+            let handle = D3D12_CPU_DESCRIPTOR_HANDLE {
+                ptr: self.cpu + ((base + i as u32) as usize) * (self.step as usize),
+            };
+            crate::dxr::DxrEngine::write_tlas_srv(&host.device, handle, gpu_va);
+        }
+        self.tlas_gen
+            .store(generation, std::sync::atomic::Ordering::Release);
     }
 
     /// The GPU address and upload buffer of the per-slot 16-byte [`victory_shader::emit::SLOT_VIEWS`]
@@ -3566,11 +3604,15 @@ mod tests {
         let Some(heap) = HostHeap::new(false, 8) else {
             return; // no host GPU
         };
-        // Reserved 16 sparse-UMA slots strictly below `null_slot` and past `count + dynamic`.
+        // Reserved 16 sparse-UMA slots below `null_slot` and 64 DXR TLAS slots
+        // below `sparse_base`, both strictly past `count + dynamic`.
         let null = victory_shader::emit::view_heap_limit();
         assert!(null > 0);
-        assert_eq!(heap.sparse_base, Some(null - crate::sparse_uma::SPARSE_SLOTS));
-        assert!(heap.count + heap.dynamic <= heap.sparse_base.unwrap());
+        let expected_sparse = null - crate::sparse_uma::SPARSE_SLOTS;
+        let expected_tlas = expected_sparse - crate::dxr::TLAS_SLOTS;
+        assert_eq!(heap.sparse_base, Some(expected_sparse));
+        assert_eq!(heap.tlas_base, Some(expected_tlas));
+        assert!(heap.count + heap.dynamic <= expected_tlas);
 
         // Before any shader binds `SLOT_VIEWS`, the table stays a lean `Pending` map.
         assert!(matches!(*heap.views.lock().unwrap(), ViewsTable::Pending(_)));

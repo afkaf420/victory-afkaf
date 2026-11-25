@@ -22,6 +22,8 @@
 //!    on, pass every thread start and end on to the attached images.
 
 #[cfg(windows)]
+pub mod bvh_hook;
+#[cfg(windows)]
 mod console_insn;
 mod crash;
 #[cfg(windows)]

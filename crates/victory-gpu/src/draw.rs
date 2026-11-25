@@ -1112,6 +1112,22 @@ impl State {
                         }
                         continue;
                     }
+                    if srv && slot == crate::dxr::SLOT_TLAS_MAP {
+                        // Ours: 64 x 16-byte `[tlas_va_shr8_lo, tlas_va_shr8_hi,
+                        // host_tlas_srv_slot, valid]` lookup table (`t251`).
+                        match self.heap_tlas_map(list) {
+                            // SAFETY: an open list; the list holds the upload buffer.
+                            Some(gpu) => unsafe {
+                                if compute {
+                                    l.SetComputeRootShaderResourceView(param, gpu);
+                                } else {
+                                    l.SetGraphicsRootShaderResourceView(param, gpu);
+                                }
+                            },
+                            None => once!("a shader reads DXR SLOT_TLAS_MAP without a host GPU"),
+                        }
+                        continue;
+                    }
                     let tabled = srv && crate::pipeline::host::bounded_root_srvs();
                     let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {
@@ -1403,6 +1419,28 @@ impl State {
         let host = heap.host()?;
         let (gpu, buffer) = host.views_gpu()?;
         const ONCE: usize = usize::MAX - 0x5f;
+        if list.first_use(ONCE) {
+            list.keep(&buffer);
+        }
+        Some(gpu)
+    }
+
+    /// For a Tier-2 DXR 1.1 `RayQuery` shader binding `SLOT_TLAS_MAP` (`t251`):
+    /// syncs the bound view heap's 64 fixed host TLAS SRV slots (`TLAS_BASE..+64`)
+    /// and returns the GPU address of the 1,024-byte `SLOT_TLAS_MAP` buffer.
+    fn heap_tlas_map(&self, list: &HostList) -> Option<u64> {
+        if let Some(heap) = self
+            .heaps
+            .iter()
+            .filter(|&&h| h != 0)
+            .map(|&h| crate::descriptor::heap(h as This))
+            .find(|h| !h.samplers())
+            && let Some(host) = heap.host()
+        {
+            host.sync_tlas_views();
+        }
+        let (gpu, buffer) = crate::dxr::tlas_map_gpu()?;
+        const ONCE: usize = usize::MAX - 0x60;
         if list.first_use(ONCE) {
             list.keep(&buffer);
         }

@@ -87,6 +87,8 @@ mod exchange;
 mod diff_tests;
 #[cfg(all(test, windows))]
 mod intersect_tests;
+#[cfg(all(test, windows))]
+mod rayquery_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lower;
@@ -116,8 +118,9 @@ pub use lower::set_host_max_wave;
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY,
-    SLOT_STRIDES, SLOT_STRIDES_COUNT, SLOT_VIEWS, USER_DATA_SPACE, USER_MEMORY_APERTURE_HI,
-    USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS, set_view_heap_limit, view_heap_limit,
+    SLOT_STRIDES, SLOT_STRIDES_COUNT, SLOT_TLAS_MAP, SLOT_VIEWS, TLAS_MAP_ENTRIES,
+    USER_DATA_SPACE, USER_MEMORY_APERTURE_HI, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+    set_view_heap_limit, view_heap_limit,
 };
 
 /// The loop limit without an override: 2^20.
@@ -198,6 +201,17 @@ pub fn sparse_uma() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_SPARSE_UMA").is_some_and(|v| v == "1"))
 }
 
+/// Whether hardware DXR 1.1 `RayQuery` whole-loop lifting is enabled
+/// (`VICTORY_DXR_RAYQUERY=1`, default off). Part of the translation fingerprint.
+pub fn dxr_rayquery() -> bool {
+    #[cfg(test)]
+    if let Some(on) = lower::TEST_DXR_RAYQUERY.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DXR_RAYQUERY").is_some_and(|v| v == "1"))
+}
+
 /// Everything a translation depends on besides the container: the
 /// translator's own source (hashed at build time), the value of every
 /// `VICTORY_*` switch it reads, the host facts the device hands it (widest
@@ -223,6 +237,7 @@ pub fn translation_fingerprint() -> Vec<u8> {
     out.push(group_sync());
     out.extend_from_slice(&shader_opt().to_le_bytes());
     out.push(u8::from(sparse_uma()));
+    out.push(u8::from(dxr_rayquery()));
     out
 }
 

@@ -53,6 +53,13 @@ pub const SLOT_FAULTS: u8 = 253;
 /// a raw buffer of [`SLOT_STRIDES_COUNT`] 16-byte entries, entry `i` holding
 /// `[addr_lo, addr_hi, num_records, stride]` for view-heap slot `i`.
 pub const SLOT_VIEWS: u8 = 252;
+/// The root SRV `t<SLOT_TLAS_MAP>` in [`ROOT_CBV_SPACE`] of a ray-tracing
+/// shader lifted to SM 6.6 `RayQuery` (`VICTORY_DXR_RAYQUERY=1`): a raw buffer
+/// of [`TLAS_MAP_ENTRIES`] 16-byte entries, each holding
+/// `[tlas_va_shr8_lo, tlas_va_shr8_hi, host_tlas_srv_slot, valid]`.
+pub const SLOT_TLAS_MAP: u8 = 251;
+/// Number of 16-byte entries in [`SLOT_TLAS_MAP`].
+pub const TLAS_MAP_ENTRIES: u32 = 64;
 /// Entries of the [`SLOT_MEMORY`] directory: title addresses below 128 GiB.
 pub const MEMORY_PAGES: u32 = 1 << 21;
 /// Dwords of the [`SLOT_FAULTS`] buffer.
@@ -91,6 +98,7 @@ pub(crate) mod flags {
     pub const WAVE_OPS: u64 = 1 << 19;
     pub const BARYCENTRICS: u64 = 1 << 22;
     pub const INT64: u64 = 1 << 20;
+    pub const RAYTRACING_TIER_1_1: u64 = 1 << 25;
     pub const ATOMIC_TYPED64: u64 = 1 << 27;
     pub const ATOMIC_HEAP64: u64 = 1 << 32;
     pub const RESOURCE_HEAP: u64 = 1 << 30;
@@ -848,6 +856,9 @@ impl Shader {
         }
         if self.flags & flags::BARYCENTRICS != 0 {
             features |= 0x2_0000;
+        }
+        if self.flags & flags::RAYTRACING_TIER_1_1 != 0 {
+            features |= 0x10_0000;
         }
         if self.flags & flags::RESOURCE_HEAP != 0 {
             features |= 0x200_0000;

@@ -76,6 +76,9 @@ pub(crate) struct Host {
     /// Whether the active D3D12 device supports `D3D12_HEAP_TYPE_GPU_UPLOAD`
     /// (Resizable BAR exposed via `D3D12_FEATURE_D3D12_OPTIONS16`).
     gpu_upload_heap: bool,
+    /// Hardware raytracing tier reported by `D3D12_FEATURE_D3D12_OPTIONS5`
+    /// (`D3D12_RAYTRACING_TIER_1_1` enables Tier-2 inline `RayQuery` DXR).
+    rt_tier: D3D12_RAYTRACING_TIER,
 }
 
 /// Resolves `VICTORY_ASYNC_UPLOAD`: on by default (`"0"` disables and falls
@@ -346,6 +349,12 @@ pub(crate) fn gpu_upload_heap_supported() -> bool {
     host().is_some_and(|h| h.gpu_upload_heap)
 }
 
+/// Whether the active host GPU supports DXR Tier 1.1 (`RayQuery` / inline
+/// raytracing via `D3D12_FEATURE_D3D12_OPTIONS5::RaytracingTier`).
+pub(crate) fn raytracing_tier_1_1() -> bool {
+    host().is_some_and(|h| h.rt_tier.0 >= D3D12_RAYTRACING_TIER_1_1.0)
+}
+
 /// Raw `ID3D12Device*` of the active host D3D12 device, for external host
 /// bridges (such as PC-native upscaler integration).
 #[allow(dead_code)]
@@ -497,6 +506,7 @@ fn sweep() {
     crate::texture::let_go_idle();
     crate::resource::let_go_idle();
     crate::sparse_uma::sweep();
+    crate::dxr::sweep();
 }
 
 /// Drops `object` once every submission running now has finished: at once
@@ -997,14 +1007,31 @@ fn create() -> windows::core::Result<Host> {
             )
             .is_ok()
             && o16.GPUUploadHeapSupported.as_bool();
+        let mut o5 = D3D12_FEATURE_DATA_D3D12_OPTIONS5::default();
+        let rt_tier = if device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS5,
+                (&raw mut o5).cast(),
+                size_of_val(&o5) as u32,
+            )
+            .is_ok()
+        {
+            o5.RaytracingTier
+        } else {
+            D3D12_RAYTRACING_TIER_NOT_SUPPORTED
+        };
         tracing::info!(
             adapter = %adapter_name,
             dedicated_mb = dedicated_vram >> 20,
             budget_mb = budget >> 20,
             gpu_upload_heap,
+            rt_tier = rt_tier.0,
             high_vram = dedicated_vram >= HIGH_VRAM_BYTES,
             "host D3D12 device ready"
         );
+        if rt_tier.0 >= D3D12_RAYTRACING_TIER_1_1.0 && crate::dxr::active() {
+            crate::dxr::publish_loader_hooks();
+        }
         Ok(Host {
             device,
             queue,
@@ -1027,6 +1054,7 @@ fn create() -> windows::core::Result<Host> {
             upload_ring: Mutex::new(None),
             dedicated_vram,
             gpu_upload_heap,
+            rt_tier,
         })
     }
 }
@@ -3824,6 +3852,21 @@ impl Host {
             .as_ref()
             // SAFETY: plain fence query.
             .map_or(u64::MAX, |f| unsafe { f.GetCompletedValue() })
+    }
+
+    /// Last completed value on the main graphics queue fence.
+    pub(crate) fn graphics_completed_value(&self) -> u64 {
+        // SAFETY: plain fence query.
+        unsafe { self.fence.GetCompletedValue() }
+    }
+
+    /// Conservative upper bound on in-flight graphics submissions (next fence
+    /// value that will cover all work currently recorded or queued).
+    pub(crate) fn graphics_retire_fence_hint(&self) -> u64 {
+        self.submitted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .saturating_add(1)
     }
 
     /// Runs `prepare` on `upload_queue` (performing batched `UpdateTileMappings`
@@ -6934,6 +6977,7 @@ impl Meter {
             );
             crate::tiles::status();
             crate::sparse_uma::status();
+            crate::dxr::status();
             {
                 let [queued, due, away, partly, oldest] =
                     [0, 1, 2, 3, 4].map(|i| crate::draw::HEAP_TEXTURES_QUEUE[i].load(Ordering::Relaxed));
