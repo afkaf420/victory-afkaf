@@ -16,6 +16,7 @@ pub mod display;
 pub mod dsp;
 #[cfg(windows)]
 pub mod dstorage;
+pub mod fidelityfx;
 #[cfg(windows)]
 pub mod files;
 pub mod gameinput;
@@ -70,5 +71,9 @@ pub(crate) fn all() -> Vec<HleModule> {
     all.push(xmem::module());
     #[cfg(windows)]
     all.push(xsystem::module());
+    #[cfg(windows)]
+    if fidelityfx::should_register() {
+        all.push(fidelityfx::module());
+    }
     all
 }

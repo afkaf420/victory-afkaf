@@ -82,6 +82,7 @@
 
 mod bitcode;
 mod container;
+mod exchange;
 #[cfg(all(test, windows))]
 mod diff_tests;
 #[cfg(all(test, windows))]
@@ -103,6 +104,7 @@ mod waterfall_tests;
 #[cfg(all(test, windows))]
 mod wave64_tests;
 mod wave;
+mod whole_live;
 
 use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};
@@ -345,7 +347,11 @@ pub fn emit(
     // (a mask with lanes elsewhere is only helped by the exact forms: not by each half-wave
     // on its own)
     let exact_only = matches!(&original, Err(ShaderError::Unsupported { what, .. }) if *what == lower::MASK_ELSEWHERE);
-    if stuck && native.stage == HwStage::Cs && native.wave64 && lower::host_max_wave() == 32 {
+    if stuck
+        && matches!(native.stage, HwStage::Cs | HwStage::Ms)
+        && native.wave64
+        && lower::host_max_wave() == 32
+    {
         let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
         let report = |what: &str, r: &Result<(HostShader, Option<u32>), ShaderError>| {
             if why {
@@ -397,12 +403,11 @@ pub fn emit(
                 }
             }
         }
-        // Off unless asked for (`VICTORY_WAVE_WIDE=1`), for a console wave run as two host
-        // waves: this form puts group barriers inside branches and loops, and runs 121-124
-        // lost the card in a submission of two programs that had just moved to it
-        // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
-        // has no barrier, stays on.
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
+        // On by default now that single-wave groups use double-buffered Mode A
+        // and multi-wave groups use Mode B pairwise arrival counters (TGSM-only
+        // fences + bounded spin + TDR fuse, no group barrier inside wave-wide
+        // branches). `VICTORY_WAVE_WIDE=0` opts out.
+        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0");
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
@@ -537,16 +542,14 @@ fn widen(
         what: "wave-wide branches in a thread group of several console waves",
     };
     match native.io {
-        // (a program whose waves are the host's meets no one: no barrier, any group)
-        crate::native::StageIo::Cs(_) if !(native.wave64 && lower::host_max_wave() == 32) => {}
-        crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64 => {}
-        crate::native::StageIo::Cs(cs) => {
+        crate::native::StageIo::Cs(_) => {}
+        crate::native::StageIo::Ms(_) if native.wave64 && lower::host_max_wave() == 32 => {}
+        _ => {
             if why {
-                eprintln!("WAVE64-WIDE not tried: thread groups of {:?}", cs.threads);
+                eprintln!("WAVE64-WIDE not tried for stage {:?}", native.stage);
             }
             return Err(NOT);
         }
-        _ => return Err(NOT),
     }
     let mut wide = std::collections::HashSet::new();
     loop {

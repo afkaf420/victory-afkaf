@@ -5,7 +5,8 @@
 //! (unless `VICTORY_LATE_WAIT=1`, see [`late`]);
 //! overlap them with per-submission fences once more than clears run.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -57,11 +58,270 @@ pub(crate) struct Host {
     /// The adapter the device is on, for its memory budget
     /// ([`Host::video_memory`]); `None` if the system does not name it.
     adapter: Option<IDXGIAdapter3>,
+    /// Dedicated D3D12 copy queue for asynchronous buffer/texture uploads
+    /// synchronized into `queue` via GPU-only `ID3D12CommandQueue::Wait`.
+    upload_queue: Option<ID3D12CommandQueue>,
+    /// Fence signalled by `upload_queue` after each async copy batch.
+    upload_fence: Option<ID3D12Fence>,
+    /// Event waited on ONLY when the upload ring wraps onto an in-flight tail.
+    upload_event: HANDLE,
+    /// Monotonically increasing value signalled on `upload_fence`.
+    upload_value: AtomicU64,
+    /// Lazily allocated ring-buffered staging heap (`D3D12_HEAP_TYPE_GPU_UPLOAD`
+    /// when ReBAR is available, else `D3D12_HEAP_TYPE_UPLOAD`) and COPY command
+    /// list pool. Strictly write-only from CPU.
+    upload_ring: Mutex<Option<UploadRing>>,
     /// Dedicated video memory reported by the active adapter, in bytes.
     dedicated_vram: u64,
     /// Whether the active D3D12 device supports `D3D12_HEAP_TYPE_GPU_UPLOAD`
     /// (Resizable BAR exposed via `D3D12_FEATURE_D3D12_OPTIONS16`).
     gpu_upload_heap: bool,
+}
+
+/// Resolves `VICTORY_ASYNC_UPLOAD`: on by default (`"0"` disables and falls
+/// back to synchronous copies on the main graphics queue).
+fn resolve_async_upload(env: Option<&str>) -> bool {
+    env.is_none_or(|v| v.trim() != "0")
+}
+
+/// Whether asynchronous copy-queue uploads are enabled (`VICTORY_ASYNC_UPLOAD`,
+/// on by default; `=0` reverts to direct graphics-queue uploads).
+fn async_upload() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let env = std::env::var("VICTORY_ASYNC_UPLOAD").ok();
+        resolve_async_upload(env.as_deref())
+    })
+}
+
+/// Resolves `VICTORY_UPLOAD_RING_MB` (in bytes): defaults to 128 MiB on
+/// high-VRAM GPUs (>= 16 GiB) and 64 MiB on smaller GPUs, clamped to 16..=512 MiB.
+fn resolve_upload_ring_bytes(env: Option<&str>, high_vram: bool) -> u64 {
+    let default_mb = if high_vram { 128 } else { 64 };
+    env.and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(default_mb)
+        .clamp(16, 512)
+        << 20
+}
+
+/// A live D3D12 resource kept alive while an async copy batch is in flight.
+struct KeptResource(#[allow(dead_code)] ID3D12Resource);
+// SAFETY: D3D12 resources are free-threaded and dropped once after GPU completion.
+unsafe impl Send for KeptResource {}
+
+/// One `D3D12_COMMAND_LIST_TYPE_COPY` allocator/list pair recycled once its
+/// signalled `upload_fence` value completes.
+struct CopySlot {
+    allocator: ID3D12CommandAllocator,
+    list: ID3D12GraphicsCommandList,
+    fence: u64,
+}
+
+/// One in-flight ring slice (or fallback-only keep set) retired once
+/// `upload_fence >= fence`.
+struct RingFlight {
+    start: u64,
+    end: u64,
+    fence: u64,
+    _keep: Vec<KeptResource>,
+}
+
+/// Ring-buffered staging heap for `upload_queue`. Mapped strictly write-only
+/// (`D3D12_RANGE { Begin: 0, End: 0 }`) so write-combined ReBAR memory is never
+/// CPU-read.
+struct UploadRing {
+    buffer: ID3D12Resource,
+    data: *mut u8,
+    size: u64,
+    #[cfg_attr(not(test), allow(dead_code))]
+    gpu_upload: bool,
+    head: u64,
+    slots: Vec<CopySlot>,
+    in_flight: VecDeque<RingFlight>,
+}
+
+// SAFETY: `UploadRing` is only accessed while holding `Host::upload_ring`; its
+// D3D12 objects are free-threaded and `data` stays mapped for `buffer`'s lifetime.
+unsafe impl Send for UploadRing {}
+
+impl UploadRing {
+    fn new(device: &ID3D12Device, size: u64, try_gpu_upload: bool) -> Option<Self> {
+        let make = |heap_type: D3D12_HEAP_TYPE, initial_state: D3D12_RESOURCE_STATES| -> windows::core::Result<(ID3D12Resource, *mut u8)> {
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: heap_type,
+                ..Default::default()
+            };
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: size.max(1),
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let mut buffer: Option<ID3D12Resource> = None;
+            let mut data = std::ptr::null_mut();
+            let read_none = D3D12_RANGE { Begin: 0, End: 0 };
+            // SAFETY: valid D3D12 committed buffer creation + write-only Map.
+            unsafe {
+                device.CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    initial_state,
+                    None,
+                    &mut buffer,
+                )?;
+                let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
+                b.Map(0, Some(&read_none), Some(&mut data))?;
+            }
+            Ok((buffer.ok_or_else(windows::core::Error::empty)?, data.cast()))
+        };
+
+        let (buffer, data, gpu_upload) = if try_gpu_upload {
+            match make(D3D12_HEAP_TYPE_GPU_UPLOAD, D3D12_RESOURCE_STATE_COMMON) {
+                Ok((b, d)) => (b, d, true),
+                Err(e) => {
+                    tracing::warn!(error = %e, size_mb = size >> 20, "D3D12_HEAP_TYPE_GPU_UPLOAD ring creation failed; falling back to UPLOAD heap");
+                    let (b, d) = make(D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ).ok()?;
+                    (b, d, false)
+                }
+            }
+        } else {
+            let (b, d) = make(D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ).ok()?;
+            (b, d, false)
+        };
+        name(&buffer, || {
+            if gpu_upload {
+                "async upload ring (GPU_UPLOAD ReBAR)".into()
+            } else {
+                "async upload ring (UPLOAD)".into()
+            }
+        });
+        tracing::info!(
+            size_mb = size >> 20,
+            gpu_upload,
+            "async copy-queue upload ring ready (VICTORY_ASYNC_UPLOAD=0 to disable)"
+        );
+        Some(UploadRing {
+            buffer,
+            data,
+            size,
+            gpu_upload,
+            head: 0,
+            slots: Vec::new(),
+            in_flight: VecDeque::new(),
+        })
+    }
+
+    fn retire(&mut self, completed: u64) {
+        while self.in_flight.front().is_some_and(|f| f.fence <= completed) {
+            self.in_flight.pop_front();
+        }
+    }
+
+    fn wait_fence(fence: &ID3D12Fence, event: HANDLE, target: u64) {
+        // SAFETY: `fence` and `event` are owned by `Host`; only invoked under
+        // `Host::upload_ring` when the ring wraps onto an in-flight tail.
+        unsafe {
+            if fence.GetCompletedValue() < target
+                && fence.SetEventOnCompletion(target, event).is_ok()
+            {
+                WaitForSingleObject(event, INFINITE);
+            }
+        }
+    }
+
+    fn take_slot(
+        &mut self,
+        device: &ID3D12Device,
+        fence: &ID3D12Fence,
+        event: HANDLE,
+    ) -> windows::core::Result<CopySlot> {
+        // SAFETY: plain fence query.
+        let completed = unsafe { fence.GetCompletedValue() };
+        self.retire(completed);
+        if let Some(pos) = self.slots.iter().position(|s| s.fence <= completed) {
+            return Ok(self.slots.swap_remove(pos));
+        }
+        const MAX_SLOTS: usize = 16;
+        if self.slots.len() < MAX_SLOTS {
+            // SAFETY: valid COPY command allocator + closed COPY command list.
+            let (allocator, list) = unsafe {
+                let allocator: ID3D12CommandAllocator =
+                    device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY)?;
+                let list: ID3D12GraphicsCommandList = device.CreateCommandList(
+                    0,
+                    D3D12_COMMAND_LIST_TYPE_COPY,
+                    &allocator,
+                    None,
+                )?;
+                list.Close()?;
+                (allocator, list)
+            };
+            return Ok(CopySlot { allocator, list, fence: 0 });
+        }
+        // Pool at cap: wait for the earliest slot to finish.
+        let (pos, target) = self
+            .slots
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, s)| s.fence)
+            .map(|(i, s)| (i, s.fence))
+            .unwrap();
+        Self::wait_fence(fence, event, target);
+        // SAFETY: plain fence query.
+        self.retire(unsafe { fence.GetCompletedValue() });
+        Ok(self.slots.swap_remove(pos))
+    }
+
+    /// Reserves `bytes` aligned to `align` in the write-only ring buffer,
+    /// invokes `write(dst_ptr)` to populate it, and returns `(offset, end)`.
+    /// Returns `None` if `bytes` or `batch_used + bytes` exceeds half the ring
+    /// (caller falls back to direct staging so one burst never overwrites itself).
+    fn stage_write(
+        &mut self,
+        bytes: u64,
+        align: u64,
+        batch_used: &mut u64,
+        fence: &ID3D12Fence,
+        event: HANDLE,
+        write: impl FnOnce(*mut u8),
+    ) -> Option<(u64, u64)> {
+        let len = bytes.max(1);
+        let half = self.size / 2;
+        if len > half || batch_used.saturating_add(len) > half {
+            return None;
+        }
+        // SAFETY: plain fence query.
+        self.retire(unsafe { fence.GetCompletedValue() });
+        let align = align.max(1);
+        let mut offset = self.head.next_multiple_of(align);
+        if offset + len > self.size {
+            offset = 0;
+        }
+        let end = offset + len;
+        while self
+            .in_flight
+            .iter()
+            .any(|f| f.start < f.end && f.start < end && offset < f.end)
+        {
+            let Some(oldest) = self.in_flight.front().map(|f| f.fence) else {
+                break;
+            };
+            Self::wait_fence(fence, event, oldest);
+            // SAFETY: plain fence query.
+            self.retire(unsafe { fence.GetCompletedValue() });
+        }
+        // SAFETY: `[offset, end)` is within the mapped ring buffer and no
+        // in-flight copy overlaps it; caller writes strictly write-only.
+        write(unsafe { self.data.add(offset as usize) });
+        self.head = end;
+        *batch_used += len;
+        Some((offset, end))
+    }
 }
 
 /// Threshold (16 GiB) above which default card buffer/window budgets scale up
@@ -84,6 +344,13 @@ pub(crate) fn high_vram() -> bool {
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn gpu_upload_heap_supported() -> bool {
     host().is_some_and(|h| h.gpu_upload_heap)
+}
+
+/// Raw `ID3D12Device*` of the active host D3D12 device, for external host
+/// bridges (such as PC-native upscaler integration).
+#[allow(dead_code)]
+pub(crate) fn device_raw() -> Option<*mut std::ffi::c_void> {
+    host().map(|h| h.device.as_raw())
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -667,6 +934,16 @@ fn create() -> windows::core::Result<Host> {
         })?;
         let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
         let event = CreateEventW(None, false, false, None)?;
+        let upload_queue: Option<ID3D12CommandQueue> = device
+            .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                Type: D3D12_COMMAND_LIST_TYPE_COPY,
+                ..Default::default()
+            })
+            .ok();
+        let upload_fence: Option<ID3D12Fence> = upload_queue
+            .as_ref()
+            .and_then(|_| device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok());
+        let upload_event = CreateEventW(None, false, false, None)?;
         let rtvs: ID3D12DescriptorHeap =
             device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
@@ -742,6 +1019,11 @@ fn create() -> windows::core::Result<Host> {
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
             adapter,
+            upload_queue,
+            upload_fence,
+            upload_event,
+            upload_value: AtomicU64::new(0),
+            upload_ring: Mutex::new(None),
             dedicated_vram,
             gpu_upload_heap,
         })
@@ -883,6 +1165,122 @@ mod tests {
             high_vram(),
             gpu_upload_heap_supported()
         );
+    }
+
+    #[test]
+    fn upload_ring_config_respects_overrides() {
+        assert!(resolve_async_upload(None));
+        assert!(resolve_async_upload(Some("1")));
+        assert!(!resolve_async_upload(Some("0")));
+        assert!(!resolve_async_upload(Some(" 0 ")));
+        assert_eq!(resolve_upload_ring_bytes(None, false), 64 << 20);
+        assert_eq!(resolve_upload_ring_bytes(None, true), 128 << 20);
+        assert_eq!(resolve_upload_ring_bytes(Some("96"), false), 96 << 20);
+        assert_eq!(resolve_upload_ring_bytes(Some("4"), true), 16 << 20);
+        assert_eq!(resolve_upload_ring_bytes(Some("2048"), true), 512 << 20);
+    }
+
+    /// Verifies the dedicated COPY queue + GPU_UPLOAD/UPLOAD ring + GPU-only
+    /// `self.queue.Wait` end-to-end on the host GPU for both a texture upload
+    /// and a buffer copy, reading back on the main graphics queue without any
+    /// CPU wait on `upload_fence`.
+    #[test]
+    fn async_copy_queue_gpu_upload_ring_round_trip() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        // 16x16 R8G8B8A8_UNORM texture in DEFAULT heap (starts in COMMON).
+        let tex_desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 16,
+            Height: 16,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+            ..Default::default()
+        };
+        let default_heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let mut tex: Option<ID3D12Resource> = None;
+        let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        let mut total = 0u64;
+        // SAFETY: valid D3D12 texture creation and footprint query.
+        unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &default_heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &tex_desc,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut tex,
+                )
+                .expect("default texture");
+            host.device.GetCopyableFootprints(
+                &tex_desc,
+                0,
+                1,
+                0,
+                Some(&mut footprint),
+                None,
+                None,
+                Some(&mut total),
+            );
+        }
+        let tex = tex.unwrap();
+        let row_pitch = footprint.Footprint.RowPitch as usize;
+        let mut src = vec![0u8; total as usize];
+        for y in 0..16usize {
+            for x in 0..16usize {
+                let p = y * row_pitch + x * 4;
+                src[p] = (x * 16) as u8;
+                src[p + 1] = (y * 16) as u8;
+                src[p + 2] = (x ^ y) as u8;
+                src[p + 3] = 0xEE;
+            }
+        }
+        // Upload asynchronously on COPY queue -> main queue waits on GPU only.
+        let val = host
+            .async_upload_texture(&tex, 0, footprint, &src, 0)
+            .expect("async_upload_texture");
+        assert!(val >= 1);
+        let ring_uses_gpu_upload = host.with_upload_ring(|r| r.gpu_upload).unwrap();
+        assert_eq!(ring_uses_gpu_upload, host.gpu_upload_heap);
+
+        // Read back on main graphics queue (must see uploaded bytes via Queue::Wait).
+        let readback = host.read_back_buffer(total).expect("readback buffer");
+        let list = host.new_list().expect("graphics list");
+        // SAFETY: open graphics list and live texture/readback resources.
+        unsafe {
+            let to = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&readback),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: footprint,
+                },
+            };
+            let from = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&tex),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+            };
+            list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+            list.close();
+            host.execute(&[&list]);
+            let mut mapped = std::ptr::null_mut();
+            readback.Map(0, None, Some(&mut mapped)).expect("map readback");
+            let got = std::slice::from_raw_parts(mapped.cast::<u8>(), total as usize);
+            for y in 0..16usize {
+                let row_a = &src[y * row_pitch..y * row_pitch + 16 * 4];
+                let row_b = &got[y * row_pitch..y * row_pitch + 16 * 4];
+                assert_eq!(row_a, row_b, "row {y} mismatch after async GPU_UPLOAD copy");
+            }
+            readback.Unmap(0, None);
+        }
     }
 }
 
@@ -3187,17 +3585,239 @@ impl Host {
         }
     }
 
+    /// Returns (creating lazily on first use) the locked `UploadRing`.
+    fn with_upload_ring<R>(&self, f: impl FnOnce(&mut UploadRing) -> R) -> Option<R> {
+        let mut guard = self.upload_ring.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_none() {
+            let env = std::env::var("VICTORY_UPLOAD_RING_MB").ok();
+            let size = resolve_upload_ring_bytes(env.as_deref(), self.dedicated_vram >= HIGH_VRAM_BYTES);
+            *guard = UploadRing::new(&self.device, size, self.gpu_upload_heap);
+        }
+        guard.as_mut().map(f)
+    }
+
+    /// Uploads dirty byte runs of card-backed buffers/windows asynchronously on
+    /// `self.upload_queue` via `UploadRing` (`GPU_UPLOAD` when ReBAR is enabled,
+    /// else `UPLOAD`), and synchronizes `self.queue` via GPU-only
+    /// `self.queue.Wait(&upload_fence, val)` (zero CPU `WaitForSingleObject`).
+    ///
+    /// Returns `Ok(true)` if copies were submitted to `upload_queue`, `Ok(false)`
+    /// if `dirty` contained no byte ranges to upload, or `Err` to fall back.
+    fn async_upload_dirty(
+        &self,
+        dirty: &[(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)],
+        prev_graphics_fence: u64,
+    ) -> Result<bool, ()> {
+        let (Some(upload_queue), Some(upload_fence)) = (&self.upload_queue, &self.upload_fence) else {
+            return Err(());
+        };
+        if !dirty.iter().any(|(_, r)| !r.is_empty()) {
+            return Ok(false);
+        }
+        let submitted = self.with_upload_ring(|ring| -> Result<bool, ()> {
+            let mut slot = ring
+                .take_slot(&self.device, upload_fence, self.upload_event)
+                .map_err(|_| ())?;
+            let mut spans: Vec<(u64, u64)> = Vec::new();
+            let mut keep: Vec<KeptResource> = Vec::new();
+            let mut batch_used: u64 = 0;
+            let mut copied_any = false;
+            // SAFETY: COPY command allocator & list are idle (`slot.fence <= completed`),
+            // buffers are live and kept in `keep` until `upload_fence` passes.
+            let recorded = unsafe {
+                (|| -> windows::core::Result<()> {
+                    slot.allocator.Reset()?;
+                    slot.list.Reset(&slot.allocator, None)?;
+                    for (shadow, ranges) in dirty {
+                        if ranges.is_empty() {
+                            continue;
+                        }
+                        let Some((staging, _, _)) = shadow.card_sides() else {
+                            continue;
+                        };
+                        let cpu_src = shadow.cpu_data();
+                        let mut kept_staging = false;
+                        for &(a, b) in ranges {
+                            let len = (b - a) as u64;
+                            if len == 0 {
+                                continue;
+                            }
+                            if let Some((off, end)) = ring.stage_write(
+                                len,
+                                64,
+                                &mut batch_used,
+                                upload_fence,
+                                self.upload_event,
+                                |dst| {
+                                    // Write-only copy into mapped ring memory.
+                                    std::ptr::copy_nonoverlapping(cpu_src.add(a), dst, len as usize);
+                                },
+                            ) {
+                                slot.list.CopyBufferRegion(&shadow.buffer, a as u64, &ring.buffer, off, len);
+                                match spans.last_mut() {
+                                    Some(last) if off == last.1 => last.1 = end,
+                                    _ => spans.push((off, end)),
+                                }
+                            } else {
+                                slot.list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, len);
+                                if !kept_staging {
+                                    keep.push(KeptResource(staging.clone()));
+                                    kept_staging = true;
+                                }
+                            }
+                            crate::shadow::CARD_STATS[0].fetch_add(len, Ordering::Relaxed);
+                            copied_any = true;
+                        }
+                        crate::shadow::CARD_STATS[1].fetch_add(ranges.len() as u64, Ordering::Relaxed);
+                        keep.push(KeptResource(shadow.buffer.clone()));
+                    }
+                    slot.list.Close()?;
+                    if !copied_any {
+                        return Ok(());
+                    }
+                    // Order copy queue after any in-flight graphics submission that
+                    // may still be reading/writing these card buffers (GPU-only wait).
+                    if prev_graphics_fence > 0 {
+                        upload_queue.Wait(&self.fence, prev_graphics_fence)?;
+                    }
+                    let cmd: ID3D12CommandList = slot.list.cast()?;
+                    upload_queue.ExecuteCommandLists(&[Some(cmd)]);
+                    let val = self.upload_value.fetch_add(1, Ordering::AcqRel) + 1;
+                    upload_queue.Signal(upload_fence, val)?;
+                    slot.fence = val;
+                    if spans.is_empty() {
+                        ring.in_flight.push_back(RingFlight {
+                            start: 0,
+                            end: 0,
+                            fence: val,
+                            _keep: keep,
+                        });
+                    } else {
+                        let last = spans.len() - 1;
+                        let mut keep_opt = Some(keep);
+                        for (idx, (start, end)) in spans.into_iter().enumerate() {
+                            ring.in_flight.push_back(RingFlight {
+                                start,
+                                end,
+                                fence: val,
+                                _keep: if idx == last {
+                                    keep_opt.take().unwrap_or_default()
+                                } else {
+                                    Vec::new()
+                                },
+                            });
+                        }
+                    }
+                    // Synchronize main graphics queue on the GPU — zero CPU wait.
+                    self.queue.Wait(upload_fence, val)?;
+                    Ok(())
+                })()
+            };
+            ring.slots.push(slot);
+            recorded.map(|()| copied_any).map_err(|_| ())
+        });
+        match submitted {
+            Some(Ok(v)) => Ok(v),
+            _ => Err(()),
+        }
+    }
+
+    /// Stages `src` into the async `UploadRing` (`GPU_UPLOAD` when ReBAR is
+    /// available, else `UPLOAD`), uploads it into `dst` (which must be in
+    /// `D3D12_RESOURCE_STATE_COMMON` on entry) via `CopyTextureRegion` on
+    /// `self.upload_queue`, and synchronizes `self.queue` via GPU-only
+    /// `self.queue.Wait(&upload_fence, val)`. Returns the signalled
+    /// `upload_fence` value, or `None` if async upload is unavailable or `src`
+    /// exceeds half the ring.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn async_upload_texture(
+        &self,
+        dst: &ID3D12Resource,
+        subresource: u32,
+        mut footprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+        src: &[u8],
+        prev_graphics_fence: u64,
+    ) -> Option<u64> {
+        if !async_upload() || src.is_empty() {
+            return None;
+        }
+        let (upload_queue, upload_fence) = (self.upload_queue.as_ref()?, self.upload_fence.as_ref()?);
+        self.with_upload_ring(|ring| -> Option<u64> {
+            let mut slot = ring
+                .take_slot(&self.device, upload_fence, self.upload_event)
+                .ok()?;
+            let mut batch_used: u64 = 0;
+            let Some((off, end)) = ring.stage_write(
+                src.len() as u64,
+                D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT as u64,
+                &mut batch_used,
+                upload_fence,
+                self.upload_event,
+                |dst_ptr| {
+                    // SAFETY: `stage_write` reserves `src.len()` write-only bytes.
+                    unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), dst_ptr, src.len()) };
+                },
+            ) else {
+                ring.slots.push(slot);
+                return None;
+            };
+            footprint.Offset = off;
+            // SAFETY: valid COPY command list, live `dst` and ring buffer.
+            let res = unsafe {
+                (|| -> windows::core::Result<u64> {
+                    slot.allocator.Reset()?;
+                    slot.list.Reset(&slot.allocator, None)?;
+                    let to = D3D12_TEXTURE_COPY_LOCATION {
+                        pResource: std::mem::transmute_copy(dst),
+                        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                            SubresourceIndex: subresource,
+                        },
+                    };
+                    let from = D3D12_TEXTURE_COPY_LOCATION {
+                        pResource: std::mem::transmute_copy(&ring.buffer),
+                        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                            PlacedFootprint: footprint,
+                        },
+                    };
+                    slot.list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+                    slot.list.Close()?;
+                    if prev_graphics_fence > 0 {
+                        upload_queue.Wait(&self.fence, prev_graphics_fence)?;
+                    }
+                    let cmd: ID3D12CommandList = slot.list.cast()?;
+                    upload_queue.ExecuteCommandLists(&[Some(cmd)]);
+                    let val = self.upload_value.fetch_add(1, Ordering::AcqRel) + 1;
+                    upload_queue.Signal(upload_fence, val)?;
+                    slot.fence = val;
+                    ring.in_flight.push_back(RingFlight {
+                        start: off,
+                        end,
+                        fence: val,
+                        _keep: vec![KeptResource(dst.clone())],
+                    });
+                    self.queue.Wait(upload_fence, val)?;
+                    Ok(val)
+                })()
+            };
+            ring.slots.push(slot);
+            res.ok()
+        })?
+    }
+
     /// Before a submission's lists run, for copies in the card's memory
     /// ([`crate::shadow::cards`]): what changed on their CPU side since
-    /// the last submission goes to their card side (a list of ours, run
-    /// now; the submission's lists follow it on the queue), and the ranges
-    /// this submission's shaders may write get a compare to run after its
-    /// lists. `None` if there is nothing to do.
+    /// the last submission goes to their card side (asynchronously on
+    /// `upload_queue` via GPU-only `Queue::Wait` when `VICTORY_ASYNC_UPLOAD`
+    /// is enabled, else on the main queue), and the ranges this submission's
+    /// shaders may write get a compare to run after its lists. `None` if
+    /// there is nothing to do.
     ///
     /// `flown`: the submission is sent ahead with [`relay`]. Its compare
     /// then stores the hashes it makes (see [`flagged_pieces`] and
     /// `relay`).
-    fn card_before(&self, runs: &[&HostList], flown: bool) -> Option<CardPlan> {
+    fn card_before(&self, runs: &[&HostList], flown: bool, prev_graphics_fence: u64) -> Option<CardPlan> {
         use std::sync::Arc;
         if !crate::shadow::cards() {
             return None;
@@ -3238,7 +3858,8 @@ impl Host {
         let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
         let work = work.as_mut()?;
         // A copy whose shader writes are declared for the first time gets
-        // its bytes from before, whole.
+        // its bytes from before, whole. Buffers/windows with 0 declared UAV
+        // writes never allocate `Card::before` or run GPU hashing.
         let mut whole: Vec<Arc<crate::shadow::Shadow>> = Vec::new();
         for (shadow, _) in &declared {
             if shadow.card_make_before(|size| {
@@ -3254,73 +3875,101 @@ impl Host {
         }
         let mut used: Vec<(bool, Prelude)> = Vec::new();
         if !dirty.is_empty() {
-            let Some(sync) = work.sync.pop().or_else(|| self.make_prelude()) else {
-                fail(format_args!("no host list to bring host copies in the card's memory up to date"));
+            // Try routing buffer/window uploads onto the dedicated async COPY
+            // queue + GPU_UPLOAD ring with GPU-only `self.queue.Wait`.
+            let copied_async = if async_upload() {
+                self.async_upload_dirty(&dirty, prev_graphics_fence).is_ok()
+            } else {
+                false
             };
-            let (allocator, list) = &sync;
-            // SAFETY: the list's last run finished (it ran ahead of a
-            // submission that was waited for, and came back after that);
-            // live buffers, and the ranges lie in them.
-            let recorded = unsafe {
-                (|| -> windows::core::Result<()> {
-                    allocator.Reset()?;
-                    list.Reset(allocator, None)?;
-                    for (shadow, ranges) in &dirty {
-                        let Some((staging, before, size)) = shadow.card_sides() else {
-                            continue;
-                        };
-                        for &(a, b) in ranges {
-                            list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64);
-                            crate::shadow::CARD_STATS[0].fetch_add((b - a) as u64, Ordering::Relaxed);
+            // Only record a graphics-queue `sync` list if either (a) we fell
+            // back to synchronous copies on `self.queue`, or (b) at least one
+            // dirty buffer has a `Card::before` hash table that must be
+            // rehashed after the upload. Read-only buffers and card windows
+            // (0 declared UAV writes) skip the graphics list entirely!
+            let needs_rehash = dirty
+                .iter()
+                .any(|(s, _)| s.card_sides().is_some_and(|(_, before, _)| before.is_some()));
+            if !copied_async || needs_rehash {
+                let Some(sync) = work.sync.pop().or_else(|| self.make_prelude()) else {
+                    fail(format_args!("no host list to bring host copies in the card's memory up to date"));
+                };
+                let (allocator, list) = &sync;
+                // SAFETY: the list's last run finished (it ran ahead of a
+                // submission that was waited for, and came back after that);
+                // live buffers, and the ranges lie in them.
+                let recorded = unsafe {
+                    (|| -> windows::core::Result<()> {
+                        allocator.Reset()?;
+                        list.Reset(allocator, None)?;
+                        for (shadow, ranges) in &dirty {
+                            let Some((staging, before, size)) = shadow.card_sides() else {
+                                continue;
+                            };
+                            if !copied_async {
+                                for &(a, b) in ranges {
+                                    list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64);
+                                    crate::shadow::CARD_STATS[0].fetch_add((b - a) as u64, Ordering::Relaxed);
+                                }
+                                crate::shadow::CARD_STATS[1].fetch_add(ranges.len() as u64, Ordering::Relaxed);
+                            }
+                            let Some(before) = before else {
+                                continue;
+                            };
+                            // When copies ran synchronously on this list, transition
+                            // `COPY_DEST -> NON_PIXEL_SHADER_RESOURCE`; when they ran
+                            // on `upload_queue`, the buffer decayed to `COMMON` before
+                            // `self.queue.Wait` and promotes implicitly.
+                            if !copied_async && !ranges.is_empty() {
+                                list.ResourceBarrier(&[transition(
+                                    &shadow.buffer,
+                                    D3D12_RESOURCE_STATE_COPY_DEST,
+                                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                )]);
+                            }
+                            list.SetComputeRootSignature(&work.root);
+                            list.SetPipelineState(&work.pso);
+                            list.SetComputeRootShaderResourceView(1, shadow.buffer.GetGPUVirtualAddress());
+                            list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
+                            list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
+                            let runs: Vec<crate::shadow::CardSpan> = if whole.iter().any(|s| Arc::ptr_eq(s, shadow)) {
+                                vec![shadow.card_run(0, usize::MAX)]
+                            } else {
+                                ranges.iter().map(|&(a, b)| shadow.card_run(a, b)).collect()
+                            };
+                            // Always deduplicate overlapping 64 KiB pieces when
+                            // 64-byte diffing emits multiple small runs in one piece
+                            // (or when `VICTORY_CARD_REHASH_RUNS=1`).
+                            let runs = if runs.len() > 1 || rehash_runs() {
+                                crate::shadow::joined_piece_runs(runs)
+                            } else {
+                                runs
+                            };
+                            CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
+                            CARD_PASSES[1].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
+                            for run in runs {
+                                let constants = [run.first, run.skew, size as u32, run.pieces, 0, 0];
+                                list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                                list.Dispatch(run.pieces.div_ceil(64), 1, 1);
+                            }
                         }
-                        crate::shadow::CARD_STATS[1].fetch_add(ranges.len() as u64, Ordering::Relaxed);
-                        let Some(before) = before else {
-                            continue;
-                        };
-                        // No twin (it cost the card the copy's size again,
-                        // 399 MB in run 75): `before` holds a 128-bit hash
-                        // of each 64 KiB piece. The pieces just sent up are
-                        // hashed again, all of them the first time; the
-                        // compare after the lists hashes the declared
-                        // pieces and flags those whose hash is another.
-                        if !ranges.is_empty() {
-                            list.ResourceBarrier(&[transition(
-                                &shadow.buffer,
-                                D3D12_RESOURCE_STATE_COPY_DEST,
-                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                            )]);
-                        }
-                        list.SetComputeRootSignature(&work.root);
-                        list.SetPipelineState(&work.pso);
-                        list.SetComputeRootShaderResourceView(1, shadow.buffer.GetGPUVirtualAddress());
-                        list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
-                        list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
-                        let runs: Vec<crate::shadow::CardSpan> = if whole.iter().any(|s| Arc::ptr_eq(s, shadow)) {
-                            vec![shadow.card_run(0, usize::MAX)]
-                        } else {
-                            ranges.iter().map(|&(a, b)| shadow.card_run(a, b)).collect()
-                        };
-                        // The same pieces in fewer passes (`rehash_runs`).
-                        let runs = if rehash_runs() { crate::shadow::joined_piece_runs(runs) } else { runs };
-                        CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
-                        CARD_PASSES[1].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
-                        for run in runs {
-                            let constants = [run.first, run.skew, size as u32, run.pieces, 0, 0];
-                            list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
-                            list.Dispatch(run.pieces.div_ceil(64), 1, 1);
-                        }
-                    }
-                    list.Close()?;
-                    self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
-                    Ok(())
-                })()
-            };
-            if let Err(e) = recorded {
-                fail(format_args!("host copies in the card's memory could not be brought up to date ({e})"));
+                        list.Close()?;
+                        self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+                        Ok(())
+                    })()
+                };
+                if let Err(e) = recorded {
+                    fail(format_args!("host copies in the card's memory could not be brought up to date ({e})"));
+                }
+                used.push((false, sync));
             }
-            used.push((false, sync));
         }
         drop(order);
+        // Fast path: all uploads ran asynchronously on `upload_queue` with
+        // 0 declared UAV writes and no graphics-queue rehash/compare work.
+        if declared.is_empty() && used.is_empty() {
+            return None;
+        }
         let mut plan = CardPlan {
             ranges: Vec::new(),
             check: None,
@@ -4215,7 +4864,7 @@ impl Host {
             self.settle(&mut submitted, WHY_MOST);
             settled += settling.elapsed();
         }
-        let card = self.card_before(runs, flown);
+        let card = self.card_before(runs, flown, *submitted);
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
         }
@@ -4871,6 +5520,96 @@ impl HostList {
         self.settle(to, COPY_DEST);
         record_twin_copy(&self.list, &depth.texture, twin, colour);
         self.settle(&twin.colour, UNORDERED_ACCESS);
+    }
+
+    /// Brings a depth texture's host copy up to date with its colour/plane
+    /// twin before an external consumer (such as a PC-native upscaler) reads
+    /// it on this list. Returns `true` if `resource` has a depth twin.
+    ///
+    /// If the twin has a separate depth-plane pass that was deferred during
+    /// normal draw recording, this records that pass inline on `self.list`
+    /// (replacing pipeline/render-target bindings; callers must invalidate
+    /// cached draw state afterwards).
+    #[allow(dead_code)]
+    pub(crate) fn flush_depth_twin_if_dirty(&self, resource: crate::object::This) -> bool {
+        if !self.twin_use(resource, false, false) {
+            return false;
+        }
+        let plane = {
+            let Some(twin) = crate::resource::twin(resource) else {
+                return true;
+            };
+            let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
+            twins
+                .get_mut(&(std::sync::Arc::as_ptr(&twin) as usize))
+                .filter(|u| u.late)
+                .map(|u| {
+                    u.late = false;
+                    (u.depth.clone(), u.twin.clone())
+                })
+        };
+        if let Some((depth, twin)) = plane {
+            self.pass_plane(&depth, &twin);
+        }
+        true
+    }
+
+    /// Transitions a console texture's host copy to `wanted` (a PC D3D12
+    /// resource state) on this list, recording an inline transition barrier
+    /// when this list has already used the texture, or letting `prelude()`
+    /// bring it there on first use. Also pins the host texture on `self`
+    /// until list reset.
+    #[allow(dead_code)]
+    pub(crate) fn ensure_texture_state(
+        &self,
+        resource: crate::object::This,
+        wanted: u32,
+    ) -> Option<std::sync::Arc<crate::resource::HostTexture>> {
+        let copy = crate::resource::host_copy(resource)?;
+        let wanted = legal_state(&copy.texture, wanted);
+        let before = {
+            let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+            match states.entry(std::sync::Arc::as_ptr(&copy) as usize) {
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert((wanted, wanted, copy.clone()));
+                    None
+                }
+                std::collections::hash_map::Entry::Occupied(mut o) => {
+                    let prev = std::mem::replace(&mut o.get_mut().1, wanted);
+                    (prev != wanted).then_some(prev)
+                }
+            }
+        };
+        if let Some(before) = before {
+            let barrier = transition(
+                &copy.texture,
+                D3D12_RESOURCE_STATES(before as i32),
+                D3D12_RESOURCE_STATES(wanted as i32),
+            );
+            // SAFETY: open command list and live host texture.
+            unsafe { self.list.ResourceBarrier(&[barrier]) };
+        }
+        self.keep(&copy.texture);
+        Some(copy)
+    }
+
+    /// Updates this list's tracked end-state for `resource` after an external
+    /// pass (e.g. PC upscaler) transitioned it directly on `self.list`.
+    #[allow(dead_code)]
+    pub(crate) fn record_external_state(&self, resource: crate::object::This, after_state: u32) {
+        let Some(copy) = crate::resource::host_copy(resource) else {
+            return;
+        };
+        let state = legal_state(&copy.texture, after_state);
+        let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        match states.entry(std::sync::Arc::as_ptr(&copy) as usize) {
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert((state, state, copy));
+            }
+            std::collections::hash_map::Entry::Occupied(mut o) => {
+                o.get_mut().1 = state;
+            }
+        }
     }
 
     /// Before the list closes: the depth textures whose twins it wrote last

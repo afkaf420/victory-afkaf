@@ -499,6 +499,24 @@ impl Module {
     pub fn terminate(&mut self, block: usize, t: Term) {
         self.blocks[block].term = Some(t);
     }
+    pub fn take_term(&mut self, block: usize) -> Option<Term> {
+        self.blocks[block].term.take()
+    }
+    /// Rewrites incoming phi predecessors from `old` to `new` in the direct
+    /// successors of `term` when an already-terminated block is split.
+    pub fn remap_phi_preds(&mut self, term: Term, old: usize, new: usize) {
+        for &succ in successors(Some(term)).iter() {
+            for &p in &self.blocks[succ].phis {
+                if let Op::Phi(inc) = &mut self.insts[p as usize].op {
+                    for (_, from) in inc.iter_mut() {
+                        if *from == old {
+                            *from = new;
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     pub fn md_str(&mut self, s: &str) -> Md {
         self.mds.push(MdDef::Str(s.into()));

@@ -55,6 +55,7 @@ mod tiles;
 pub mod signature;
 #[cfg(windows)]
 mod texture;
+pub mod upscaler_bridge;
 #[cfg(windows)]
 mod watch;
 

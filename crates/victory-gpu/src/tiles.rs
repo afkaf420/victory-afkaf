@@ -71,14 +71,25 @@ const HEAP_TILES: u32 = 1024;
 /// no heap could be had); uploads recorded again for such a level.
 pub(crate) static STATS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
 
-/// Whether textures are made this way: the switch
-/// (`VICTORY_LEVELS_ON_DEMAND=1`; off by default), and a card that reads
-/// zeros from, and drops writes to, levels without memory (tiled resources
-/// tier 2).
+/// Resolves `VICTORY_LEVELS_ON_DEMAND`: honors explicit `"1"`/`"0"` overrides,
+/// otherwise defaults on for high-VRAM GPUs (>= 16 GiB dedicated VRAM, verified
+/// on RTX 3090 Tiled Resources Tier 4) and off on smaller GPUs.
+fn resolve_levels_on_demand(env: Option<&str>, high_vram: bool) -> bool {
+    match env.map(str::trim) {
+        Some(v) => v == "1",
+        None => high_vram,
+    }
+}
+
+/// Whether textures are made this way: `VICTORY_LEVELS_ON_DEMAND` (defaults on
+/// for >= 16 GiB GPUs, off on smaller GPUs; explicit `0` or `1` overrides), and
+/// a card that reads zeros from, and drops writes to, levels without memory
+/// (tiled resources tier 2+).
 pub(crate) fn wanted() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        if !std::env::var_os("VICTORY_LEVELS_ON_DEMAND").is_some_and(|v| v == "1") {
+        let env = std::env::var("VICTORY_LEVELS_ON_DEMAND").ok();
+        if !resolve_levels_on_demand(env.as_deref(), crate::host::high_vram()) {
             return false;
         }
         let Some(host) = host() else {
@@ -99,7 +110,7 @@ pub(crate) fn wanted() -> bool {
             tier,
             on,
             floor_kb = floor() >> 10,
-            "host copies of title textures take the card's memory level by level (VICTORY_LEVELS_ON_DEMAND=1)"
+            "host copies of title textures take the card's memory level by level (VICTORY_LEVELS_ON_DEMAND)"
         );
         on
     })
@@ -1415,5 +1426,14 @@ void look() {
             s[3] >> 20,
             s[8]
         );
+    }
+
+    #[test]
+    fn levels_on_demand_defaults_on_high_vram_and_respects_overrides() {
+        assert!(!resolve_levels_on_demand(None, false));
+        assert!(resolve_levels_on_demand(None, true));
+        assert!(!resolve_levels_on_demand(Some("0"), true));
+        assert!(resolve_levels_on_demand(Some("1"), false));
+        assert!(resolve_levels_on_demand(Some(" 1 "), false));
     }
 }

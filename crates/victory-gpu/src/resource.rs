@@ -2000,6 +2000,22 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     hosted(this, true).map(|made| made.0)
 }
 
+/// Returns a title texture's host copy and its host `D3D12_RESOURCE_DESC`,
+/// for external host bridges (such as PC-native upscalers).
+#[cfg(windows)]
+#[allow(dead_code)]
+pub(crate) fn host_copy_for_external(
+    this: This,
+) -> Option<(
+    std::sync::Arc<HostTexture>,
+    windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC,
+)> {
+    let copy = host_copy(this)?;
+    // SAFETY: `copy.texture` is a live host `ID3D12Resource`.
+    let desc = unsafe { copy.texture.GetDesc() };
+    Some((copy, desc))
+}
+
 /// A host texture like the title's: same description, in GPU memory,
 /// without the console's layout and flags.
 #[cfg(windows)]

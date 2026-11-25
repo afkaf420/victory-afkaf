@@ -343,15 +343,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     } != 0;
     let guarded = if failed {
         count = 0;
-        if !guarded {
-            return None;
-        }
-        #[cfg(feature = "diagnostics")]
-        let guarding = std::time::Instant::now();
-        let written = guard(first * PAGE, last * PAGE);
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::GuardUs, guarding.elapsed().as_micros() as u64);
-        written?
+        writes_mixed(j, first * PAGE, last * PAGE, guarded)?
     } else {
         Vec::new()
     };
@@ -375,6 +367,105 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             .map(|(&p, &w)| (p, w))
             .collect(),
     ))
+}
+
+/// Fallback when a single `GetWriteWatch` call over `[start, end)` fails:
+/// walks VirtualQuery sub-regions so ranges spanning multiple adjacent
+/// single-view `MEM_WRITE_WATCH` private mappings, unmapped placeholder holes,
+/// and promoted `MEM_MAPPED` aliased views each use their optimal tracking
+/// mechanism (`GetWriteWatch` for `MEM_WRITE_WATCH` private regions with zero
+/// `PAGE_READONLY` faults; `guard()` only for `MEM_MAPPED` views and holes).
+/// Returns `None` if any committed private sub-region is not write-watched.
+fn writes_mixed(j: &mut Journal, start: usize, end: usize, guarded: bool) -> Option<Vec<usize>> {
+    use windows_sys::Win32::System::Memory::{
+        GetWriteWatch, MEM_COMMIT, MEM_MAPPED, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery,
+    };
+    const WRITE_WATCH_FLAG_RESET: u32 = 1;
+    // Fast path: if `guarded` and the first block is already held by `GUARDS`
+    // (a known `MEM_MAPPED`/placeholder range), check whether the whole range
+    // is a pure guarded view without splitting it.
+    let mut at = start;
+    let mut dirty = Vec::new();
+    let mut any = false;
+    while at < end {
+        // SAFETY: plain VirtualQuery into a zeroed struct.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: valid out pointer.
+        let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+        if n == 0 {
+            return None;
+        }
+        let region_end = (info.BaseAddress as usize)
+            .saturating_add(info.RegionSize)
+            .min(end);
+        if region_end <= at {
+            return None;
+        }
+        if info.State == MEM_COMMIT && info.Type == MEM_PRIVATE {
+            let sub_first = at / PAGE;
+            let sub_last = region_end.div_ceil(PAGE);
+            let mut count = (sub_last - sub_first) * PAGE / KERNEL_PAGE;
+            j.found.resize(count.max(j.found.len()), 0);
+            let mut granularity = 0;
+            // SAFETY: `j.found` holds `count` entries; querying committed private region.
+            let sub_failed = unsafe {
+                GetWriteWatch(
+                    WRITE_WATCH_FLAG_RESET,
+                    (sub_first * PAGE) as *const _,
+                    (sub_last - sub_first) * PAGE,
+                    j.found.as_mut_ptr().cast(),
+                    &mut count,
+                    &mut granularity,
+                )
+            } != 0;
+            if sub_failed {
+                // Ordinary committed private memory (not `MEM_WRITE_WATCH`).
+                return None;
+            }
+            dirty.extend(j.found[..count].iter().map(|&addr| addr / PAGE));
+            any = true;
+        } else {
+            if !guarded {
+                return None;
+            }
+            // Coalesce consecutive non-private (`MEM_MAPPED` / placeholder hole)
+            // sub-regions into one `guard()` call.
+            let mut guard_end = region_end;
+            while guard_end < end {
+                // SAFETY: plain VirtualQuery probe.
+                let mut next_info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+                // SAFETY: valid out pointer.
+                let m = unsafe {
+                    VirtualQuery(guard_end as *const _, &mut next_info, size_of_val(&next_info))
+                };
+                if m == 0 || (next_info.State == MEM_COMMIT && next_info.Type == MEM_PRIVATE) {
+                    break;
+                }
+                let next_end = (next_info.BaseAddress as usize)
+                    .saturating_add(next_info.RegionSize)
+                    .min(end);
+                if next_end <= guard_end {
+                    break;
+                }
+                // Stop if we hit free memory that isn't a placeholder/view.
+                if next_info.Type != MEM_MAPPED && next_info.State == MEM_COMMIT {
+                    break;
+                }
+                guard_end = next_end;
+            }
+            #[cfg(feature = "diagnostics")]
+            let guarding = std::time::Instant::now();
+            let sub_written = guard(at, guard_end)?;
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::GuardUs, guarding.elapsed().as_micros() as u64);
+            dirty.extend(sub_written);
+            any = true;
+            at = guard_end;
+            continue;
+        }
+        at = region_end;
+    }
+    any.then_some(dirty)
 }
 
 /// Guarded blocks of view memory.
@@ -681,11 +772,35 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
     !blocks.is_empty()
 }
 
+/// Evicts `[at, at + len)` from `JOURNAL.written` and invalidates overlapping
+/// `ahead` cache entries when a VA range is unmapped or remapped. Removing
+/// freed VAs prevents stale journal entries from accumulating at runtime or
+/// poisoning subsequent `VirtualAlloc(MEM_WRITE_WATCH)` allocations that reuse
+/// the same VA; live `Shadow` copies are invalidated separately via
+/// `crate::shadow::remapped`. Must never be called while holding `GUARDS`.
+fn journal_clear(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let first = at / PAGE;
+    let last = at.saturating_add(len).div_ceil(PAGE);
+    if first >= last {
+        return;
+    }
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    j.ahead.retain(|&(a, b)| b <= first || a >= last);
+    let stale: Vec<usize> = j.written.range(first..last).map(|(&p, _)| p).collect();
+    for page in stale {
+        j.written.remove(&page);
+    }
+}
+
 /// Before our own write into title memory `[at, at + len)` through the
 /// kernel (which does not fault into our handler): opens its guarded blocks.
 /// The runtime calls it (as `kernel_will_write`) before the title's kernel
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
+    wrote(at, len);
     // The length is the title's (`fread`'s size times count, saturated).
     open(&mut guards(), at, at.saturating_add(len));
     // A placed texture there changes with no descriptor written.
@@ -837,6 +952,12 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
+    // Evict stale write-watch journal entries BEFORE taking `GUARDS` (lock
+    // order: `JOURNAL` -> `GUARDS`) so freed/reused VAs start clean, and reset
+    // `Shadow::copied` on live shadows so remapped single-view `MEM_WRITE_WATCH`
+    // pages are re-copied even when their kernel dirty bits start clear.
+    journal_clear(at, len);
+    crate::shadow::remapped(at, len);
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);
@@ -954,6 +1075,7 @@ mod tests {
             )
             .is_none()
         );
+        title_memory_remapped(p, 4 * PAGE);
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }
@@ -1404,6 +1526,149 @@ mod tests {
         let top = usize::MAX - 16;
         writing(top, PAGE);
         title_memory_remapped(top, usize::MAX);
+    }
+
+    /// A placeholder containing a single-view `MEM_WRITE_WATCH` private block,
+    /// an unmapped hole, and a `MEM_MAPPED` view tracks all three cleanly: the
+    /// private block stays `PAGE_READWRITE` (zero guard faults, kernel reads
+    /// succeed directly) and reports writes via `GetWriteWatch`.
+    #[test]
+    fn mixed_private_write_watch_and_mapped_view_coexist() {
+        use std::io::{Read, Seek, Write};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER,
+            MEM_RESERVE_PLACEHOLDER, MapViewOfFile3, PAGE_NOACCESS, UnmapViewOfFile2,
+            VirtualAlloc2,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        // SAFETY: 3-block placeholder + 1-block pagefile section.
+        let (p, section) = unsafe {
+            let p = VirtualAlloc2(
+                GetCurrentProcess(),
+                std::ptr::null(),
+                3 * BLOCK,
+                MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                PAGE_NOACCESS,
+                std::ptr::null_mut(),
+                0,
+            ) as usize;
+            assert_ne!(p, 0);
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                BLOCK as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            // Block 0: private `MEM_WRITE_WATCH` replacing placeholder.
+            VirtualFree(p as *mut _, BLOCK, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+            let priv_ptr = VirtualAlloc2(
+                GetCurrentProcess(),
+                p as *const _,
+                BLOCK,
+                MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+                std::ptr::null_mut(),
+                0,
+            );
+            assert_eq!(priv_ptr as usize, p);
+            // Block 1 stays an unmapped placeholder hole.
+            // Block 2: `MEM_MAPPED` section view replacing placeholder.
+            VirtualFree(
+                (p + 2 * BLOCK) as *mut _,
+                BLOCK,
+                MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
+            );
+            let mapped = MapViewOfFile3(
+                section,
+                GetCurrentProcess(),
+                (p + 2 * BLOCK) as *const _,
+                0,
+                BLOCK,
+                MEM_REPLACE_PLACEHOLDER,
+                PAGE_READWRITE,
+                std::ptr::null_mut(),
+                0,
+            );
+            assert_eq!(mapped.Value as usize, p + 2 * BLOCK);
+            (p, section)
+        };
+        // Initial query guards block 2, notes block 1 absent, and leaves block 0 `PAGE_READWRITE`.
+        let (t0, _) = writes(p, p + 3 * BLOCK, true).expect("mixed range watched");
+        assert!(writable(p), "single-view MEM_WRITE_WATCH block stays PAGE_READWRITE");
+        assert!(!writable(p + 2 * BLOCK), "MEM_MAPPED block is PAGE_READONLY guarded");
+
+        // CPU write to block 0 is detected by `GetWriteWatch` without any guard fault.
+        // SAFETY: block 0 is committed `PAGE_READWRITE`.
+        unsafe { ((p + 16) as *mut u8).write_volatile(0x42) };
+        let (t1, after_cpu) = writes(p, p + 3 * BLOCK, true).expect("mixed range after cpu write");
+        assert!(t1 > t0);
+        assert!(after_cpu.iter().any(|&(pg, at)| pg == p / PAGE && at == t1));
+        assert!(writable(p), "block 0 still PAGE_READWRITE");
+
+        // Kernel `ReadFile` directly into block 0 succeeds without needing `writing()`.
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(b"direct_watch").unwrap();
+        file.rewind().unwrap();
+        // SAFETY: 12 bytes of our committed `PAGE_READWRITE` block 0.
+        let dst = unsafe { std::slice::from_raw_parts_mut((p + 128) as *mut u8, 12) };
+        assert_eq!(file.read(dst).unwrap(), 12);
+        assert_eq!(dst, b"direct_watch");
+        let (t2, after_io) = writes(p, p + 3 * BLOCK, true).expect("mixed range after kernel read");
+        assert!(after_io.iter().any(|&(pg, at)| pg == p / PAGE && at == t2));
+
+        // Write to block 2 (`MEM_MAPPED`) still reports through the guard.
+        // SAFETY: guarded `MEM_MAPPED` block 2, opened by VEH on write.
+        unsafe { ((p + 2 * BLOCK + 8) as *mut u8).write_volatile(0x99) };
+        let (t3, after_mapped) = writes(p, p + 3 * BLOCK, true).expect("mixed range after mapped write");
+        assert!(after_mapped.iter().any(|&(pg, at)| pg == (p + 2 * BLOCK) / PAGE && at == t3));
+
+        // Clean up: notify guards BEFORE unmapping/freeing.
+        title_memory_remapped(p, 3 * BLOCK);
+        // SAFETY: our private allocation, section view, placeholders, and section handle.
+        unsafe {
+            VirtualFree(p as *mut _, BLOCK, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+            UnmapViewOfFile2(
+                GetCurrentProcess(),
+                windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: (p + 2 * BLOCK) as *mut _,
+                },
+                MEM_PRESERVE_PLACEHOLDER,
+            );
+            for block in 0..3 {
+                VirtualFree((p + block * BLOCK) as *mut _, 0, MEM_RELEASE);
+            }
+            windows_sys::Win32::Foundation::CloseHandle(section);
+        }
+    }
+
+    /// `title_memory_remapped` evicts freed/remapped VAs from `JOURNAL.written`
+    /// so a fresh `VirtualAlloc(MEM_WRITE_WATCH)` reusing the same address
+    /// starts clean without stale dirty entries.
+    #[test]
+    fn remapped_evicts_freed_va_from_journal() {
+        // SAFETY: fresh write-watched allocation, freed after eviction check.
+        let p = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                2 * PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(p, 0);
+        // SAFETY: committed page of ours.
+        unsafe { ((p + 8) as *mut u8).write_volatile(1) };
+        let (_, written) = writes(p, p + 2 * PAGE, false).expect("watched");
+        assert_eq!(written.len(), 1);
+        title_memory_remapped(p, 2 * PAGE);
+        // After eviction, no stale journal entries remain for `[p, p + 2 * PAGE)`.
+        let (_, after) = writes(p, p + 2 * PAGE, false).expect("watched");
+        assert!(after.is_empty(), "journal must not retain evicted pages");
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }
 }
 

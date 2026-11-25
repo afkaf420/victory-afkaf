@@ -223,12 +223,14 @@ impl Shader {
     }
 
     /// The thread-group shared memory: `[lds_dwords x i32]` in address
-    /// space 3.
+    /// space 3 (clamped to D3D12's 32 KiB / 8,192-dword TGSM ceiling).
     pub fn lds(&mut self) -> V {
         if let Some(g) = self.lds {
             return g;
         }
-        let arr = self.m.array(self.lds_dwords, self.t.i32);
+        debug_assert!(self.lds_dwords <= 8192, "TGSM exceeded 32 KiB: {} dwords", self.lds_dwords);
+        let dwords = self.lds_dwords.min(8192);
+        let arr = self.m.array(dwords, self.t.i32);
         let g = self.m.global("lds", arr, 3);
         self.lds = Some(g);
         g

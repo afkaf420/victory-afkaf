@@ -542,3 +542,373 @@ fn lds_oob_reads_zero_and_drops_writes() {
         assert_eq!(got, expected, "byte_addr={byte_addr:#x}");
     }
 }
+
+/// 128-thread Wave64 CS (2 console waves = 4 host 32-lane waves on NVIDIA).
+/// Console wave 0 (`t < 64`) takes a wave-wide branch while console wave 1
+/// (`64 <= t < 128`) skips it. Inside the branch, console wave 0 runs TWO
+/// consecutive cross-half exchanges (a 64-lane wave OR plus a cross-half
+/// `v_readlane_b32(0)` + `v_readlane_b32(32)` reduction-tail pair) and stores
+/// the combined result. Proves Mode B double-buffered pairwise arrival counters
+/// never deadlock when console waves diverge inside a threadgroup.
+#[test]
+fn mode_b_128_thread_divergent_wave_pairwise_exchange() {
+    let mut words = vec![
+        // Each thread t computes v5 = t + 10 and v7 = 1 << (t >> 1).
+        0x7E0A_028A, // v_mov_b32 v5, 10
+        0x4A0A_0105, // v_add_nc_u32 v5, v5, v0 (v5 = t + 10)
+        0x7E0C_0281, // v_mov_b32 v6, 1
+        0x2C0E_0081, // v_lshrrev_b32 v7, 1, v0
+        0x340E_0D07, // v_lshlrev_b32 v7, v7, v6 (v7 = 1 << (t >> 1))
+        // Wave-wide divergence: console wave 0 (t < s0 = 64) enters, wave 1 skips!
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0020, // s_cbranch_execz +32 dwords (patched below)
+    ];
+    let branch_idx = words.len() - 1;
+    // Inside the wave-wide branch: cross-half Wave64 OR of v7 -> s7.
+    words.extend_from_slice(&super::wave::WAVE_OR_V7_TO_S7);
+    // Second consecutive cross-half exchange: folded v_readlane(0) + v_readlane(32) of v5!
+    words.extend_from_slice(&[
+        0xD760_0006,
+        (128 << 9) | (256 + 5), // v_readlane_b32 s6, v5, 0  (= 10)
+        0xD760_000E,
+        (160 << 9) | (256 + 5), // v_readlane_b32 s14, v5, 32 (= 42)
+        0x8006_0E06,            // s_add_u32 s6, s6, s14 (= 52)
+        0x8006_0706,            // s_add_u32 s6, s6, s7  (= 52 + wave_or)
+        0x7E02_0206,            // v_mov_b32 v1, s6
+        // Only console lane 0 writes UAV[0]
+        0x7DA4_0080,            // v_cmpx_eq_u32 exec, 0, v0
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16 | 1 << 8, // buffer_store_dword v1, off, s[8:11], 0
+    ]);
+    let target_idx = words.len();
+    words[branch_idx] = 0xBF88_0000 | ((target_idx - branch_idx - 1) as u32 & 0xFFFF);
+    words.push(0xBEFE_040C); // s_mov_b64 exec, s[12:13]
+
+    let native = native_of(&words, true, 128);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let branch = (0..p.blocks.len())
+        .find(|&b| p.blocks[b].insts.last().is_some_and(|i| i.name() == "s_cbranch_execz"))
+        .expect("wave-wide branch");
+    let shader = lowered(&native, &p, &HashSet::from([branch])).expect("lower Mode B");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("Mode B DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    // s0 = 64 -> wave 0 enters (all 64 lanes, OR = 0xFFFF_FFFF, readlane(0)+readlane(32) = 10+42 = 52),
+    // while wave 1 (lanes 64..127) skips the branch completely.
+    // s0 = 36 -> wave 0 enters (lanes 0..35, OR = (1<<18)-1 = 0x3_FFFF, readlane(0)+readlane(32) = 52),
+    // wave 1 skips.
+    for (limit, expected_or) in [(64u32, u32::MAX), (36, (1u32 << 18) - 1)] {
+        let Some(got) = on_the_card(&shader, [limit, 0]) else { return };
+        let expected = expected_or.wrapping_add(52);
+        assert_eq!(got, expected, "Mode B 128-thread divergent wave (limit={limit})");
+    }
+}
+
+/// Coherent scalar buffer load (`glc` flag) in paired Wave64-on-Wave32 mode
+/// broadcasts half 0's loaded words to half 1 so both halves agree on the
+/// loaded scalar value across both Mode A (64 threads) and Mode B (128 threads).
+#[test]
+fn glc_scalar_load_broadcasts_across_paired_halves() {
+    use super::host::Stride;
+    let build_prog = |threads: u32| {
+        let mut w = vec![
+            0xBE85_0380, // s_mov_b32 s5, 0
+            // UAV descriptor s[8:11] at table offset 0
+            (0x3D << 26) | (0x02 << 18) | (8 << 6) | 2,
+            125 << 25,
+            // SRV descriptor s[12:15] at table offset 32 bytes (slot 1 in heap)
+            (0x3D << 26) | (0x02 << 18) | (12 << 6) | 2,
+            (125 << 25) | 32,
+            // Force paired mode: v_readlane_b32 s6, v0, 32
+            0xD760_0006,
+            (160 << 9) | (256 + 0),
+            // Coherent `s_buffer_load_dword s18, s[12:15], 0 glc`
+            (0x3D << 26) | (0x08 << 18) | (1 << 16) | (18 << 6) | (12 >> 1),
+            125 << 25,
+            // v1 = s18 + s6
+            0x8012_0612, // s_add_u32 s18, s18, s6
+            0x7E02_0212, // v_mov_b32 v1, s18
+            // v2 = (v0 >> 5) * 4 (lane 0 -> 0, lane 32 -> 4)
+            0x2C04_0085, // v_lshrrev_b32 v2, 5, v0
+            0x3404_0482, // v_lshlrev_b32 v2, 2, v2
+            // Only threads 0 and 32 write (v0 & 31 == 0 && v0 < 64)
+            0x3606_009F, // v_and_b32 v3, 31, v0
+            0x7DA4_0680, // v_cmpx_eq_u32 exec, 0, v3
+            0x7DA8_00C0, // v_cmpx_gt_u32 exec, 64, v0
+            // buffer_store_dword v1, v2, s[8:11], 0 offen
+            (0x38 << 26) | (0x1C << 18) | (1 << 12),
+            (128 << 24) | (2 << 16) | (1 << 8) | 2,
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = w.drain(..).flat_map(|x: u32| x.to_le_bytes()).collect();
+        NativeProgram {
+            stage: HwStage::Cs,
+            wave64: true,
+            vgprs: 16,
+            layout: vec![
+                RootParam {
+                    root: RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 4,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            used: vec![
+                UsedResource {
+                    kind: ResourceType::Uav,
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride: 0,
+                    dwords: 4,
+                    user_data: 4,
+                    slot: 1,
+                },
+                UsedResource {
+                    kind: ResourceType::Srv,
+                    root: RootType::Table,
+                    table_offset_dwords: 8,
+                    lower_bound: 1,
+                    stride: 0,
+                    dwords: 4,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 5 << 1,
+                threads: [threads, 1, 1],
+            }),
+            code,
+        }
+    };
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else { return };
+    for threads in [64u32, 128] {
+        let native = build_prog(threads);
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let shader = lowered(&native, &p, &HashSet::new()).expect("lower glc smem");
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+            let mut copy = shader.dxil.clone();
+            v.validate(&mut copy).expect("glc smem DXIL validation failed");
+        }
+        let Ok((root, pso)) = host.compute_pipeline(&shader) else { return };
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let payload = 0xCAFE_1000u32;
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[
+                        View::RawUav(2),
+                        View::Buffer {
+                            data: &[payload],
+                            stride: Stride::Raw,
+                        },
+                    ],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("dispatch failed ({threads} threads): {e}"));
+        let expected = payload.wrapping_add(32);
+        assert_eq!(out[0][0], expected, "half 0 mismatch ({threads} threads)");
+        assert_eq!(out[0][1], expected, "half 1 mismatch ({threads} threads)");
+    }
+}
+
+/// Cross-half `ds_bpermute_b32` in both Mode A (64 threads) and Mode B
+/// (128 threads): every lane reads from its opposite half (`lane ^ 32`) via
+/// the double-buffered exchange bank and writes the permuted result to UAV[t].
+#[test]
+fn cross_half_ds_bpermute_exchanges_lanes_across_halves() {
+    let words = [
+        // v5 = v0 * 17 + 3
+        0x340A_0084, // v_lshlrev_b32 v5, 4, v0  (t * 16)
+        0x4A0A_0105, // v_add_nc_u32 v5, v5, v0  (t * 17)
+        0x4A0A_0A83, // v_add_nc_u32 v5, 3, v5   (t * 17 + 3)
+        // v4 = (((v0 & 63) ^ 32) << 2)
+        0x3608_00BF, // v_and_b32 v4, 63, v0
+        0x3A08_08A0, // v_xor_b32 v4, 32, v4
+        0x3408_0882, // v_lshlrev_b32 v4, 2, v4
+        // ds_bpermute_b32 v6, v4, v5
+        (0x36 << 26) | (0xB3 << 18),
+        (6 << 24) | (5 << 8) | 4,
+        // v2 = v0 << 2 (byte offset for UAV[t])
+        0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+        // buffer_store_dword v6, v2, s[8:11], 0 offen
+        (0x38 << 26) | (0x1C << 18) | (1 << 12),
+        (128 << 24) | (2 << 16) | (6 << 8) | 2,
+    ];
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else { return };
+    for threads in [64u32, 128] {
+        let native = native_of(&words, true, threads);
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let shader = lowered(&native, &p, &HashSet::new()).expect("lower cross-half ds_bpermute");
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+            let mut copy = shader.dxil.clone();
+            v.validate(&mut copy).expect("ds_bpermute DXIL validation failed");
+        }
+        let Ok((root, pso)) = host.compute_pipeline(&shader) else { return };
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(threads)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("dispatch failed ({threads} threads): {e}"));
+        for t in 0..threads {
+            let partner = (t & !63) | ((t & 63) ^ 32);
+            let expected = partner * 17 + 3;
+            assert_eq!(out[0][t as usize], expected, "threads={threads}, lane={t}");
+        }
+    }
+}
+
+/// Full 32 KiB (8,192 dwords) console LDS + Wave64-on-Wave32 exchange tail
+/// carving: total host TGSM stays <= 8,192 dwords (passing `dxil.dll`
+/// validation), an OOB write to dword 8191 is clamped/dropped without
+/// clobbering the carved exchange/halves region, and cross-half `v_readlane`
+/// plus in-bounds LDS dword 0 both return exact results on the RTX 3090.
+#[test]
+fn full_32k_lds_carves_tail_for_wave64_exchange() {
+    let words = [
+        // Write sentinel s0 to LDS[0] and attempt OOB write to carved tail byte 32764 (dword 8191).
+        0x7E10_0200, // v_mov_b32 v8, s0
+        0x7E12_0280, // v_mov_b32 v9, 0
+        0xD834_0000,
+        0x0000_0809, // ds_write_b32 v9, v8 (LDS[0] = s0)
+        0x7E14_02FF,
+        32764,       // v_mov_b32 v10, 32764 (dword 8191 -> carved tail!)
+        0x7E16_02FF,
+        0xBAD0_C0DE, // v_mov_b32 v11, 0xBAD0C0DE
+        0xD834_0000,
+        0x0000_0B0A, // ds_write_b32 v10, v11 (must be dropped by console_lds_dwords clamp!)
+        0xBF8A_0000, // s_barrier
+        // Cross-half exchange after the OOB write (would corrupt if tail write landed!)
+        0xD760_0006,
+        (160 << 9) | (256 + 0), // v_readlane_b32 s6, v0, 32 (= 32)
+        // Read LDS[0] (== s0) and LDS[8191] (== 0, clamped)
+        0xD8D8_0000,
+        0x0C00_0009, // ds_read_b32 v12, v9
+        0xD8D8_0000,
+        0x0D00_000A, // ds_read_b32 v13, v10
+        0x4A18_1B0C, // v_add_nc_u32 v12, v12, v13
+        0x4A00_1806, // v_add_nc_u32 v0, s6, v12 (= s0 + 0 + 32)
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+    ];
+    let mut native = native_of(&words, true, 64);
+    native.io = StageIo::Cs(ComputeIo {
+        // 64 * 512 B = 32,768 B (full 8,192 dwords of console LDS!)
+        rsrc2: (5 << 1) | (64 << 15),
+        threads: [64, 1, 1],
+    });
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let shader = lowered(&native, &p, &HashSet::new()).expect("lower full 32 KiB LDS");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy)
+            .expect("32 KiB carved LDS DXIL validation failed (exceeded 32768 B?)");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let sentinel = 0x1357_9BDFu32;
+    let Some(got) = on_the_card(&shader, [sentinel, 0]) else { return };
+    assert_eq!(got, sentinel.wrapping_add(32));
+}
+
+/// 128-thread Wave64 Mesh Shader (`ms_6_6`) with cross-half `v_readlane_b32`
+/// lowers to Wave32 Mode B and passes `dxil.dll` validation.
+#[test]
+fn wave64_128_thread_mesh_shader_lowers_and_validates_on_wave32() {
+    use super::container::SigElement;
+    use crate::native::MeshIo;
+    // Cross-half `v_readlane_b32 s6, v0, 32`, then export pos0 and prim0.
+    // Note: in MS, v0 is flattened thread ID in group.
+    let words = [
+        0xD760_0006,
+        (160 << 9) | (256 + 0), // v_readlane_b32 s6, v0, 32
+        0x7E02_0206,            // v_mov_b32 v1, s6
+        // exp pos0, v1, v1, v1, v1
+        (0x3E << 26) | (12 << 4) | 0xF,
+        (1 << 24) | (1 << 16) | (1 << 8) | 1,
+        // exp prim0, v0, off, off, off done
+        (0x3E << 26) | (1 << 11) | (20 << 4) | 0x1,
+        0,
+        S_ENDPGM,
+    ];
+    let native = NativeProgram {
+        stage: HwStage::Ms,
+        wave64: true,
+        vgprs: 8,
+        layout: Vec::new(),
+        used: Vec::new(),
+        io: StageIo::Ms(MeshIo {
+            outputs: Vec::new(),
+            clip_cntl: 0,
+            threads: 128,
+            max_vertices: 128,
+            max_primitives: 128,
+            topology: 2,
+            lds_bytes: 0,
+        }),
+        code: words.iter().flat_map(|w: &u32| w.to_le_bytes()).collect(),
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let pos = SigElement {
+        name: "SV_Position".into(),
+        index: 0,
+        kind: 3,
+        comp: 9,
+        interp: 4,
+        row: Some(0),
+        col: 0,
+        cols: 4,
+        usage: 0xF,
+        half: false,
+    };
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let lowered_ms = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: vec![pos],
+        prims: Vec::new(),
+        mesh_stride: 0,
+    });
+    lower::TEST_HOST_WAVE.set(was);
+    let mut lowered_ms = lowered_ms.expect("lower 128-thread Wave64 MS on Wave32");
+    assert_eq!(lowered_ms.wave_size, None, "ms_6_6 must not emit WaveSize metadata");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut lowered_ms.dxil)
+            .expect("128-thread Wave64 MS Wave32 DXIL validation failed");
+    }
+}

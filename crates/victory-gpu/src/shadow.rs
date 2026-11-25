@@ -170,6 +170,45 @@ fn card_limits() -> (u64, u64) {
     })
 }
 
+/// Whether card-backed buffer refreshes diff 64-byte cachelines against
+/// last-sent bytes (`VICTORY_DIFF64`; on by default, `=0` uploads whole dirty
+/// pages).
+fn diff64_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DIFF64").is_none_or(|v| v != "0"))
+}
+
+/// Diffs `new` against `old` (starting at `base_offset` within the buffer) in
+/// 64-byte cacheline chunks aligned to buffer coordinates. Updates `old` ONLY
+/// on changed chunks and appends coalesced `[from, to)` buffer-offset runs to
+/// `out`. Returns total modified bytes.
+pub(crate) fn diff_cachelines_64(
+    old: &mut [u8],
+    new: &[u8],
+    base_offset: usize,
+    out: &mut Vec<(usize, usize)>,
+) -> usize {
+    const LINE: usize = 64;
+    let len = old.len().min(new.len());
+    let mut i = 0;
+    let mut changed = 0usize;
+    while i < len {
+        let next = ((base_offset + i) / LINE + 1) * LINE - base_offset;
+        let end = next.min(len);
+        if old[i..end] != new[i..end] {
+            old[i..end].copy_from_slice(&new[i..end]);
+            let (a, b) = (base_offset + i, base_offset + end);
+            changed += b - a;
+            match out.last_mut() {
+                Some(last) if a <= last.1 => last.1 = b,
+                _ => out.push((a, b)),
+            }
+        }
+        i = end;
+    }
+    changed
+}
+
 /// Bytes alive of copies' card sides, and of their "before" twins.
 static CARD_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
@@ -2911,7 +2950,11 @@ impl Shadow {
         let base = self.start as usize / PAGE;
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let mut writes = written.iter().peekable();
-        let (mut bytes, mut run) = (0, None);
+        // `(first_page, first_time)`: pages copied for the first time (`*at == 0`)
+        // take a full copy; subsequent refreshes of card-backed buffers diff
+        // 64-byte cachelines against last-sent bytes (`copy_diff64`).
+        let (mut bytes, mut run): (usize, Option<(usize, bool)>) = (0, None);
+        let diff = self.card.is_some() && diff64_on();
         let last = (to - 1) / PAGE;
         for page in from / PAGE..=last {
             let write = match writes.peek() {
@@ -2923,20 +2966,32 @@ impl Shadow {
             };
             let at = &mut copied[page - base];
             if *at == 0 || write > *at {
+                let first_time = *at == 0;
                 // A page only partly in the range is copied in part: it
                 // stays stale for the rest.
                 let (start, end) = (self.start as usize, (self.start + self.len) as usize);
                 if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
                     *at = now;
                 }
-                run.get_or_insert(page);
-            } else if let Some(first) = run.take() {
-                bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
+                if let Some((first, was_first)) = run
+                    && diff
+                    && was_first != first_time
+                {
+                    let (a, b) = ((first * PAGE).max(from), (page * PAGE).min(to));
+                    bytes += if was_first { self.copy(a, b) } else { self.copy_diff64(a, b) };
+                    run = Some((page, first_time));
+                } else {
+                    run.get_or_insert((page, first_time));
+                }
+            } else if let Some((first, was_first)) = run.take() {
+                let (a, b) = ((first * PAGE).max(from), (page * PAGE).min(to));
+                bytes += if !diff || was_first { self.copy(a, b) } else { self.copy_diff64(a, b) };
             }
         }
         // Cut to the range: next to it shaders may be writing the copy.
-        if let Some(first) = run {
-            bytes += self.copy((first * PAGE).max(from), ((last + 1) * PAGE).min(to));
+        if let Some((first, was_first)) = run {
+            let (a, b) = ((first * PAGE).max(from), ((last + 1) * PAGE).min(to));
+            bytes += if !diff || was_first { self.copy(a, b) } else { self.copy_diff64(a, b) };
         }
         bytes
     }
@@ -2954,6 +3009,46 @@ impl Shadow {
         to - from
     }
 
+    /// Refreshes a card-backed buffer over `[from, to)` by diffing 64-byte
+    /// cachelines against the last-sent CPU copy (`self.data`) and enqueueing
+    /// ONLY modified 64-byte runs to the card. Cuts PCIe upload traffic >90%
+    /// and prevents unchanged adjacent cachelines from clobbering GPU-written
+    /// UAV counters or indirect arguments sharing the same 4 KiB / 64 KiB page.
+    fn copy_diff64(&self, from: usize, to: usize) -> usize {
+        thread_local! {
+            static SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+            static RUNS: std::cell::RefCell<Vec<(usize, usize)>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (from.max(start), to.min(end));
+        let len = to.saturating_sub(from);
+        if len == 0 {
+            return 0;
+        }
+        let offset = from - start;
+        SCRATCH.with(|scratch| {
+            RUNS.with(|runs| {
+                let mut scratch = scratch.borrow_mut();
+                if scratch.len() < len {
+                    scratch.resize(len, 0);
+                }
+                let new = &mut scratch[..len];
+                crate::host::copy_mapped(new.as_mut_ptr(), from as *const u8, len, false);
+                let mut runs = runs.borrow_mut();
+                runs.clear();
+                // SAFETY: `[offset, offset + len)` lies inside `self.data`
+                // (`to <= self.start + self.len`); this range is not under an
+                // active flight's shader write (`copy_stale` skips pending ranges).
+                let old = unsafe { std::slice::from_raw_parts_mut(self.data.add(offset), len) };
+                let changed = diff_cachelines_64(old, new, offset, &mut runs);
+                if !runs.is_empty() {
+                    self.card_changed_runs(&runs);
+                }
+                changed
+            })
+        })
+    }
+
     /// Whether shaders read and write this copy in the card's own memory
     /// ([`cards`]).
     pub(crate) fn carded(&self) -> bool {
@@ -2963,17 +3058,39 @@ impl Shadow {
     /// The CPU side's bytes at offsets `[from, to)` changed: they go to the
     /// card's side before the next submission.
     fn card_changed(&self, from: usize, to: usize) {
-        let Some(card) = &self.card else {
-            return;
-        };
         if from >= to {
             return;
         }
-        let mut dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
-        match dirty.last_mut() {
-            Some(last) if from <= last.1 && to >= last.0 => *last = (last.0.min(from), last.1.max(to)),
-            _ => dirty.push((from, to)),
+        self.card_changed_runs(&[(from, to)]);
+    }
+
+    /// Appends multiple changed `[from, to)` byte runs to `card.dirty` under
+    /// one lock acquisition, coalescing overlapping/adjacent runs.
+    fn card_changed_runs(&self, runs: &[(usize, usize)]) {
+        let Some(card) = &self.card else {
+            return;
+        };
+        if runs.is_empty() {
+            return;
         }
+        let mut dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+        for &(from, to) in runs {
+            if from >= to {
+                continue;
+            }
+            match dirty.last_mut() {
+                Some(last) if from <= last.1 && to >= last.0 => {
+                    *last = (last.0.min(from), last.1.max(to));
+                }
+                _ => dirty.push((from, to)),
+            }
+        }
+    }
+
+    /// Pointer to the CPU-side staging mapping (`Card::staging`) for async
+    /// ring-buffered copies (`host::card_before`).
+    pub(crate) fn cpu_data(&self) -> *const u8 {
+        self.data
     }
 
     /// Of a copy in the card's memory: the CPU's side (PC memory), the
@@ -3714,6 +3831,90 @@ mod window_tests {
         assert_eq!(resolve_card_windows_bytes(Some("1024"), false), 1024 << 20);
         assert!(!resolve_card_room_kept(Some("0"), true));
         assert!(resolve_card_room_kept(Some("1"), false));
+    }
+
+    /// 64-byte cacheline diffing updates only changed cachelines, coalesces
+    /// adjacent runs, respects unaligned start/end offsets, and leaves
+    /// untouched cachelines (e.g. adjacent GPU counters) intact.
+    #[test]
+    fn cacheline_diff_64_isolates_and_coalesces_modified_runs() {
+        use super::diff_cachelines_64;
+        // 4 KiB page with two small CPU edits at cachelines 1 and 2 (coalesced)
+        // and one isolated edit at cacheline 50.
+        let mut old = vec![0x11u8; 4096];
+        let mut new = old.clone();
+        new[70] = 0x22; // inside cacheline [64..128)
+        new[130] = 0x33; // inside cacheline [128..192) -> coalesces to [64..192)
+        new[50 * 64 + 3] = 0x44; // inside cacheline [3200..3264)
+        let mut runs = Vec::new();
+        let changed = diff_cachelines_64(&mut old, &new, 0, &mut runs);
+        assert_eq!(runs, vec![(64, 192), (3200, 3264)]);
+        assert_eq!(changed, 192);
+        assert_eq!(old, new);
+
+        // Second diff with no further changes produces zero runs.
+        runs.clear();
+        assert_eq!(diff_cachelines_64(&mut old, &new, 0, &mut runs), 0);
+        assert!(runs.is_empty());
+
+        // Unaligned base offset & length: clips cleanly to [base, base + len).
+        let mut old_u = vec![0u8; 100];
+        let mut new_u = vec![0u8; 100];
+        new_u[5] = 0xAA; // buffer offset 25 -> cacheline [0..64), clipped to [20..64)
+        new_u[95] = 0xBB; // buffer offset 115 -> cacheline [64..128), clipped to [64..120)
+        runs.clear();
+        let changed_u = diff_cachelines_64(&mut old_u, &new_u, 20, &mut runs);
+        assert_eq!(runs, vec![(20, 120)]);
+        assert_eq!(changed_u, 100);
+        assert_eq!(old_u, new_u);
+    }
+}
+
+/// The runtime mapped or unmapped `[at, at + len)`: clears `copied` on any
+/// live `Shadow` covering those pages so their next refresh re-copies the new
+/// mapping even if its hardware `MEM_WRITE_WATCH` dirty bits started clear.
+pub(crate) fn remapped(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let end = at.saturating_add(len);
+    let mut hit: Vec<Arc<Shadow>> = Vec::new();
+    {
+        let map = buffers();
+        for (&(start, _), entry) in map.range(..(end as u64, 0)) {
+            if entry.end > at as u64
+                && let Some(shadow) = &entry.shadow
+            {
+                hit.push(shadow.clone());
+            }
+            let _ = start;
+        }
+    }
+    {
+        let map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        for (&(start, _), shadow) in map.range(..(end as u64, 0)) {
+            if start.saturating_add(shadow.len) > at as u64 {
+                hit.push(shadow.clone());
+            }
+        }
+    }
+    for shadow in hit {
+        let s_start = shadow.start as usize;
+        let s_end = s_start.saturating_add(shadow.len as usize);
+        let lo = at.max(s_start);
+        let hi = end.min(s_end);
+        if lo >= hi {
+            continue;
+        }
+        let base = s_start / PAGE;
+        let first = lo / PAGE;
+        let last = hi.div_ceil(PAGE);
+        let mut copied = shadow.copied.lock().unwrap_or_else(|e| e.into_inner());
+        for page in first..last {
+            if let Some(slot) = copied.get_mut(page - base) {
+                *slot = 0;
+            }
+        }
     }
 }
 

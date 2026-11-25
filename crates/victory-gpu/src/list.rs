@@ -180,6 +180,23 @@ pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
     unsafe { (*this.cast::<List>()).host.as_ref() }
 }
 
+/// Raw host `ID3D12GraphicsCommandList*` for an external PC library (such as a
+/// native upscaler) recording commands inline into a console command list.
+#[cfg(windows)]
+pub(crate) fn host_list_raw(this: This) -> Option<*mut std::ffi::c_void> {
+    use windows::core::Interface;
+    host_list(this).map(|l| l.list.as_raw())
+}
+
+/// Invalidates cached descriptor-heap, root-signature, and pipeline bindings
+/// on `this`'s draw state and replays non-pipeline graphics state onto the
+/// underlying host command list. Must be called after an external PC pass
+/// (or inline depth-twin pass) modifies host command-list state directly.
+#[cfg(windows)]
+pub(crate) fn invalidate_cached_bindings(this: This) {
+    with_state(this, |host, state| state.replay(host));
+}
+
 /// The host side of a submitted list, taken from it: a queue that waits
 /// for a fence runs it later, and the title may reset the list meanwhile.
 /// With it go the upload memory and the dynamic descriptor slots its
