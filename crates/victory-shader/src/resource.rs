@@ -138,6 +138,9 @@ pub struct RootIndexedView {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Resources {
+    /// Scalar values saved to a constant VGPR lane and restored within one
+    /// block, even if that VGPR is also used in ordinary vector operations.
+    pub(crate) restored_lanes: std::collections::HashMap<Site, Moved>,
     /// Every scalar memory access by address (`s_load_*`, `s_store_*`), and
     /// every global memory access (`global_*`, the dynamic term per lane).
     pub scalar: Vec<(Site, Address)>,
@@ -227,6 +230,9 @@ pub fn track(
         for (i, inst) in block.insts.iter().enumerate() {
             let site = (b, i);
             t.at.set(Some(site));
+            if let Some(value) = t.restored(inst, Some(b)) {
+                out.restored_lanes.insert(site, value);
+            }
             let fail = |what| ShaderError::Unsupported {
                 offset: inst.machine.offset,
                 what,
@@ -514,7 +520,7 @@ impl<'a> Tracer<'a> {
                 }
                 for inst in &block.insts {
                     for (k, &(_, v)) in inst.writes.iter().enumerate() {
-                        let new = match copy_source(inst, k).or_else(|| self.restored(inst)) {
+                        let new = match copy_source(inst, k).or_else(|| self.restored(inst, None)) {
                             Some(Moved::Const(c)) => Some(Term::Const(c)),
                             Some(Moved::Value(s)) => o[s.0 as usize],
                             None => Some(Term::Value(v)),
@@ -1118,10 +1124,17 @@ impl<'a> Tracer<'a> {
         let Operand::Scalar { code, dwords } = *op else {
             return Err("a descriptor not in SGPRs");
         };
-        let words = (0..dwords)
+        let mut words = (0..dwords)
             .map(|k| inst.read(Reg::S(code + k)).map(|v| self.origin(v)))
             .collect::<Option<Vec<_>>>()
             .ok_or("a descriptor not in SGPRs")?;
+        // A byte access through a buffer descriptor made raw reads what the
+        // descriptor's view does with a raw host view.
+        if !inst.name().contains("format")
+            && let Some(raw) = self.made_raw(&words)
+        {
+            words = raw.to_vec();
+        }
         // Only the lanes that reach the access (and pass its guard when the
         // enclosing branch is widened) read the descriptor.
         let mut known = Vec::from_iter(self.lanes.map(|l| (l.reach[at.0], true)));
@@ -1470,6 +1483,44 @@ impl<'a> Tracer<'a> {
             }
             _ => None,
         }
+    }
+
+    /// The words of a buffer descriptor that `words` makes raw before byte
+    /// accesses: the stride (dword 1 bits 16-29) cleared, the record count
+    /// times max(stride, 1), out-of-bounds checking by bytes (dword 3 bits
+    /// 28-29 set). The bounds are then the view's size in bytes either way.
+    fn made_raw(&self, words: &[Term]) -> Option<[Term; 4]> {
+        let [w0, Term::Value(w1), Term::Value(w2), Term::Value(w3)] = *words else {
+            return None;
+        };
+        // `x op c` with `c` either side.
+        let with = |v: Value, name: &str, c: u32| match self.sop2(v, &[name])?.1 {
+            [x, Term::Const(k)] | [Term::Const(k), x] if k == c => Some(x),
+            _ => None,
+        };
+        let d1 = with(w1, "s_and_b32", 0xC000_FFFF)?;
+        let Term::Value(m3) = with(w3, "s_or_b32", 0x3000_0000)? else {
+            return None;
+        };
+        let d3 = with(m3, "s_and_b32", 0xCFFF_FFFF)?;
+        let [a, b] = self.sop2(w2, &["s_mul_i32"])?.1;
+        let max = |t: Term| match t {
+            Term::Value(s) => with(s, "s_max_u32", 1),
+            Term::Const(_) => None,
+        };
+        let (d2, field) = match (max(a), max(b)) {
+            (_, Some(f)) => (a, f),
+            (Some(f), None) => (b, f),
+            (None, None) => return None,
+        };
+        let Term::Value(field) = field else {
+            return None;
+        };
+        // s_bfe_u32: offset 16, width 14.
+        let (_, [x, Term::Const(0x000E_0010)]) = self.sop2(field, &["s_bfe_u32"])? else {
+            return None;
+        };
+        (x == d1).then_some([w0, d1, d2, d3])
     }
 
     /// For a `v_readfirstlane_b32` result: the VGPR value it reads.
@@ -2255,41 +2306,64 @@ impl<'a> Tracer<'a> {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Moved {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Moved {
     Const(u32),
     Value(Value),
+}
+
+fn plain_lane(v: &crate::gfx10::Valu) -> bool {
+    v.abs == 0
+        && v.neg == 0
+        && v.opsel == 0
+        && !v.clamp
+        && v.omod == 0
+        && v.sdwa.is_none()
+        && v.dpp.is_none()
 }
 
 impl Tracer<'_> {
     /// For `v_readlane_b32` of a constant lane: the SGPR spilled to that
     /// lane, found by following the VGPR's `v_writelane_b32` writes.
-    fn restored(&self, inst: &Inst) -> Option<Moved> {
+    fn restored(&self, inst: &Inst, block: Option<usize>) -> Option<Moved> {
         let Fields::Valu(v) = &inst.fields else {
             return None;
         };
-        if inst.name() != "v_readlane_b32" {
+        if inst.name() != "v_readlane_b32" || !plain_lane(v) {
             return None;
         }
         let [Operand::Vector { reg, .. }, lane] = v.src[..] else {
             return None;
         };
-        self.spilled(inst.read(Reg::V(reg))?, lane_of(lane)?, &mut Vec::new())
+        let lane = lane_of(lane)?;
+        if lane >= if self.p.wave64 { 64 } else { 32 } {
+            return None;
+        }
+        self.spilled(inst.read(Reg::V(reg))?, lane, block, &mut Vec::new())
             .ok()
             .flatten()
     }
 
     /// What lane `lane` of VGPR value `v` holds: `Ok(None)` for a phi in
     /// `seen` (already being resolved), `Err` if not a spilled SGPR.
-    fn spilled(&self, v: Value, lane: u32, seen: &mut Vec<Value>) -> Result<Option<Moved>, ()> {
+    fn spilled(
+        &self,
+        v: Value,
+        lane: u32,
+        block: Option<usize>,
+        seen: &mut Vec<Value>,
+    ) -> Result<Option<Moved>, ()> {
         if let Some((b, i)) = self.phis[v.0 as usize] {
+            if block.is_some() {
+                return Err(());
+            }
             if seen.contains(&v) {
                 return Ok(None);
             }
             seen.push(v);
             let mut found = None;
             for &a in &self.p.blocks[b].phis[i].args {
-                if let Some(m) = self.spilled(a, lane, seen)? {
+                if let Some(m) = self.spilled(a, lane, block, seen)? {
                     if found.is_some_and(|f| f != m) {
                         return Err(());
                     }
@@ -2298,18 +2372,26 @@ impl Tracer<'_> {
             }
             return Ok(found);
         }
-        let inst = self.def(v).ok_or(())?;
+        let site = self.defs[v.0 as usize].ok_or(())?;
+        if block.is_some_and(|b| site.0 != b) {
+            return Err(());
+        }
+        let inst = self.inst(site);
         let Fields::Valu(w) = &inst.fields else {
             return Err(());
         };
         let (Some(Operand::Vector { reg, .. }), [value, at]) = (w.dst, &w.src[..]) else {
             return Err(());
         };
-        if inst.name() != "v_writelane_b32" {
+        if inst.name() != "v_writelane_b32" || !plain_lane(w) {
             return Err(());
         }
-        if lane_of(*at).ok_or(())? != lane {
-            return self.spilled(inst.read(Reg::V(reg)).ok_or(())?, lane, seen);
+        let written = lane_of(*at).ok_or(())?;
+        if written >= if self.p.wave64 { 64 } else { 32 } {
+            return Err(());
+        }
+        if written != lane {
+            return self.spilled(inst.read(Reg::V(reg)).ok_or(())?, lane, block, seen);
         }
         match *value {
             Operand::Scalar { code, .. } if code != NULL => {

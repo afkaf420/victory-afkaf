@@ -37,6 +37,8 @@ mod host;
 mod indirect;
 #[cfg(windows)]
 mod inplace;
+#[cfg(windows)]
+mod land;
 pub mod list;
 pub mod object;
 pub mod pipeline;
@@ -44,8 +46,12 @@ pub mod pipeline;
 mod primitive;
 pub mod query;
 pub mod queue;
+#[cfg(windows)]
+mod residency;
 pub mod resource;
 pub mod root;
+#[cfg(windows)]
+mod safecopy;
 #[cfg(windows)]
 mod sampler;
 #[cfg(windows)]
@@ -56,6 +62,8 @@ mod memory;
 mod shadow;
 #[cfg(windows)]
 pub mod sparse_uma;
+#[cfg(windows)]
+mod texback;
 #[cfg(windows)]
 mod tiles;
 pub mod signature;
@@ -68,7 +76,7 @@ mod watch;
 #[cfg(windows)]
 pub use host::on_failure;
 #[cfg(windows)]
-pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
+pub use inplace::{title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_view};
 #[cfg(windows)]
 pub use watch::{
     clear_console_memory, note_console_memory, title_memory_reading, title_memory_remapped,

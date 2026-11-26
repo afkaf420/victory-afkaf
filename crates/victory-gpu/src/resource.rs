@@ -1142,6 +1142,116 @@ pub(crate) struct HostTexture {
     /// levels have been given. Its `bytes` are 0: what it holds of the card
     /// is counted there.
     pub(crate) tiled: Option<crate::tiles::Tiled>,
+    /// The title's level its level 0 is: larger levels have no place in it.
+    pub(crate) base: u32,
+    /// Tells host copies apart that one texture had one after the other.
+    pub(crate) serial: u64,
+    /// Made in place of one with fewer levels: the slots that show that one
+    /// are made again once this one was filled whole.
+    pub(crate) grown: std::sync::atomic::AtomicBool,
+    /// What the last submitted upload put in it.
+    pub(crate) holds: std::sync::Arc<Holds>,
+    /// Who makes its first upload (`crate::texture::ahead`).
+    pub(crate) ahead: std::sync::atomic::AtomicU8,
+    /// The texture's D3D12 resource flags (cached once at creation).
+    flags: u32,
+}
+
+/// What a host copy was filled with last: the first level of it and the
+/// digest of the title memory it was read from.
+#[cfg(windows)]
+pub(crate) type Holds = std::sync::Mutex<Option<(u32, crate::texture::Digest)>>;
+
+/// [`HostTexture::serial`] of the last one made.
+#[cfg(windows)]
+static NEXT_SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Recently created host textures `(raw_ptr, now_ms)` for `fresh()`, used by
+/// `VICTORY_SHOW_AFTER` and `VICTORY_UPLOAD_AHEAD` to tell newly created
+/// textures from older ones.
+#[cfg(windows)]
+static RECENT_TEXTURES: std::sync::Mutex<std::collections::VecDeque<(usize, u64)>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+
+/// Whether `texture` was created in the last second.
+#[cfg(windows)]
+pub(crate) fn fresh(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) -> bool {
+    use windows::core::Interface;
+    let raw = texture.as_raw() as usize;
+    let since = crate::host::now_ms().saturating_sub(1000);
+    RECENT_TEXTURES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .rev()
+        .take_while(|r| r.1 >= since)
+        .any(|r| r.0 == raw)
+}
+
+#[cfg(windows)]
+fn made_now(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) {
+    use windows::core::Interface;
+    let now = crate::host::now_ms();
+    let mut recent = RECENT_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    while recent.front().is_some_and(|r| r.1 + 1000 < now) {
+        recent.pop_front();
+    }
+    recent.push_back((texture.as_raw() as usize, now));
+}
+
+/// Whether placed textures only read the mip levels a view starts at when
+/// `VICTORY_LEVELS_ON_DEMAND` is off (`VICTORY_HELD_LEVELS=0` disables).
+#[cfg(windows)]
+pub(crate) fn held_only() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_HELD_LEVELS").is_none_or(|v| v != "0") && !crate::tiles::wanted()
+    })
+}
+
+/// The first level a placed texture's view shows: of views of one 2D texture.
+#[cfg(windows)]
+pub(crate) fn first_mip(view: &[u32]) -> u32 {
+    const TEXTURE_2D_VIEW: u32 = 4;
+    match *view {
+        [_, TEXTURE_2D_VIEW, _, _, first, ..] => first.min(15),
+        _ => 0,
+    }
+}
+
+/// Bytes from mip `first` down to the end of `layout` (all of `layout.size`
+/// when `first == 0` or the texture is multi-slice/thick/3D/MSAA).
+#[cfg(windows)]
+pub(crate) fn layout_bytes_from(layout: &victory_formats::texture::Layout, first: u32) -> u64 {
+    let whole = first == 0
+        || layout.slices != 1
+        || layout.thick
+        || layout.desc.dimension == victory_formats::texture::Dimension::Tex3d
+        || layout.desc.samples != 1
+        || first >= layout.desc.mips;
+    if whole {
+        return layout.size;
+    }
+    layout.mips[first as usize..]
+        .iter()
+        .map(|m| match m.tail {
+            Some(_) => layout.alignment,
+            None => m.offset + u64::from(m.pitch) * u64::from(m.rows) * u64::from(layout.desc.element_bytes),
+        })
+        .max()
+        .unwrap_or(layout.size)
+        .min(layout.size)
+}
+
+/// The level from which on a texture of `layout` is read for a view starting
+/// at `first`.
+#[cfg(windows)]
+pub(crate) fn read_from(layout: &victory_formats::texture::Layout, first: u32) -> u32 {
+    if layout.slices != 1 || layout.mips.is_empty() {
+        return 0;
+    }
+    let first = first.min(layout.first_tail_mip).min(layout.mips.len() as u32 - 1);
+    if layout_bytes_from(layout, first) < layout.size { first } else { 0 }
 }
 
 /// What a title texture has on the host: its host copy and, for a depth
@@ -1931,9 +2041,16 @@ fn host_bytes(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) ->
 
 #[cfg(windows)]
 impl HostTexture {
+    pub(crate) fn flags(&self) -> u32 {
+        self.flags
+    }
+
     fn new(texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource, state: u32) -> HostTexture {
         use std::sync::atomic::Ordering::Relaxed;
         let bytes = host_bytes(&texture);
+        // SAFETY: a live texture.
+        let flags = unsafe { texture.GetDesc() }.Flags.0 as u32;
+        made_now(&texture);
         HOST_TEXTURES[0].fetch_add(1, Relaxed);
         HOST_TEXTURES[1].fetch_add(bytes, Relaxed);
         HostTexture {
@@ -1942,6 +2059,12 @@ impl HostTexture {
             bytes,
             filled: false,
             tiled: None,
+            base: 0,
+            serial: NEXT_SERIAL.fetch_add(1, Relaxed),
+            grown: std::sync::atomic::AtomicBool::new(false),
+            holds: std::sync::Arc::default(),
+            ahead: crate::texture::ahead::fresh(),
+            flags,
         }
     }
 
@@ -1952,13 +2075,23 @@ impl HostTexture {
         state: u32,
         tiled: crate::tiles::Tiled,
     ) -> HostTexture {
-        HOST_TEXTURES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        use std::sync::atomic::Ordering::Relaxed;
+        // SAFETY: a live texture.
+        let flags = unsafe { texture.GetDesc() }.Flags.0 as u32;
+        made_now(&texture);
+        HOST_TEXTURES[0].fetch_add(1, Relaxed);
         HostTexture {
             texture,
             state: std::sync::atomic::AtomicU32::new(state),
             bytes: 0,
             filled: false,
             tiled: Some(tiled),
+            base: 0,
+            serial: NEXT_SERIAL.fetch_add(1, Relaxed),
+            grown: std::sync::atomic::AtomicBool::new(false),
+            holds: std::sync::Arc::default(),
+            ahead: crate::texture::ahead::fresh(),
+            flags,
         }
     }
 }
@@ -2021,6 +2154,15 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
         return None;
     }
     hosted(this, true).map(|made| made.0)
+}
+
+/// A title texture's host copy if it is already made; not made here.
+#[cfg(windows)]
+pub(crate) fn made_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
+    if this.is_null() {
+        return None;
+    }
+    hosted(this, false).map(|made| made.0)
 }
 
 /// Returns a title texture's host copy and its host `D3D12_RESOURCE_DESC`,
@@ -2301,6 +2443,7 @@ fn hand_out_resource(
     if desc.dimension != BUFFER {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         textures().insert(at);
+        crate::texback::replaced(resource.data() as usize);
         if !fills(&desc) {
             TARGETS_AT
                 .lock()
@@ -2325,7 +2468,9 @@ impl Drop for Resource {
         // Out of the table of textures first: the sweep looks at the ones
         // in it, under its lock.
         if self.desc.dimension != BUFFER {
-            textures().remove(&(std::ptr::from_ref::<Resource>(self) as usize));
+            let address = std::ptr::from_ref::<Resource>(self) as usize;
+            crate::texback::released(address);
+            textures().remove(&address);
             if !fills(&self.desc) {
                 let mut targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
                 let at = self.data() as u64;
@@ -2555,6 +2700,38 @@ static PLACED_TWINS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn placed_filler_twins() -> u64 {
     PLACED_TWINS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Width, height and format of texture `this` (`None` for a buffer), for
+/// `crate::texback`'s kinds.
+#[cfg(windows)]
+pub(crate) fn texture_kind(this: This) -> Option<(u64, u32, u32)> {
+    if this.is_null() {
+        return None;
+    }
+    let r = resource(this);
+    const TEXTURE_2D: u32 = 3;
+    (r.desc.dimension == TEXTURE_2D && r.desc.sample_count <= 1)
+        .then_some((r.desc.width, r.desc.height, r.desc.format))
+}
+
+/// Texture `this`'s console layout (one plane), where it lies in title
+/// memory and the bytes that layout takes, for `crate::texback`; `None` for
+/// a buffer or a texture with multiple planes.
+#[cfg(windows)]
+pub(crate) fn title_texture(this: This) -> Option<(victory_formats::texture::Layout, usize, usize)> {
+    if this.is_null() {
+        return None;
+    }
+    let r = resource(this);
+    if r.desc.dimension == BUFFER {
+        return None;
+    }
+    let t = texture_layout(&r.desc)?;
+    let [plane] = &t.planes[..] else {
+        return None;
+    };
+    Some((plane.layout.clone(), r.data() as usize, t.size as usize))
 }
 
 /// The bytes of title memory a texture with the resource description

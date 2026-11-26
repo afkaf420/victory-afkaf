@@ -167,6 +167,21 @@ pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
     }
 }
 
+/// Calls `f` on the largest live shader-visible view heap without blocking
+/// if `SHADER_HEAPS` is currently write-locked.
+#[cfg(windows)]
+pub(crate) fn with_view_heap<T>(f: impl FnOnce(&host::HostHeap) -> T) -> Option<T> {
+    let heaps = SHADER_HEAPS.try_read().ok()?;
+    let host = heaps
+        .iter()
+        // SAFETY: registered heaps are live (removed when dropped).
+        .map(|&(_, _, at)| unsafe { &*(at as *const Heap) })
+        .filter(|heap| !heap.samplers())
+        .filter_map(|heap| heap.host.get()?.as_ref())
+        .max_by_key(|host| host.count())?;
+    Some(f(host))
+}
+
 /// Points slot `index` of the host heap behind `heap` (if still live) at `size`
 /// bytes of `buffer` at `gpu`.
 #[cfg(windows)]
@@ -782,6 +797,17 @@ fn view_at(i: u32, generation: u32) -> Option<View> {
         PLACED => views_read().placed_of(i, generation),
         _ => None,
     }
+}
+
+/// The words of the record at `handle`, if they are a view's.
+#[cfg(windows)]
+pub(crate) fn record_at(handle: u64) -> Option<[u32; 3]> {
+    if handle == 0 {
+        return None;
+    }
+    // SAFETY: the handle is a descriptor slot the title passes back.
+    let words = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+    (words[0] == VIEW_TAG).then_some(words)
 }
 
 /// The view recorded at `handle`, if one is (and its resource is alive).

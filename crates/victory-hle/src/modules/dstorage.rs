@@ -1567,11 +1567,15 @@ fn into_destination(
         // is committed and mapped under `_reading`; nothing else writes it until completion.
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
         let filled = fill(out).map(drop);
+        // Release `MAPPING` before notifying `watch`/`descriptor::host` so
+        // `title_memory_written` never nests under `MAPPING.read()` and never
+        // delays concurrent `xmem` remappings.
+        drop(_reading);
         // Said again now that the bytes are there (upstream's c75fdba holds
         // the blocks open over the read and marks them once more at its
         // end): a copy or a texture pass that took the memory while the
-        // read was under way took what was there before. Counted; acted on
-        // only with `VICTORY_PAGE_WRITES=all`.
+        // read was under way took what was there before. Counted and acted on
+        // by default under `VICTORY_PAGE_WRITES=all`.
         victory_gpu::title_memory_written(request.destination as usize, len, false);
         return filled;
     }

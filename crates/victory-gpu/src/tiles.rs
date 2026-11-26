@@ -71,17 +71,16 @@ const HEAP_TILES: u32 = 1024;
 /// no heap could be had); uploads recorded again for such a level.
 pub(crate) static STATS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
 
-/// Resolves `VICTORY_LEVELS_ON_DEMAND`: strictly opt-in (`"1"` enables), off by
-/// default on all GPUs (matching upstream). High-VRAM GPUs (>= 16 GiB) have
-/// ample VRAM for committed host textures without `CreateReservedResource` +
-/// `UpdateTileMappings` page-table churn during large bake bursts.
+/// Resolves `VICTORY_LEVELS_ON_DEMAND`: on by default (`=0` disables),
+/// allocating host texture VRAM level-by-level via `CreateReservedResource` +
+/// `UpdateTileMappings` on Tier 2+ GPUs.
 fn resolve_levels_on_demand(env: Option<&str>, _high_vram: bool) -> bool {
-    env.is_some_and(|v| v.trim() == "1")
+    env.is_none_or(|v| v.trim() != "0")
 }
 
-/// Whether textures are made this way: `VICTORY_LEVELS_ON_DEMAND=1` (opt-in,
-/// off by default), and a card that reads zeros from, and drops writes to,
-/// levels without memory (tiled resources tier 2+).
+/// Whether textures are made this way: `VICTORY_LEVELS_ON_DEMAND=1` (on by
+/// default; `=0` disables), and a card that reads zeros from, and drops writes
+/// to, levels without memory (tiled resources tier 2+).
 pub(crate) fn wanted() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -1426,10 +1425,11 @@ void look() {
     }
 
     #[test]
-    fn levels_on_demand_is_opt_in_and_respects_overrides() {
-        assert!(!resolve_levels_on_demand(None, false));
-        assert!(!resolve_levels_on_demand(None, true));
+    fn levels_on_demand_defaults_on_and_respects_overrides() {
+        assert!(resolve_levels_on_demand(None, false));
+        assert!(resolve_levels_on_demand(None, true));
         assert!(!resolve_levels_on_demand(Some("0"), true));
+        assert!(!resolve_levels_on_demand(Some(" 0 "), false));
         assert!(resolve_levels_on_demand(Some("1"), false));
         assert!(resolve_levels_on_demand(Some(" 1 "), true));
     }
