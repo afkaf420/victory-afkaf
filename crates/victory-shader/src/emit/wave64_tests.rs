@@ -839,47 +839,15 @@ fn full_32k_lds_carves_tail_for_wave64_exchange() {
     assert_eq!(got, sentinel.wrapping_add(32));
 }
 
-/// 128-thread Wave64 Mesh Shader (`ms_6_6`) with cross-half `v_readlane_b32`
-/// lowers to Wave32 Mode B and passes `dxil.dll` validation.
+/// 128-thread Wave64 Mesh Shader (`ms_6_6`) computing its console lane index
+/// via `v_mbcnt_lo/hi(-1)` + a per-lane loop lowers cleanly on Wave32 with
+/// ZERO Mode B spin loops, ZERO TGSM atomics, ZERO barriers, and `lds_dwords == 0`,
+/// and passes `dxil.dll` validation. Genuine cross-lane `v_readlane_b32` in a
+/// mesh shader is cleanly refused rather than injecting Mode B spins.
 #[test]
-fn wave64_128_thread_mesh_shader_lowers_and_validates_on_wave32() {
+fn wave64_128_thread_mesh_shader_v_mbcnt_emits_no_mode_b_spins() {
     use super::container::SigElement;
     use crate::native::MeshIo;
-    // Cross-half `v_readlane_b32 s6, v0, 32`, then export pos0 and prim0.
-    // Note: in MS, v0 is flattened thread ID in group.
-    let words = [
-        0xD760_0006,
-        (160 << 9) | (256 + 0), // v_readlane_b32 s6, v0, 32
-        0x7E02_0206,            // v_mov_b32 v1, s6
-        // exp pos0, v1, v1, v1, v1
-        (0x3E << 26) | (12 << 4) | 0xF,
-        (1 << 24) | (1 << 16) | (1 << 8) | 1,
-        // exp prim0, v0, off, off, off done
-        (0x3E << 26) | (1 << 11) | (20 << 4) | 0x1,
-        0,
-        S_ENDPGM,
-    ];
-    let native = NativeProgram {
-        stage: HwStage::Ms,
-        wave64: true,
-        vgprs: 8,
-        layout: Vec::new(),
-        used: Vec::new(),
-        io: StageIo::Ms(MeshIo {
-            outputs: Vec::new(),
-            clip_cntl: 0,
-            threads: 128,
-            max_vertices: 128,
-            max_primitives: 128,
-            topology: 2,
-            lds_bytes: 0,
-        }),
-        code: words.iter().flat_map(|w: &u32| w.to_le_bytes()).collect(),
-    };
-    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    let st = structure::structure(&p).expect("structure");
-    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
-    let io = io::raise(&p, &native).expect("io::raise");
     let pos = SigElement {
         name: "SV_Position".into(),
         index: 0,
@@ -892,23 +860,320 @@ fn wave64_128_thread_mesh_shader_lowers_and_validates_on_wave32() {
         usage: 0xF,
         half: false,
     };
-    let was = lower::TEST_HOST_WAVE.replace(Some(32));
-    let lowered_ms = lower::lower(&lower::Parts {
-        native: &native,
-        p: &p,
-        st: &st,
-        io: &io,
-        res: &res,
-        inputs: Vec::new(),
-        outputs: vec![pos],
-        prims: Vec::new(),
-        mesh_stride: 0,
-    });
-    lower::TEST_HOST_WAVE.set(was);
-    let mut lowered_ms = lowered_ms.expect("lower 128-thread Wave64 MS on Wave32");
+    let lower_ms = |words: &[u32]| {
+        let native = NativeProgram {
+            stage: HwStage::Ms,
+            wave64: true,
+            vgprs: 8,
+            layout: Vec::new(),
+            used: Vec::new(),
+            io: StageIo::Ms(MeshIo {
+                outputs: Vec::new(),
+                clip_cntl: 0,
+                threads: 128,
+                max_vertices: 128,
+                max_primitives: 128,
+                topology: 2,
+                lds_bytes: 0,
+            }),
+            code: words.iter().flat_map(|w: &u32| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let st = structure::structure(&p).expect("structure");
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+        let io = io::raise(&p, &native).expect("io::raise");
+        let was = lower::TEST_HOST_WAVE.replace(Some(32));
+        let out = lower::lower(&lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: vec![pos.clone()],
+            prims: Vec::new(),
+            mesh_stride: 0,
+        });
+        lower::TEST_HOST_WAVE.set(was);
+        out
+    };
+
+    // Part A: `v_mbcnt_lo/hi(-1)` lane-ID idiom + per-lane self-loop + exports.
+    let mbcnt_words = [
+        0xD765_0001,
+        0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
+        0xD766_0001,
+        0x0002_02C1, // v_mbcnt_hi_u32_b32 v1, -1, v1
+        0x3604_0287, // v_and_b32 v2, 7, v1
+        0x4A04_0481, // v_add_nc_u32 v2, 1, v2
+        0x7E06_0280, // v_mov_b32 v3, 0
+        0xBE8C_047E, // s_mov_b64 s[12:13], exec
+        // per-lane self-loop
+        0x4A06_0681, // v_add_nc_u32 v3, 1, v3
+        0x4A04_04C1, // v_add_nc_u32 v2, -1, v2
+        0x7DAA_0480, // v_cmpx_ne_u32 exec, 0, v2
+        0xBF89_FFFC, // s_cbranch_execnz -4
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        0x4A02_0701, // v_add_nc_u32 v1, v1, v3
+        // exp pos0, v1, v1, v1, v1
+        (0x3E << 26) | (12 << 4) | 0xF,
+        (1 << 24) | (1 << 16) | (1 << 8) | 1,
+        // exp prim0, v0, off, off, off done
+        (0x3E << 26) | (1 << 11) | (20 << 4) | 0x1,
+        0,
+        S_ENDPGM,
+    ];
+    let mut lowered_ms = lower_ms(&mbcnt_words).expect("lower 128-thread Wave64 v_mbcnt MS");
     assert_eq!(lowered_ms.wave_size, None, "ms_6_6 must not emit WaveSize metadata");
+    assert_eq!(lowered_ms.lds_dwords, 0, "v_mbcnt MS must not allocate Mode B TGSM");
+    assert_eq!(lowered_ms.atomic_rmws, 0, "v_mbcnt MS must emit 0 Mode B atomics/spins");
+    assert_eq!(lowered_ms.barriers, 0, "v_mbcnt MS must emit 0 barriers");
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut lowered_ms.dxil)
-            .expect("128-thread Wave64 MS Wave32 DXIL validation failed");
+            .expect("128-thread Wave64 v_mbcnt MS DXIL validation failed");
     }
+
+    // Part B: genuine cross-lane `v_readlane_b32` in MS is cleanly refused (no Mode B).
+    let readlane_words = [
+        0xD760_0006,
+        (160 << 9) | (256 + 0), // v_readlane_b32 s6, v0, 32
+        0x7E02_0206,            // v_mov_b32 v1, s6
+        (0x3E << 26) | (12 << 4) | 0xF,
+        (1 << 24) | (1 << 16) | (1 << 8) | 1,
+        (0x3E << 26) | (1 << 11) | (20 << 4) | 0x1,
+        0,
+        S_ENDPGM,
+    ];
+    let refused = lower_ms(&readlane_words);
+    assert!(
+        matches!(
+            refused,
+            Err(ShaderError::Unsupported {
+                what: "a cross-lane operation in a mesh shader",
+                ..
+            })
+        ),
+        "cross-lane MS should be cleanly refused without Mode B: {:?}",
+        refused.err()
+    );
+}
+
+/// Regression for `exchange::all_lane_blocks` self-post-dominance and paired
+/// Wave64-on-Wave32 `count_iteration()`:
+/// 1. A 1-block per-lane self-loop (`d -> (d, exit)`) marks `all[d] == false`.
+/// 2. A multi-block per-lane loop latch (`H -> ... -> d -> (H, exit)`) marks
+///    `all[H] == false` and `all[d] == false`.
+/// 3. An acyclic per-lane diamond inside a uniform loop keeps `all[H] == true`
+///    and `all[d] == true` (only the divergent arms are `false`).
+/// 4. Paired Mode A (64 threads) and Mode B (128 threads) lowering inject ZERO
+///    `barrier(9)` or Mode B spins into per-lane loops, validate with `dxil.dll`,
+///    and execute without deadlocking on the RTX 3090 with exact per-lane counts.
+#[test]
+fn per_lane_self_loop_and_latch_are_not_all_lanes_and_emit_no_loop_sync() {
+    let run_loop_case = |words: &[u32], multi_block: bool| {
+        let native64 = native_of(words, true, 64);
+        let p = ir::build(&native64.code, native64.wave64, native64.vgprs).expect("ir::build");
+        let st = structure::structure(&p).expect("structure");
+        let all = super::exchange::all_lane_blocks(&st).expect("all_lane_blocks");
+        let latch = (0..p.blocks.len())
+            .find(|&b| {
+                p.blocks[b]
+                    .insts
+                    .last()
+                    .is_some_and(|i| i.name() == "s_cbranch_execnz")
+            })
+            .expect("per-lane loop latch");
+        assert!(
+            !all[latch],
+            "per-lane loop latch block {latch} must NOT be marked all_lanes (multi_block={multi_block})"
+        );
+        if multi_block {
+            // Find the header targeted by the latch's back-edge.
+            let crate::structure::LaneExit::Branch { taken, .. } = st.exits[latch] else {
+                panic!("latch must be a branch");
+            };
+            assert_ne!(taken, latch, "multi-block loop must have distinct header and latch");
+            assert!(
+                !all[taken],
+                "multi-block per-lane loop header {taken} must NOT be marked all_lanes"
+            );
+        }
+
+        let _one = super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Ok(host) = Host::new(false) else { return };
+        for threads in [64u32, 128] {
+            let native = native_of(words, true, threads);
+            let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+            let st = structure::structure(&p).expect("structure");
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+            let io = io::raise(&p, &native).expect("io::raise");
+            let was = lower::TEST_HOST_WAVE.replace(Some(32));
+            let mut l = lower::lower(&lower::Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                prims: Vec::new(),
+                mesh_stride: 0,
+            })
+            .expect("lower paired loop");
+            lower::TEST_HOST_WAVE.set(was);
+            if threads == 64 {
+                // Mode A: 1 entry-block `wave_base`/exchange-header init barrier
+                // + 1 barrier from the single top-level `v_readlane_b32` = 2 total;
+                // 0 barriers injected into the per-lane loop!
+                assert_eq!(
+                    l.barriers, 2,
+                    "Mode A must not inject barriers into per-lane loop (multi_block={multi_block})"
+                );
+            } else {
+                // Mode B: 1 `wave_base` atomic + 5 atomics from the single top-level
+                // `v_readlane_b32` exchange (arrival Add, volatile Or(0) loads of
+                // partner/dead in spin_enter and spin_hdr, timeout Xchg) = 6 total;
+                // 0 Mode B spins injected into the per-lane loop!
+                assert_eq!(
+                    l.atomic_rmws, 6,
+                    "Mode B must not inject a spin loop into per-lane loop (multi_block={multi_block})"
+                );
+            }
+            if let Ok(mut v) =
+                validator::Validator::load(validator::Validator::default_path().as_deref())
+            {
+                v.validate(&mut l.dxil).expect("paired loop DXIL validation failed");
+            }
+            let shader = HostShader {
+                stage: HwStage::Cs,
+                dxil: l.dxil,
+                user_data: l.user_data,
+                samplers: l.samplers,
+                static_samplers: Vec::new(),
+                root_cbvs: l.root_cbvs,
+                root_srvs: l.root_srvs,
+                root_uavs: l.root_uavs,
+                root_indexed_views: res.root_indexed_views,
+            };
+            let Ok((root, pso)) = host.compute_pipeline(&shader) else { continue };
+            let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &[View::RawUav(threads)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("dispatch failed (threads={threads}, multi={multi_block}): {e}"));
+            for t in 0..threads {
+                let partner_lane32 = (t & !63) + 32;
+                let expected = ((t & 7) + 1) + partner_lane32;
+                assert_eq!(
+                    out[0][t as usize], expected,
+                    "threads={threads}, multi={multi_block}, lane={t}"
+                );
+            }
+        }
+    };
+
+    // Case 1: 1-block per-lane self-loop (`d -> (d, exit)`).
+    let self_loop = [
+        // Force paired Mode A / Mode B: s6 = lane 32's v0 (= wave_base + 32)
+        0xD760_0006,
+        (160 << 9) | (256 + 0), // v_readlane_b32 s6, v0, 32
+        0x3602_0087,            // v_and_b32 v1, 7, v0
+        0x4A02_0281,            // v_add_nc_u32 v1, 1, v1  (trip count 1..=8)
+        0x7E04_0280,            // v_mov_b32 v2, 0
+        0xBE8C_047E,            // s_mov_b64 s[12:13], exec
+        // self-loop block `d`:
+        0x4A04_0481,            // v_add_nc_u32 v2, 1, v2
+        0x4A02_02C1,            // v_add_nc_u32 v1, -1, v1
+        0x7DAA_0280,            // v_cmpx_ne_u32 exec, 0, v1
+        0xBF89_FFFC,            // s_cbranch_execnz -4 (back to v_add_nc_u32 v2)
+        // exit:
+        0xBEFE_040C,            // s_mov_b64 exec, s[12:13]
+        0x4A04_0406,            // v_add_nc_u32 v2, s6, v2
+        0x3406_0082,            // v_lshlrev_b32 v3, 2, v0 (byte offset t * 4)
+        (0x38 << 26) | (0x1C << 18) | (1 << 12),
+        (128 << 24) | (2 << 16) | (2 << 8) | 3, // buffer_store_dword v2, v3, s[8:11], 0 offen
+    ];
+    run_loop_case(&self_loop, false);
+
+    // Case 2: multi-block per-lane loop (`H -> B -> d -> (H, exit)`).
+    let multi_block_loop = [
+        0xD760_0006,
+        (160 << 9) | (256 + 0), // v_readlane_b32 s6, v0, 32
+        0x3602_0087,            // v_and_b32 v1, 7, v0
+        0x4A02_0281,            // v_add_nc_u32 v1, 1, v1
+        0x7E04_0280,            // v_mov_b32 v2, 0
+        0xBE8C_047E,            // s_mov_b64 s[12:13], exec
+        // header H:
+        0x4A04_0481,            // v_add_nc_u32 v2, 1, v2
+        0xBF82_0000,            // s_branch +0 (forces block split H -> d)
+        // latch d:
+        0x4A02_02C1,            // v_add_nc_u32 v1, -1, v1
+        0x7DAA_0280,            // v_cmpx_ne_u32 exec, 0, v1
+        0xBF89_FFFB,            // s_cbranch_execnz -5 (back to header H)
+        // exit:
+        0xBEFE_040C,            // s_mov_b64 exec, s[12:13]
+        0x4A04_0406,            // v_add_nc_u32 v2, s6, v2
+        0x3406_0082,            // v_lshlrev_b32 v3, 2, v0
+        (0x38 << 26) | (0x1C << 18) | (1 << 12),
+        (128 << 24) | (2 << 16) | (2 << 8) | 3,
+    ];
+    run_loop_case(&multi_block_loop, true);
+
+    // Case 3: acyclic per-lane diamond INSIDE a uniform loop keeps `all[H]` & `all[d]` true.
+    let diamond_in_uniform_loop = [
+        0xBE8E_0380,            // s_mov_b32 s14, 0
+        0x7E04_0280,            // v_mov_b32 v2, 0
+        // uniform loop header H (and per-lane diamond branch d):
+        0xBE8C_047E,            // s_mov_b64 s[12:13], exec
+        0x7DA8_00A0,            // v_cmpx_gt_u32 exec, 32, v0 (lanes < 32)
+        0xBF88_0001,            // s_cbranch_execz +1 (skip then-arm T)
+        // then-arm T:
+        0x4A04_0481,            // v_add_nc_u32 v2, 1, v2
+        // merge J (and uniform loop latch):
+        0xBEFE_040C,            // s_mov_b64 exec, s[12:13]
+        0x800E_810E,            // s_add_u32 s14, s14, 1
+        0xBF07_840E,            // s_cmp_lg_u32 s14, 4
+        0xBF85_FFF8,            // s_cbranch_scc1 -8 (back to H)
+        (0x38 << 26) | (0x1C << 18),
+        (128 << 24) | (2 << 16) | (2 << 8),
+    ];
+    let native_d = native_of(&diamond_in_uniform_loop, true, 64);
+    let p_d = ir::build(&native_d.code, native_d.wave64, native_d.vgprs).expect("ir::build");
+    let st_d = structure::structure(&p_d).expect("structure");
+    let all_d = super::exchange::all_lane_blocks(&st_d).expect("all_lane_blocks");
+    let diamond_hdr = (0..p_d.blocks.len())
+        .find(|&b| {
+            p_d.blocks[b]
+                .insts
+                .last()
+                .is_some_and(|i| i.name() == "s_cbranch_execz")
+        })
+        .expect("diamond branch");
+    let uniform_latch = (0..p_d.blocks.len())
+        .find(|&b| {
+            p_d.blocks[b]
+                .insts
+                .last()
+                .is_some_and(|i| i.name() == "s_cbranch_scc1")
+        })
+        .expect("uniform latch");
+    let crate::structure::LaneExit::Branch { taken: skip_join, not_taken: then_arm, .. } =
+        st_d.exits[diamond_hdr]
+    else {
+        panic!("diamond must be a branch");
+    };
+    assert!(all_d[diamond_hdr], "acyclic diamond header inside uniform loop must stay all_lanes");
+    assert!(!all_d[then_arm], "acyclic diamond then-arm must NOT be all_lanes");
+    assert!(all_d[skip_join], "acyclic diamond merge must stay all_lanes");
+    assert!(all_d[uniform_latch], "uniform loop latch must stay all_lanes");
 }

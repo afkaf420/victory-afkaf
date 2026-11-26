@@ -69,6 +69,15 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// Total TGSM dwords declared by the emitted shader.
+    #[cfg(test)]
+    pub lds_dwords: u32,
+    /// Number of `atomicrmw` instructions emitted before optimisation.
+    #[cfg(test)]
+    pub atomic_rmws: u32,
+    /// Number of `dx.op.barrier` calls emitted before optimisation.
+    #[cfg(test)]
+    pub barriers: u32,
 }
 
 pub(crate) struct Parts<'a> {
@@ -878,68 +887,14 @@ impl<'a> Lower<'a> {
         if let StageIo::Ms(ms) = &x.native.io {
             s.prims = x.prims.clone();
             s.threads = Some([ms.threads, 1, 1]);
-            let raw_lds_dwords = ms.lds_bytes.div_ceil(4);
+            s.lds_dwords = ms.lds_bytes.div_ceil(4);
+            console_lds_dwords = s.lds_dwords;
             group_size = ms.threads;
             s.mesh = Some(super::shader::Mesh {
                 max_vertices: ms.max_vertices,
                 max_primitives: ms.max_primitives,
                 topology: ms.topology,
             });
-            let mut exchange_dwords = 0u32;
-            let mut halves_needed = false;
-            if x.native.wave64 && host_max_wave() == 32 && ms.threads > 32 {
-                let ms_crosses = p.blocks.iter().enumerate().any(|(b, blk)| {
-                    blk.insts.iter().enumerate().any(|(i, inst)| {
-                        let n = inst.name();
-                        n.starts_with("v_mbcnt")
-                            || matches!(n, "v_readlane_b32" | "v_writelane_b32")
-                            || n.starts_with("ds_permute")
-                            || n.starts_with("ds_bpermute")
-                            || whole_live.reads_mask_as_data(b, i)
-                    })
-                }) || lane_constant_masks(x.st)
-                    || !x.st.wide.is_empty();
-                let ms_wave_ops = ms_crosses
-                    || insts().any(|i| {
-                        let n = i.name();
-                        matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
-                            || (n.starts_with("ds_swizzle")
-                                && matches!(&i.fields, Fields::Ds { offset0, offset1, .. } if {
-                                    let off = u32::from(*offset0) | u32::from(*offset1) << 8;
-                                    !(off & 0x8000 != 0
-                                        || off & 0x1C == 0x1C
-                                            && off & 0x380 == 0
-                                            && off >> 10 & 0x1F < 4)
-                                }))
-                    });
-                if ms_wave_ops {
-                    // DXIL 1.6 rejects the `WaveSize` metadata tag on `ms_6_6`
-                    // ("WaveSize only allowed on compute or node shaders"); on
-                    // Wave32-only hosts (`host_max_wave() == 32`) mesh warps are
-                    // natively 32 lanes, so `wave_base` + Mode A/B exchange run
-                    // without declaring `s.wave_size`.
-                    if !ms_crosses {
-                        console_lanes = true;
-                        halves_needed = true;
-                    } else if let Some(all) = all_lane_blocks(x.st) {
-                        console_lanes = true;
-                        halves_needed = true;
-                        let (ex, dwords) = make_exchange(ms.threads, all);
-                        exchange = Some(ex);
-                        exchange_dwords = dwords;
-                    }
-                }
-            }
-            let reserved_dwords = u32::from(halves_needed) + exchange_dwords;
-            let max_console = MAX_LDS_DWORDS.saturating_sub(reserved_dwords);
-            console_lds_dwords = raw_lds_dwords.min(max_console);
-            if let Some(ex) = &mut exchange {
-                ex.slot = console_lds_dwords;
-            }
-            if halves_needed {
-                halves = Some(console_lds_dwords + exchange_dwords);
-            }
-            s.lds_dwords = console_lds_dwords + reserved_dwords;
             // Barriers order the lanes' LDS accesses; the console's
             // allocation request needs them too, but the host does not. One
             // lane sends that request, and what it dominates (the path for
@@ -1101,7 +1056,6 @@ impl<'a> Lower<'a> {
             half_outputs: half_outputs(&x.native.io, &x.outputs),
             mask_data: match x.native.stage {
                 HwStage::Cs => MaskData::Console,
-                HwStage::Ms if console_lanes => MaskData::Console,
                 HwStage::Ps | HwStage::Vs => MaskData::Host,
                 _ => MaskData::None,
             },
@@ -1813,6 +1767,12 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            #[cfg(test)]
+            lds_dwords: self.s.lds_dwords,
+            #[cfg(test)]
+            atomic_rmws: self.s.m.atomic_rmw_count(),
+            #[cfg(test)]
+            barriers: self.s.m.barrier_count(),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -3606,6 +3566,11 @@ impl<'a> Lower<'a> {
                     }
                 }
             }
+            for blk in self.rq_plan.lowered_join.values_mut() {
+                if *blk == at {
+                    *blk = spin_join;
+                }
+            }
             if self.entry_tail == at {
                 self.entry_tail = spin_join;
             }
@@ -4117,7 +4082,10 @@ impl<'a> Lower<'a> {
     /// the console's wave size (lanes are thread ids in group order there).
     /// Pixel lanes match only within a quad.
     fn cross_lane(&mut self, quad: bool) -> Result<(), Why> {
-        if self.s.mesh.is_some() && !self.console_lanes {
+        if self.s.mesh.is_some() {
+            // shortcut: no wave size for mesh shaders in SM 6.6, so host
+            // lanes cannot follow the console's; ordinary `v_mbcnt(-1)` uses
+            // `flattenedThreadIdInGroup & (wave - 1)` directly without Mode B.
             return Err("a cross-lane operation in a mesh shader");
         }
         if self.s.threads.is_none() && !(quad && self.s.pixel) {
@@ -4263,25 +4231,20 @@ impl<'a> Lower<'a> {
     }
 
     /// Mesh: the thread's index in the group, which is its vertex and
-    /// primitive index (relabelled via `wave_base` when running Wave64 on
-    /// Wave32 so host waves align to 32-lane console halves).
+    /// primitive index.
     fn mesh_thread(&mut self) -> V {
         if let Some(f) = self.flat {
             return f;
         }
-        let f = if self.halves.is_some() {
-            self.console_thread()
-        } else {
-            let e = self.s.entry;
-            self.s.op(
-                e,
-                "flattenedThreadIdInGroup.i32",
-                Attr::ReadNone,
-                self.s.t.i32,
-                96,
-                &[],
-            )
-        };
+        let e = self.s.entry;
+        let f = self.s.op(
+            e,
+            "flattenedThreadIdInGroup.i32",
+            Attr::ReadNone,
+            self.s.t.i32,
+            96,
+            &[],
+        );
         self.flat = Some(f);
         f
     }
@@ -4292,9 +4255,9 @@ impl<'a> Lower<'a> {
     }
 
     fn lane_index(&mut self) -> V {
-        if self.s.mesh.is_some() && !self.console_lanes {
-            // Mesh code without cross-lane wave ops reads no other lanes, so
-            // host waves need not match the console's.
+        if self.s.mesh.is_some() {
+            // The console's lane: mesh code reads no other lanes, so host
+            // waves need not match the console's.
             let f = self.mesh_thread();
             let m = self.s.m.i32(self.wave() - 1);
             return self.s.m.bin(self.s.entry, Bin::And, f, m);
@@ -8895,15 +8858,20 @@ impl<'a> Lower<'a> {
         }
     }
 
-    /// Whether every reachable predecessor of loop header `header` enters it
-    /// wave-uniformly so all 64 console lanes carry the exact same iteration
-    /// counter without cross-half synchronisation.
+    /// Whether every reachable back-edge predecessor of loop header `header`
+    /// branches wave-uniformly so all 64 console lanes carry the exact same
+    /// iteration counter without cross-half synchronisation.
+    ///
+    /// Every forward edge into `header` supplies `0` (`enter_loop`), so once
+    /// `all_lanes(header)` holds and every back-edge predecessor runs in all
+    /// lanes with a uniform/wave-wide exit, `phi` is provably identical across
+    /// both halves on every iteration.
     fn counter_uniform(&self, header: usize) -> bool {
         if !self.all_lanes(header) {
             return false;
         }
         self.x.p.blocks[header].preds.iter().all(|&q| {
-            if self.block[q].is_none() {
+            if self.block[q].is_none() || self.rpo[q] < self.rpo[header] {
                 return true;
             }
             if !self.all_lanes(q) {
@@ -8957,11 +8925,15 @@ impl<'a> Lower<'a> {
         let mut over = self.s.m.cmp(c, p, next, limit);
         self.s.m.tag(over, Tag::Counter);
         // In paired Wave64-on-Wave32 mode, keep loop-limit aborts wave-uniform
-        // whenever the iteration counter is not already provably identical
-        // across both halves, so one half cannot jump to `abort_block` while
-        // its partner enters a cross-half exchange.
+        // ONLY when every lane of the console wave runs this latch
+        // (`all_lanes(self.cur_ir)`) and the header's iteration counter is not
+        // already provably identical across both halves. Never emit a half-local
+        // `waveAllTrue`/`waveAnyTrue` without cross-half exchange (that lets
+        // one 32-lane half exit an outer loop while its partner stays inside),
+        // and never inject an exchange into a per-lane loop latch.
         if self.exchange.as_ref().is_some_and(|e| e.paired())
             && !self.local
+            && self.all_lanes(self.cur_ir)
             && !self.counter_uniform(to)
         {
             let (i1t, i32t) = (self.s.t.i1, self.s.t.i32);
@@ -8972,18 +8944,16 @@ impl<'a> Lower<'a> {
             };
             over = self.s.op(c, wname, Attr::NoUnwind, i1t, wcode, &[over]);
             self.s.flags |= flags::WAVE_OPS;
-            if self.all_lanes(self.cur_ir) {
-                let over_i32 = self.s.m.cast(c, Cast::ZExt, over, i32t);
-                let (c2, lo, hi) = self.exchange_halves(c, over_i32);
-                let combined = if p == pred::IULT {
-                    self.s.m.bin(c2, Bin::And, lo, hi)
-                } else {
-                    self.s.m.bin(c2, Bin::Or, lo, hi)
-                };
-                let z = self.s.m.i32(0);
-                over = self.s.m.cmp(c2, pred::NE, combined, z);
-                self.s.m.tag(over, Tag::Counter);
-            }
+            let over_i32 = self.s.m.cast(c, Cast::ZExt, over, i32t);
+            let (c2, lo, hi) = self.exchange_halves(c, over_i32);
+            let combined = if p == pred::IULT {
+                self.s.m.bin(c2, Bin::And, lo, hi)
+            } else {
+                self.s.m.bin(c2, Bin::Or, lo, hi)
+            };
+            let z = self.s.m.i32(0);
+            over = self.s.m.cmp(c2, pred::NE, combined, z);
+            self.s.m.tag(over, Tag::Counter);
         }
         // Record the incoming back-edge from `self.cur` (which Mode B exchange
         // may have advanced to its join block).
@@ -9043,6 +9013,10 @@ impl<'a> Lower<'a> {
 
     fn fill_phis(&mut self) -> Result<(), Stop> {
         let p = self.x.p;
+        // All blocks have finished lowering and recorded their `self.tail[b]`;
+        // clear `cur_ir` so `mask_dword`/`scc_some` never consult a stale `self.cur`
+        // after Mode B splits `tail[b]`.
+        self.cur_ir = usize::MAX;
         // Lane-mask joins first (what an edge brings may ask for more joins,
         // of masks and of numbers): each edge's mask as the structure
         // tracked it, a constant or a scalar-built one included.
@@ -9089,6 +9063,10 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        enum PhiPred {
+            RqJoin(usize),
+            IrPred(usize),
+        }
         for (v, b, i) in std::mem::take(&mut self.data_phis) {
             let phi = &p.blocks[b].phis[i];
             let bit = phi.reg == Reg::Scc;
@@ -9103,24 +9081,26 @@ impl<'a> Lower<'a> {
                     .args
                     .iter()
                     .any(|a| matches!(self.vals.get(a), Some(Val::I32(_))));
-            let mut incoming = Vec::new();
+            let mut entries: Vec<(V, PhiPred)> = Vec::new();
             let lifted_hdr = self.rq_plan.exit_to_header.get(&b).copied();
             let mut rq_edge_added = false;
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
-                let qb = if let Some(hdr) = lifted_hdr
+                let pred = if let Some(hdr) = lifted_hdr
                     && self.rq_plan.by_header[&hdr].body.contains(&q)
                 {
                     if rq_edge_added {
                         continue;
                     }
                     rq_edge_added = true;
-                    let Some(&join_blk) = self.rq_plan.lowered_join.get(&hdr) else {
+                    if !self.rq_plan.lowered_join.contains_key(&hdr) {
                         continue;
-                    };
-                    join_blk
+                    }
+                    PhiPred::RqJoin(hdr)
                 } else {
-                    let Some(qb) = self.tail[q] else { continue };
-                    self.edges.get(&(q, b)).copied().unwrap_or(qb)
+                    if self.tail[q].is_none() {
+                        continue;
+                    }
+                    PhiPred::IrPred(q)
                 };
                 let arg = phi.args[n];
                 if self.read_phis.contains(&phi.value) && !self.vals.contains_key(&arg) {
@@ -9192,6 +9172,40 @@ impl<'a> Lower<'a> {
                     _ if bit => self.s.m.bool(false),
                     _ => self.s.m.i32(0),
                 };
+                entries.push((x, pred));
+            }
+            // Resolve final predecessor blocks AFTER all `mask_dword`/`scc_some`
+            // calls for this phi so any Mode B split of `tail[q]` updates both
+            // the current and any earlier predecessor edges.
+            let incoming: Vec<(V, usize)> = entries
+                .into_iter()
+                .map(|(x, pred)| {
+                    let qb = match pred {
+                        PhiPred::RqJoin(hdr) => self.rq_plan.lowered_join[&hdr],
+                        PhiPred::IrPred(q) => {
+                            let tail = self.tail[q].expect("reachable");
+                            self.edges.get(&(q, b)).copied().unwrap_or(tail)
+                        }
+                    };
+                    (x, qb)
+                })
+                .collect();
+            self.s.m.set_phi(v, incoming);
+        }
+        // Drain any lane-mask phis created lazily while materialising `mask_dword`
+        // or `scc_some` above.
+        while let Some((v, b, i)) = self.pending_masks.pop() {
+            let phi = &p.blocks[b].phis[i];
+            let offset = p.blocks[b].offset;
+            let args = st
+                .phi_masks
+                .get(&phi.value)
+                .ok_or_else(|| unsupported(offset, "a lane-mask join of an untracked mask"))?;
+            let mut incoming = Vec::new();
+            for (n, &q) in p.blocks[b].preds.iter().enumerate() {
+                let Some(qb) = self.tail[q] else { continue };
+                let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
+                let x = self.boolean(args[n], qb).map_err(|w| unsupported(offset, w))?;
                 incoming.push((x, qb));
             }
             self.s.m.set_phi(v, incoming);

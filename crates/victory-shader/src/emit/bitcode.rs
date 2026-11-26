@@ -518,6 +518,24 @@ impl Module {
         }
     }
 
+    #[cfg(test)]
+    pub fn atomic_rmw_count(&self) -> u32 {
+        self.insts
+            .iter()
+            .filter(|i| matches!(i.op, Op::AtomicRmw(..)))
+            .count() as u32
+    }
+
+    #[cfg(test)]
+    pub fn barrier_count(&self) -> u32 {
+        self.insts
+            .iter()
+            .filter(|i| {
+                matches!(i.op, Op::Call(f, _) if self.funcs[f as usize].name == "dx.op.barrier")
+            })
+            .count() as u32
+    }
+
     pub fn md_str(&mut self, s: &str) -> Md {
         self.mds.push(MdDef::Str(s.into()));
         Md(self.mds.len() as u32 - 1)

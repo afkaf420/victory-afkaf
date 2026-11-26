@@ -282,8 +282,10 @@ impl UploadRing {
 
     /// Reserves `bytes` aligned to `align` in the write-only ring buffer,
     /// invokes `write(dst_ptr)` to populate it, and returns `(offset, end)`.
-    /// Returns `None` if `bytes` or `batch_used + bytes` exceeds half the ring
-    /// (caller falls back to direct staging so one burst never overwrites itself).
+    /// Tracks exact modular bytes consumed in `batch_used` (including alignment
+    /// padding and wrap-around tail waste) so one batch never overwrites its
+    /// own un-submitted spans; returns `None` if this write would exceed half
+    /// the ring (caller flushes the current batch and starts the next).
     fn stage_write(
         &mut self,
         bytes: u64,
@@ -293,19 +295,10 @@ impl UploadRing {
         event: HANDLE,
         write: impl FnOnce(*mut u8),
     ) -> Option<(u64, u64)> {
-        let len = bytes.max(1);
-        let half = self.size / 2;
-        if len > half || batch_used.saturating_add(len) > half {
-            return None;
-        }
+        let (offset, end, new_used) =
+            plan_ring_alloc(self.head, self.size, bytes, align, *batch_used)?;
         // SAFETY: plain fence query.
         self.retire(unsafe { fence.GetCompletedValue() });
-        let align = align.max(1);
-        let mut offset = self.head.next_multiple_of(align);
-        if offset + len > self.size {
-            offset = 0;
-        }
-        let end = offset + len;
         while self
             .in_flight
             .iter()
@@ -322,9 +315,44 @@ impl UploadRing {
         // in-flight copy overlaps it; caller writes strictly write-only.
         write(unsafe { self.data.add(offset as usize) });
         self.head = end;
-        *batch_used += len;
+        *batch_used = new_used;
         Some((offset, end))
     }
+}
+
+/// Computes `(offset, end, new_batch_used)` for staging `bytes` aligned to
+/// `align` inside a ring of `size` bytes, tracking exact modular bytes consumed
+/// from the batch's starting offset (including alignment padding and wrap-around
+/// tail waste) so `head` can never wrap onto an un-submitted span of the same
+/// batch. Returns `None` if this write would push the batch past `size / 2`.
+fn plan_ring_alloc(
+    head: u64,
+    size: u64,
+    bytes: u64,
+    align: u64,
+    batch_used: u64,
+) -> Option<(u64, u64, u64)> {
+    let len = bytes.max(1);
+    let half = size / 2;
+    if len > half {
+        return None;
+    }
+    let align = align.max(1);
+    let aligned = head.next_multiple_of(align);
+    let (offset, end, consumed) = if aligned.checked_add(len).is_some_and(|e| e <= size) {
+        let pad = if batch_used == 0 { 0 } else { aligned - head };
+        (aligned, aligned + len, pad.saturating_add(len))
+    } else {
+        // Wrap to offset 0; if earlier spans of this batch already precede
+        // `head`, include `(size - head)` so the modular arc stays `<= half`.
+        let tail_waste = if batch_used == 0 { 0 } else { size - head };
+        (0, len, tail_waste.saturating_add(len))
+    };
+    let new_used = batch_used.saturating_add(consumed);
+    if new_used > half {
+        return None;
+    }
+    Some((offset, end, new_used))
 }
 
 /// Threshold (16 GiB) above which default card buffer/window budgets scale up
@@ -1307,6 +1335,112 @@ mod tests {
                 let row_a = &src[y * row_pitch..y * row_pitch + 16 * 4];
                 let row_b = &got[y * row_pitch..y * row_pitch + 16 * 4];
                 assert_eq!(row_a, row_b, "row {y} mismatch after async GPU_UPLOAD copy");
+            }
+            readback.Unmap(0, None);
+        }
+    }
+
+    /// Many small unaligned writes (including alignment padding and ring-end
+    /// wraparound) must NEVER overlap earlier un-submitted spans of the same
+    /// batch; `plan_ring_alloc` returns `None` once modular consumption reaches
+    /// `size / 2`.
+    #[test]
+    fn upload_ring_alignment_and_wrap_never_overlap_within_batch() {
+        const SIZE: u64 = 4096;
+        const ALIGN: u64 = 64;
+        for start_head in [0u64, 1, 63, 2000, 4000, 4095] {
+            let mut head = start_head;
+            let mut batch_used = 0u64;
+            let mut spans: Vec<(u64, u64)> = Vec::new();
+            let sizes = [1u64, 3, 4, 7, 13, 32, 63, 65, 129];
+            let mut step = 0usize;
+            while let Some((off, end, used)) =
+                plan_ring_alloc(head, SIZE, sizes[step % sizes.len()], ALIGN, batch_used)
+            {
+                assert_eq!(off % ALIGN, 0, "offset must be aligned");
+                assert!(end <= SIZE && off < end);
+                assert!(used <= SIZE / 2);
+                for &(a, b) in &spans {
+                    assert!(
+                        b <= off || end <= a,
+                        "intra-batch overlap [{off},{end}) vs [{a},{b}) (start_head={start_head}, step={step})"
+                    );
+                }
+                spans.push((off, end));
+                head = end;
+                batch_used = used;
+                step += 1;
+                assert!(step < 1024, "batch must terminate at half-ring cap");
+            }
+            assert!(!spans.is_empty(), "at least one write must fit per batch");
+        }
+        // Oversized single write (> half) is rejected cleanly.
+        assert_eq!(plan_ring_alloc(0, SIZE, SIZE / 2 + 1, ALIGN, 0), None);
+        assert!(plan_ring_alloc(3000, SIZE, SIZE / 2, ALIGN, 0).is_some());
+    }
+
+    /// An oversized burst (`> ring.size / 2`) in `async_upload_dirty` must be
+    /// chunked through the write-only `UploadRing` rather than reading directly
+    /// from `Card::staging` (`shadow.data`): immediately poisoning `shadow.data`
+    /// after `async_upload_dirty` returns must never corrupt VRAM.
+    #[test]
+    fn async_upload_dirty_splits_oversized_burst_without_staging_race() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let Some(ring_size) = host.with_upload_ring(|r| r.size) else {
+            return;
+        };
+        let half = ring_size / 2;
+        // Strictly exceeds `half` so `async_upload_dirty` must split across >= 2 ring batches.
+        let total = (half + (4 << 20)) as usize;
+        let Some(shadow) = crate::shadow::test_card_shadow(total as u64) else {
+            return;
+        };
+        let cpu_ptr = shadow.cpu_data() as *mut u8;
+        let probes: [(usize, [u8; 8]); 4] = [
+            (0, *b"HEAD_OK!"),
+            (half as usize - 64, *b"EDGE_LO!"),
+            (half as usize, *b"EDGE_HI!"),
+            (total - 64, *b"TAIL_OK!"),
+        ];
+        // Populate `Card::staging` at probe offsets.
+        // SAFETY: `cpu_ptr` maps `total` bytes of writable staging memory.
+        unsafe {
+            for &(off, pat) in &probes {
+                std::ptr::copy_nonoverlapping(pat.as_ptr(), cpu_ptr.add(off), pat.len());
+            }
+        }
+        let dirty = vec![(shadow.clone(), vec![(0, total)])];
+        assert_eq!(host.async_upload_dirty(&dirty, 0), Ok(true));
+        // Immediately poison `Card::staging` on the CPU without waiting on `upload_fence`:
+        // if `upload_queue` still aliased `staging`, VRAM would observe `0xDE` instead of probes.
+        // SAFETY: `cpu_ptr` maps `total` bytes.
+        unsafe {
+            for &(off, pat) in &probes {
+                std::ptr::write_bytes(cpu_ptr.add(off), 0xDE, pat.len());
+            }
+        }
+        // Read back the probe regions from VRAM (`shadow.buffer`) on `self.queue`.
+        let readback = host.read_back_buffer(256).expect("readback buffer");
+        let list = host.new_list().expect("graphics list");
+        // SAFETY: live buffers and open graphics list.
+        unsafe {
+            for (idx, &(off, _)) in probes.iter().enumerate() {
+                list.list
+                    .CopyBufferRegion(&readback, (idx * 64) as u64, &shadow.buffer, off as u64, 8);
+            }
+            list.close();
+            host.execute(&[&list]);
+            let mut mapped = std::ptr::null_mut();
+            readback.Map(0, None, Some(&mut mapped)).expect("map readback");
+            let got = std::slice::from_raw_parts(mapped.cast::<u8>(), 256);
+            for (idx, &(_, pat)) in probes.iter().enumerate() {
+                assert_eq!(
+                    &got[idx * 64..idx * 64 + 8],
+                    &pat,
+                    "probe {idx} corrupted after poisoning Card::staging"
+                );
             }
             readback.Unmap(0, None);
         }
@@ -3648,7 +3782,13 @@ impl Host {
     /// Uploads dirty byte runs of card-backed buffers/windows asynchronously on
     /// `self.upload_queue` via `UploadRing` (`GPU_UPLOAD` when ReBAR is enabled,
     /// else `UPLOAD`), and synchronizes `self.queue` via GPU-only
-    /// `self.queue.Wait(&upload_fence, val)` (zero CPU `WaitForSingleObject`).
+    /// `self.queue.Wait(&upload_fence, val)` (zero CPU `WaitForSingleObject`
+    /// unless a single burst wraps the ring).
+    ///
+    /// Oversized ranges and bursts larger than half the ring are chunked and
+    /// flushed in multiple ring batches so `upload_queue` NEVER reads directly
+    /// from `Card::staging` (`shadow.data`) after this call returns (closing the
+    /// `VICTORY_RELAY` race where subsequent CPU updates mutate `shadow.data`).
     ///
     /// Returns `Ok(true)` if copies were submitted to `upload_queue`, `Ok(false)`
     /// if `dirty` contained no byte ranges to upload, or `Err` to fall back.
@@ -3664,94 +3804,133 @@ impl Host {
             return Ok(false);
         }
         let submitted = self.with_upload_ring(|ring| -> Result<bool, ()> {
-            let mut slot = ring
-                .take_slot(&self.device, upload_fence, self.upload_event)
-                .map_err(|_| ())?;
-            let mut spans: Vec<(u64, u64)> = Vec::new();
-            let mut keep: Vec<KeptResource> = Vec::new();
-            let mut batch_used: u64 = 0;
-            let mut copied_any = false;
-            // SAFETY: COPY command allocator & list are idle (`slot.fence <= completed`),
-            // buffers are live and kept in `keep` until `upload_fence` passes.
-            let recorded = unsafe {
-                (|| -> windows::core::Result<()> {
-                    slot.allocator.Reset()?;
-                    slot.list.Reset(&slot.allocator, None)?;
-                    for (shadow, ranges) in dirty {
-                        if ranges.is_empty() {
-                            continue;
-                        }
-                        let Some((staging, _, _)) = shadow.card_sides() else {
-                            continue;
-                        };
-                        let cpu_src = shadow.cpu_data();
-                        let mut kept_staging = false;
-                        for &(a, b) in ranges {
-                            let len = (b - a) as u64;
-                            if len == 0 {
+            let half = ring.size / 2;
+            if half == 0 {
+                return Err(());
+            }
+            let mut waited_on_graphics = false;
+            let mut last_val: Option<u64> = None;
+            let mut entry_idx = 0usize;
+            let mut range_idx = 0usize;
+            let mut range_off = 0usize;
+            while entry_idx < dirty.len() {
+                let (shadow, ranges) = &dirty[entry_idx];
+                if ranges.is_empty() || shadow.card_sides().is_none() || range_idx >= ranges.len() {
+                    entry_idx += 1;
+                    range_idx = 0;
+                    range_off = 0;
+                    continue;
+                }
+                let mut slot = ring
+                    .take_slot(&self.device, upload_fence, self.upload_event)
+                    .map_err(|_| ())?;
+                let mut spans: Vec<(u64, u64)> = Vec::new();
+                let mut keep: Vec<KeptResource> = Vec::new();
+                let mut batch_used: u64 = 0;
+                let mut copied_any = false;
+                // SAFETY: COPY command allocator & list are idle (`slot.fence <= completed`),
+                // buffers are live and kept in `keep` until `upload_fence` passes.
+                let recorded = unsafe {
+                    (|| -> windows::core::Result<Option<u64>> {
+                        slot.allocator.Reset()?;
+                        slot.list.Reset(&slot.allocator, None)?;
+                        'batch: while entry_idx < dirty.len() {
+                            let (shadow, ranges) = &dirty[entry_idx];
+                            if ranges.is_empty() || shadow.card_sides().is_none() {
+                                entry_idx += 1;
+                                range_idx = 0;
+                                range_off = 0;
                                 continue;
                             }
-                            if let Some((off, end)) = ring.stage_write(
-                                len,
-                                64,
-                                &mut batch_used,
-                                upload_fence,
-                                self.upload_event,
-                                |dst| {
-                                    // Write-only copy into mapped ring memory.
-                                    std::ptr::copy_nonoverlapping(cpu_src.add(a), dst, len as usize);
-                                },
-                            ) {
-                                slot.list.CopyBufferRegion(&shadow.buffer, a as u64, &ring.buffer, off, len);
+                            let cpu_src = shadow.cpu_data();
+                            let mut kept_shadow = false;
+                            while range_idx < ranges.len() {
+                                let (a, b) = ranges[range_idx];
+                                let cur = a.saturating_add(range_off);
+                                if cur >= b {
+                                    range_idx += 1;
+                                    range_off = 0;
+                                    continue;
+                                }
+                                let rem = (b - cur) as u64;
+                                let chunk = rem.min(half);
+                                let Some((off, end)) = ring.stage_write(
+                                    chunk,
+                                    64,
+                                    &mut batch_used,
+                                    upload_fence,
+                                    self.upload_event,
+                                    |dst| {
+                                        // Write-only copy into mapped ring memory before returning,
+                                        // so `upload_queue` never aliases CPU-mutable `Card::staging`.
+                                        std::ptr::copy_nonoverlapping(
+                                            cpu_src.add(cur),
+                                            dst,
+                                            chunk as usize,
+                                        );
+                                    },
+                                ) else {
+                                    // Batch filled half the ring: flush and continue in next slot.
+                                    if copied_any {
+                                        break 'batch;
+                                    }
+                                    return Err(windows::core::Error::empty());
+                                };
+                                slot.list.CopyBufferRegion(
+                                    &shadow.buffer,
+                                    cur as u64,
+                                    &ring.buffer,
+                                    off,
+                                    chunk,
+                                );
                                 match spans.last_mut() {
                                     Some(last) if off == last.1 => last.1 = end,
                                     _ => spans.push((off, end)),
                                 }
-                            } else {
-                                slot.list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, len);
-                                if !kept_staging {
-                                    keep.push(KeptResource(staging.clone()));
-                                    kept_staging = true;
+                                if !kept_shadow {
+                                    keep.push(KeptResource(shadow.buffer.clone()));
+                                    kept_shadow = true;
+                                }
+                                crate::shadow::CARD_STATS[0].fetch_add(chunk, Ordering::Relaxed);
+                                copied_any = true;
+                                range_off += chunk as usize;
+                                if cur + chunk as usize >= b {
+                                    range_idx += 1;
+                                    range_off = 0;
                                 }
                             }
-                            crate::shadow::CARD_STATS[0].fetch_add(len, Ordering::Relaxed);
-                            copied_any = true;
+                            crate::shadow::CARD_STATS[1]
+                                .fetch_add(ranges.len() as u64, Ordering::Relaxed);
+                            entry_idx += 1;
+                            range_idx = 0;
+                            range_off = 0;
                         }
-                        crate::shadow::CARD_STATS[1].fetch_add(ranges.len() as u64, Ordering::Relaxed);
-                        keep.push(KeptResource(shadow.buffer.clone()));
-                    }
-                    slot.list.Close()?;
-                    if !copied_any {
-                        return Ok(());
-                    }
-                    // Order copy queue after any in-flight graphics submission and
-                    // relay readback fetch that may still be reading/writing these
-                    // card buffers (GPU-only wait, zero CPU stall).
-                    if prev_graphics_fence > 0 {
-                        upload_queue.Wait(&self.fence, prev_graphics_fence)?;
-                    }
-                    let relay_fetch = LAST_RELAY_FETCH
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .as_ref()
-                        .map(|f| (f.0.clone(), f.1));
-                    if let Some((fetch_fence, fetch_val)) = relay_fetch {
-                        upload_queue.Wait(&fetch_fence, fetch_val)?;
-                    }
-                    let cmd: ID3D12CommandList = slot.list.cast()?;
-                    upload_queue.ExecuteCommandLists(&[Some(cmd)]);
-                    let val = self.upload_value.fetch_add(1, Ordering::AcqRel) + 1;
-                    upload_queue.Signal(upload_fence, val)?;
-                    slot.fence = val;
-                    if spans.is_empty() {
-                        ring.in_flight.push_back(RingFlight {
-                            start: 0,
-                            end: 0,
-                            fence: val,
-                            _keep: keep,
-                        });
-                    } else {
-                        let last = spans.len() - 1;
+                        slot.list.Close()?;
+                        if !copied_any {
+                            return Ok(None);
+                        }
+                        if !waited_on_graphics {
+                            // Order copy queue after any in-flight graphics submission and
+                            // relay readback fetch once ahead of all batches for this submit.
+                            if prev_graphics_fence > 0 {
+                                upload_queue.Wait(&self.fence, prev_graphics_fence)?;
+                            }
+                            let relay_fetch = LAST_RELAY_FETCH
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .as_ref()
+                                .map(|f| (f.0.clone(), f.1));
+                            if let Some((fetch_fence, fetch_val)) = relay_fetch {
+                                upload_queue.Wait(&fetch_fence, fetch_val)?;
+                            }
+                            waited_on_graphics = true;
+                        }
+                        let cmd: ID3D12CommandList = slot.list.cast()?;
+                        upload_queue.ExecuteCommandLists(&[Some(cmd)]);
+                        let val = self.upload_value.fetch_add(1, Ordering::AcqRel) + 1;
+                        upload_queue.Signal(upload_fence, val)?;
+                        slot.fence = val;
+                        let last = spans.len().saturating_sub(1);
                         let mut keep_opt = Some(keep);
                         for (idx, (start, end)) in spans.into_iter().enumerate() {
                             ring.in_flight.push_back(RingFlight {
@@ -3765,14 +3944,32 @@ impl Host {
                                 },
                             });
                         }
+                        Ok(Some(val))
+                    })()
+                };
+                ring.slots.push(slot);
+                match recorded {
+                    Ok(Some(v)) => last_val = Some(v),
+                    Ok(None) => break,
+                    Err(_) => {
+                        if let Some(v) = last_val {
+                            // Ensure graphics queue still waits on already-submitted batches
+                            // before falling back to synchronous copies on `self.queue`.
+                            // SAFETY: live queue and upload_fence.
+                            let _ = unsafe { self.queue.Wait(upload_fence, v) };
+                        }
+                        return Err(());
                     }
-                    // Synchronize main graphics queue on the GPU — zero CPU wait.
-                    self.queue.Wait(upload_fence, val)?;
-                    Ok(())
-                })()
-            };
-            ring.slots.push(slot);
-            recorded.map(|()| copied_any).map_err(|_| ())
+                }
+            }
+            if let Some(val) = last_val {
+                // Synchronize main graphics queue on the GPU — zero CPU wait.
+                // SAFETY: live queue and upload_fence.
+                unsafe { self.queue.Wait(upload_fence, val) }.map_err(|_| ())?;
+                Ok(true)
+            } else {
+                Ok(false)
+            }
         });
         match submitted {
             Some(Ok(v)) => Ok(v),

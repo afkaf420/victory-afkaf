@@ -16,7 +16,7 @@
 //! indexed heaps keep what their first use copied.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -101,6 +101,10 @@ struct Card {
     sent: Mutex<Vec<(usize, usize, u64)>>,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
+    /// Set permanently once shaders have declared or merged any GPU write to
+    /// this card copy, disabling `copy_diff64` so CPU resets to prior byte
+    /// values (e.g. zeroing a GPU-written counter) always upload full dirty pages.
+    gpu_written: AtomicBool,
 }
 
 /// Whether the host copies of big title buffers are in the card's own
@@ -170,12 +174,23 @@ fn card_limits() -> (u64, u64) {
     })
 }
 
-/// Whether card-backed buffer refreshes diff 64-byte cachelines against
-/// last-sent bytes (`VICTORY_DIFF64`; on by default, `=0` uploads whole dirty
-/// pages).
+/// Whether card-backed read-only window refreshes diff 64-byte cachelines
+/// against last-sent bytes (`VICTORY_DIFF64`; on by default, `=0` uploads whole
+/// dirty pages).
 fn diff64_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_DIFF64").is_none_or(|v| v != "0"))
+}
+
+/// Pure eligibility rule for `Shadow::copy_diff64`: ONLY strictly read-only
+/// card-backed allocator windows (`is_window && !gpu_written`) may diff against
+/// CPU staging (`self.data`). Title buffers (`!is_window`, which can receive
+/// undeclared UAV writes under `write_skip`, `builder_quarantined`, or dynamic
+/// descriptor indexing) and any window ever touched by GPU/UAV writes or
+/// `card_merge` / `card_merge_relay` MUST upload full dirty pages so CPU resets
+/// back to a prior byte value (e.g. `0`) always reach VRAM.
+fn resolve_can_diff64(carded: bool, is_window: bool, gpu_written: bool, enabled: bool) -> bool {
+    enabled && carded && is_window && !gpu_written
 }
 
 /// Diffs `new` against `old` (starting at `base_offset` within the buffer) in
@@ -2242,6 +2257,9 @@ impl Shadow {
         if self.place.is_some() {
             return;
         }
+        if let Some(card) = &self.card {
+            card.gpu_written.store(true, Ordering::Release);
+        }
         let len = len.min(self.left(address));
         list.defer_gpu_write(self, address as usize, len as usize);
     }
@@ -2272,7 +2290,8 @@ impl Shadow {
         // In the card's memory: no snapshot. What shaders wrote is found on
         // the card (`Host::card_before` reads the declared ranges from the
         // lists).
-        if self.card.is_some() {
+        if let Some(card) = &self.card {
+            card.gpu_written.store(true, Ordering::Release);
             pending.push(range);
             return;
         }
@@ -2951,10 +2970,12 @@ impl Shadow {
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let mut writes = written.iter().peekable();
         // `(first_page, first_time)`: pages copied for the first time (`*at == 0`)
-        // take a full copy; subsequent refreshes of card-backed buffers diff
-        // 64-byte cachelines against last-sent bytes (`copy_diff64`).
+        // take a full copy; subsequent refreshes of strictly read-only
+        // card-backed windows diff 64-byte cachelines against last-sent bytes
+        // (`copy_diff64`), while any title buffer or GPU-written shadow uploads
+        // full dirty pages unconditionally.
         let (mut bytes, mut run): (usize, Option<(usize, bool)>) = (0, None);
-        let diff = self.card.is_some() && diff64_on();
+        let diff = self.can_diff64();
         let last = (to - 1) / PAGE;
         for page in from / PAGE..=last {
             let write = match writes.peek() {
@@ -3055,6 +3076,21 @@ impl Shadow {
         self.card.is_some()
     }
 
+    /// Whether this copy is eligible for 64-byte cacheline diffing
+    /// ([`Shadow::copy_diff64`]): strictly read-only card-backed windows that
+    /// have never been written by the GPU.
+    fn can_diff64(&self) -> bool {
+        let Some(card) = &self.card else {
+            return false;
+        };
+        resolve_can_diff64(
+            true,
+            self.window,
+            card.gpu_written.load(Ordering::Acquire),
+            diff64_on(),
+        )
+    }
+
     /// The CPU side's bytes at offsets `[from, to)` changed: they go to the
     /// card's side before the next submission.
     fn card_changed(&self, from: usize, to: usize) {
@@ -3110,6 +3146,7 @@ impl Shadow {
         let Some(card) = &self.card else {
             return false;
         };
+        card.gpu_written.store(true, Ordering::Release);
         let mut before = card.before.lock().unwrap_or_else(|e| e.into_inner());
         if before.is_some() {
             return false;
@@ -3186,7 +3223,11 @@ impl Shadow {
     /// Returns the bytes written to title memory.
     pub(crate) fn card_merge(&self, at: usize, gpu: &[u8], title: &mut Vec<u8>) -> usize {
         let start = self.start as usize;
-        if self.card.is_none() || at + gpu.len() > self.len as usize {
+        let Some(card) = &self.card else {
+            return 0;
+        };
+        card.gpu_written.store(true, Ordering::Release);
+        if at + gpu.len() > self.len as usize {
             return 0;
         }
         // SAFETY: inside the mapping (checked above); only the submitting
@@ -3254,6 +3295,7 @@ impl Shadow {
         let Some(card) = &self.card else {
             return 0;
         };
+        card.gpu_written.store(true, Ordering::Release);
         if at + gpu.len() > self.len as usize {
             return 0;
         }
@@ -3462,6 +3504,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     dirty: Mutex::default(),
                     sent: Mutex::default(),
                     size,
+                    gpu_written: AtomicBool::new(false),
                 };
                 (on_card, Some(card))
             }
@@ -3678,6 +3721,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
                 size: len,
+                gpu_written: AtomicBool::new(false),
             };
             (on_card, Some(card))
         }
@@ -3700,6 +3744,25 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     note(&shadow);
     map.insert((start, len), shadow.clone());
     Some(shadow)
+}
+
+#[cfg(test)]
+pub(crate) fn test_card_shadow(len: u64) -> Option<Arc<Shadow>> {
+    let host = host()?;
+    let (staging, data) = host.shared_buffer(len)?;
+    let on_card = host.uav_buffer(len)?;
+    // SAFETY: live D3D12 buffer.
+    let gpu = unsafe { on_card.GetGPUVirtualAddress() };
+    let mut s = Shadow::new(on_card, data, gpu, 0, len);
+    s.card = Some(Card {
+        staging,
+        before: Mutex::default(),
+        dirty: Mutex::default(),
+        sent: Mutex::default(),
+        size: len,
+        gpu_written: AtomicBool::new(false),
+    });
+    Some(Arc::new(s))
 }
 
 #[cfg(test)]
@@ -3867,6 +3930,115 @@ mod window_tests {
         assert_eq!(runs, vec![(20, 120)]);
         assert_eq!(changed_u, 100);
         assert_eq!(old_u, new_u);
+    }
+
+    /// `copy_diff64` is strictly limited to read-only card-backed windows that
+    /// have never been GPU-written; title buffers (which can receive undeclared
+    /// UAV writes) and any GPU-written shadow MUST upload full dirty pages so
+    /// CPU resets back to a prior byte value (e.g. `0`) always reach VRAM.
+    #[test]
+    fn gpu_written_and_buffer_shadows_upload_full_dirty_page_on_zero_reset() {
+        use super::{Card, PAGE, Shadow, resolve_can_diff64};
+        use std::sync::Mutex;
+        use std::sync::atomic::AtomicBool;
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+        // 1. Eligibility rule matrix.
+        assert!(resolve_can_diff64(true, true, false, true));
+        assert!(!resolve_can_diff64(true, true, true, true));
+        assert!(!resolve_can_diff64(true, false, false, true));
+        assert!(!resolve_can_diff64(true, false, true, true));
+        assert!(!resolve_can_diff64(false, true, false, true));
+        assert!(!resolve_can_diff64(true, true, false, false));
+
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU
+        };
+        // SAFETY: fresh 1-page write-watched allocation freed at test end.
+        let mem = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(mem, 0);
+        struct FreeGuard(usize);
+        impl Drop for FreeGuard {
+            fn drop(&mut self) {
+                crate::watch::title_memory_remapped(self.0, PAGE);
+                // SAFETY: owned VirtualAlloc region.
+                unsafe { VirtualFree(self.0 as *mut _, 0, MEM_RELEASE) };
+            }
+        }
+        let _free = FreeGuard(mem);
+
+        let make_card_shadow = |is_window: bool| {
+            let (staging, data) = host.shared_buffer(PAGE as u64).expect("shared staging");
+            let on_card = host.uav_buffer(PAGE as u64).expect("card uav");
+            // SAFETY: live buffer.
+            let gpu = unsafe { on_card.GetGPUVirtualAddress() };
+            let mut s = Shadow::new(on_card, data, gpu, mem as u64, PAGE as u64);
+            s.window = is_window;
+            s.card = Some(Card {
+                staging,
+                before: Mutex::default(),
+                dirty: Mutex::default(),
+                sent: Mutex::default(),
+                size: PAGE as u64,
+                gpu_written: AtomicBool::new(false),
+            });
+            s
+        };
+
+        let take_dirty = |s: &Shadow| {
+            let mut dirty = s.card.as_ref().unwrap().dirty.lock().unwrap();
+            std::mem::take(&mut *dirty)
+        };
+
+        // 2. Read-only card-backed window uses `copy_diff64` on repeat writes.
+        let ro_win = make_card_shadow(true);
+        assert_eq!(ro_win.update(mem, PAGE), PAGE);
+        assert_eq!(take_dirty(&ro_win), vec![(0, PAGE)]);
+        // CPU modifies 4 bytes at offset 128 -> only cacheline [128..192) uploaded.
+        // SAFETY: committed write-watched page.
+        unsafe { ((mem + 128) as *mut u32).write_volatile(0x1234_5678) };
+        assert_eq!(ro_win.update(mem, PAGE), 64);
+        assert_eq!(take_dirty(&ro_win), vec![(128, 192)]);
+
+        // 3. Once the window has been marked GPU-written (`writing()` -> `copy_back_done`),
+        //    a CPU reset back to `0` (matching `self.data == 0` at offset 0 where
+        //    VRAM may hold an undeclared/unmerged non-zero GPU value!) MUST upload
+        //    the FULL dirty page `(0, PAGE)` instead of skipping it!
+        ro_win.writing(mem, PAGE);
+        ro_win.copy_back_done(&[(mem, mem + PAGE)]);
+        assert!(!ro_win.can_diff64());
+        // SAFETY: writing 0 back to offset 0 sets hardware write-watch while bytes match `self.data` (0).
+        unsafe { (mem as *mut u32).write_volatile(0) };
+        assert_eq!(ro_win.update(mem, PAGE), PAGE);
+        assert_eq!(
+            take_dirty(&ro_win),
+            vec![(0, PAGE)],
+            "GPU-written shadow must upload full dirty page even when CPU restores 0"
+        );
+
+        // 4. Title buffer (`is_window == false`) NEVER diffs even before any declared GPU write.
+        let buf = make_card_shadow(false);
+        assert!(!buf.can_diff64());
+        assert_eq!(buf.update(mem, PAGE), PAGE);
+        assert_eq!(take_dirty(&buf), vec![(0, PAGE)]);
+        // SAFETY: CPU writes 0 over offset 0 (same bytes as `self.data`).
+        unsafe { (mem as *mut u32).write_volatile(0) };
+        assert_eq!(buf.update(mem, PAGE), PAGE);
+        assert_eq!(
+            take_dirty(&buf),
+            vec![(0, PAGE)],
+            "title buffer shadow must always upload full dirty page"
+        );
     }
 }
 

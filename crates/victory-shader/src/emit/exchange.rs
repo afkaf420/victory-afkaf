@@ -141,10 +141,18 @@ fn lane_regions_inner(st: &Structured, include_wide: bool) -> Option<Vec<(usize,
         {
             continue; // a wave-wide or uniform branch: all lanes go the same way
         }
-        // blocks reachable from the lane branch that do not post-dominate it
+        // blocks reachable from the lane branch that do not strictly
+        // post-dominate it; if the branch itself is reachable from its own
+        // successors (per-lane self-loop, multi-block loop latch, or loop
+        // with an early break), mark `d` itself in the region too so
+        // `all_lane_blocks` never classifies it as an all-lanes block.
         let mut seen = vec![false; n];
         let mut stack: Vec<usize> = succ[d].clone();
         while let Some(b) = stack.pop() {
+            if b == d {
+                seen[d] = true;
+                continue;
+            }
             if seen[b] || pdom[d][b / 64] >> (b % 64) & 1 == 1 {
                 continue;
             }

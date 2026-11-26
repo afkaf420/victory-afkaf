@@ -376,19 +376,22 @@ pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
 
 const PAGE: usize = 64 << 10;
 
-/// Resolves `VICTORY_SINGLE_VIEW_WATCH`: on by default on native Windows
-/// (disabled on Wine or when explicitly set to `"0"`).
+/// Resolves `VICTORY_SINGLE_VIEW_WATCH`: strictly opt-in (`"1"` enables on
+/// native Windows; off by default everywhere and always disabled on Wine).
+/// Keeping `SEC_RESERVE` section views by default avoids asynchronously
+/// unmapping live multi-megabyte single-view private allocations (`PAGE_NOACCESS`)
+/// under running title CPU threads during lazy alias or DirectStorage promotion.
 fn resolve_single_view_watch(env: Option<&str>, wine: bool) -> bool {
     if wine {
         return false;
     }
-    env.is_none_or(|v| v.trim() != "0")
+    env.is_some_and(|v| v.trim() == "1")
 }
 
 /// Whether single-view physical mappings use `MEM_WRITE_WATCH` private memory
 /// and lazily promote to a `SEC_RESERVE` file mapping + `VIEW_GUARD` only when
 /// a second virtual alias maps the same physical page
-/// (`VICTORY_SINGLE_VIEW_WATCH=0` disables and always uses file mappings).
+/// (`VICTORY_SINGLE_VIEW_WATCH=1` opts in; off by default).
 fn single_view_watch() -> bool {
     static ON: LazyLock<bool> = LazyLock::new(|| {
         let env = std::env::var("VICTORY_SINGLE_VIEW_WATCH").ok();
@@ -980,6 +983,29 @@ fn promote_view_containing(physical: &mut Physical, addr: usize) -> bool {
         );
         return false;
     }
+    // Helper for recovering `physical` metadata after `VirtualFree` already
+    // turned `view_base..view_base+view_len` back into a placeholder: try to
+    // restore the private mapping with `saved`, and if even that fails, evict
+    // the torn entry from `views`/`shown` so we never leave `is_private = true`
+    // pointing at an unmapped placeholder.
+    let rollback_after_free = |physical: &mut Physical, saved: &[u8]| {
+        physical.views.remove(&view_base);
+        for k in 0..view_len.div_ceil(PAGE) {
+            let key = slice.key(k);
+            if let Some(addresses) = physical.shown.get_mut(&key) {
+                addresses.retain(|&a| a != view_base + k * PAGE);
+                if addresses.is_empty() {
+                    physical.shown.remove(&key);
+                }
+            }
+        }
+        if map_private(physical, view_base, view_len, slice.clone()) {
+            // SAFETY: freshly restored committed `PAGE_READWRITE` private view.
+            unsafe {
+                std::ptr::copy_nonoverlapping(saved.as_ptr(), view_base as *mut u8, view_len);
+            }
+        }
+    };
     // SAFETY: map the `SEC_RESERVE` section into the restored placeholder.
     let view = unsafe {
         MapViewOfFile3(
@@ -1001,11 +1027,13 @@ fn promote_view_containing(physical: &mut Physical, addr: usize) -> bool {
             error = %std::io::Error::last_os_error(),
             "promoting private physical view failed on MapViewOfFile3"
         );
+        rollback_after_free(physical, &saved);
         return false;
     }
     if !commit(view_base, view_len) {
         // SAFETY: unmap view back to placeholder on commit failure.
         unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
+        rollback_after_free(physical, &saved);
         return false;
     }
     // SAFETY: freshly mapped & committed `PAGE_READWRITE` section view.
@@ -1263,12 +1291,31 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
             victory_gpu::title_memory_remapped(at, size);
             // SAFETY: release our entire `MEM_REPLACE_PLACEHOLDER` private
             // allocation back into a placeholder of exact size `size`.
-            unsafe {
+            let freed = unsafe {
                 VirtualFree(
                     at as *mut c_void,
                     size,
                     MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
+                )
+            };
+            if freed == 0 {
+                tracing::warn!(
+                    address = format_args!("{at:#x}"),
+                    len = size,
+                    error = %std::io::Error::last_os_error(),
+                    "unmapping private physical view failed on VirtualFree(MEM_PRESERVE_PLACEHOLDER)"
                 );
+                // The private allocation is still live at `[at, at + size)`:
+                // restore tracking so `views`/`shown` stay consistent.
+                for k in 0..size.div_ceil(PAGE) {
+                    physical
+                        .shown
+                        .entry(slice.key(k))
+                        .or_default()
+                        .push(at + k * PAGE);
+                }
+                physical.views.insert(at, (size, slice, true));
+                continue;
             }
             if let Some(bytes) = head_saved {
                 let len = base - at;
@@ -1846,14 +1893,16 @@ mod tests {
         use windows_sys::Win32::System::Memory::{GetWriteWatch, MEM_MAPPED, MEM_PRIVATE};
         const WRITE_WATCH_FLAG_RESET: u32 = 1;
 
-        // Verify env switch resolver (native Windows default ON, Wine/0 OFF).
-        assert!(resolve_single_view_watch(None, false));
+        // Verify env switch resolver (strictly opt-in: default OFF, "1" ON on native Windows, always OFF on Wine).
+        assert!(!resolve_single_view_watch(None, false));
         assert!(resolve_single_view_watch(Some("1"), false));
+        assert!(resolve_single_view_watch(Some(" 1 "), false));
         assert!(!resolve_single_view_watch(Some("0"), false));
         assert!(!resolve_single_view_watch(Some(" 0 "), false));
         assert!(!resolve_single_view_watch(None, true));
+        assert!(!resolve_single_view_watch(Some("1"), true));
 
-        let pages = allocate(3);
+        let pages = allocate(4);
         let reserve = |n: usize| {
             let p = XMemVirtualAlloc(
                 std::ptr::null_mut(),
@@ -1865,9 +1914,11 @@ mod tests {
             assert!(!p.is_null());
             p
         };
-        let (a, b, c) = (reserve(2), reserve(1), reserve(1));
+        let (a, b, c, d) = (reserve(2), reserve(1), reserve(1), reserve(1));
 
-        // 1. Single-view mapping at `a` uses `MEM_PRIVATE` + `MEM_WRITE_WATCH`.
+        // 1. By default (`single_view_watch() == false`), single-view mappings
+        //    use `MEM_MAPPED` (`SEC_RESERVE`) directly; when opted in (`=1`),
+        //    they use `MEM_PRIVATE | MEM_WRITE_WATCH`.
         assert_eq!(XMemMapPhysicalPages(a, 2, pages.as_ptr()), a);
         if single_view_watch() {
             assert_eq!(query(a).host.Type, MEM_PRIVATE);
@@ -1941,13 +1992,15 @@ mod tests {
             assert_eq!(file.read(dst).unwrap(), 9);
             assert_eq!(dst, b"kernel_ok");
         } else {
-            // SAFETY: still write the expected bytes if run with `VICTORY_SINGLE_VIEW_WATCH=0`.
+            assert_eq!(query(a).host.Type, MEM_MAPPED);
+            assert!(physical().views.get(&(a as usize)).is_some_and(|v| !v.2));
+            // SAFETY: still write the expected bytes under the default `MEM_MAPPED` path.
             unsafe { a.cast::<u8>().add(0x100).write_volatile(0xAB) };
             assert!(write_physical(&pages[1..], 0x20, &[0xCD, 0xEF]));
         }
 
-        // 2. Mapping `pages[0]` at a 2nd virtual alias `b` lazily promotes `a` to
-        //    `MEM_MAPPED` (`SEC_RESERVE` section), preserving all written bytes.
+        // 2. Mapping `pages[0]` at a 2nd virtual alias `b` shares the physical
+        //    bytes via `MEM_MAPPED` (`SEC_RESERVE` section), promoting if needed.
         assert_eq!(XMemMapPhysicalPages(b, 1, pages.as_ptr()), b);
         assert_eq!(query(a).host.Type, MEM_MAPPED);
         assert_eq!(query(b).host.Type, MEM_MAPPED);
@@ -1960,16 +2013,15 @@ mod tests {
             assert_eq!(a.cast::<u8>().add(0x200).read(), 0x55);
         }
 
-        // 3. `page_window` on a single-view private mapping promotes safely and
-        //    preserves prior CPU bytes while landing DirectStorage decoded bytes.
+        // 3. `page_window` preserves prior CPU bytes while landing DirectStorage decoded bytes.
         assert_eq!(XMemMapPhysicalPages(c, 1, pages[2..].as_ptr()), c);
         // SAFETY: `c` is mapped read-write.
         unsafe { c.cast::<u8>().write_volatile(0x77) };
         {
-            let mut win = page_window(&pages[2..], 16, 4).expect("page_window on private page");
+            let mut win = page_window(&pages[2..], 16, 4).expect("page_window on mapped page");
             win.bytes().copy_from_slice(&[1, 2, 3, 4]);
         }
-        // SAFETY: `c` stays mapped & coherent after promotion.
+        // SAFETY: `c` stays mapped & coherent after DirectStorage write.
         unsafe {
             assert_eq!(c.cast::<u8>().read(), 0x77);
             assert_eq!(
@@ -1978,9 +2030,34 @@ mod tests {
             );
         }
 
+        // 4. Directly exercise the opt-in `map_private` + `promote_view_containing`
+        //    transition on native Windows even when default is OFF.
+        if !on_wine() {
+            {
+                let mut phys = physical();
+                let _changing = victory_gpu::title_memory_remapping();
+                let slice = phys.pages.get(&pages[3]).cloned().unwrap();
+                assert!(map_private(&mut phys, d as usize, PAGE, slice));
+                assert!(phys.views.get(&(d as usize)).is_some_and(|v| v.2));
+            }
+            assert_eq!(query(d).host.Type, MEM_PRIVATE);
+            // SAFETY: committed private write-watched view.
+            unsafe { d.cast::<u8>().add(0x40).write_volatile(0x9E) };
+            {
+                let mut phys = physical();
+                let _changing = victory_gpu::title_memory_remapping();
+                assert!(promote_view_containing(&mut phys, d as usize));
+                assert!(phys.views.get(&(d as usize)).is_some_and(|v| !v.2));
+            }
+            assert_eq!(query(d).host.Type, MEM_MAPPED);
+            // SAFETY: promoted `MEM_MAPPED` view preserved written byte.
+            assert_eq!(unsafe { d.cast::<u8>().add(0x40).read() }, 0x9E);
+        }
+
         assert_eq!(XMemMapPhysicalPages(a, 2, std::ptr::null()), a);
         assert_eq!(XMemMapPhysicalPages(b, 1, std::ptr::null()), b);
         assert_eq!(XMemMapPhysicalPages(c, 1, std::ptr::null()), c);
-        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+        assert_eq!(XMemMapPhysicalPages(d, 1, std::ptr::null()), d);
+        assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
     }
 }

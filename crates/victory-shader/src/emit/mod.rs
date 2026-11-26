@@ -375,11 +375,7 @@ pub fn emit(
     // (a mask with lanes elsewhere is only helped by the exact forms: not by each half-wave
     // on its own)
     let exact_only = matches!(&original, Err(ShaderError::Unsupported { what, .. }) if *what == lower::MASK_ELSEWHERE);
-    if stuck
-        && matches!(native.stage, HwStage::Cs | HwStage::Ms)
-        && native.wave64
-        && lower::host_max_wave() == 32
-    {
+    if stuck && native.stage == HwStage::Cs && native.wave64 && lower::host_max_wave() == 32 {
         let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
         let report = |what: &str, r: &Result<(HostShader, Option<u32>), ShaderError>| {
             if why {
@@ -431,11 +427,11 @@ pub fn emit(
                 }
             }
         }
-        // On by default now that single-wave groups use double-buffered Mode A
-        // and multi-wave groups use Mode B pairwise arrival counters (TGSM-only
-        // fences + bounded spin + TDR fuse, no group barrier inside wave-wide
-        // branches). `VICTORY_WAVE_WIDE=0` opts out.
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0");
+        // Off unless asked for (`VICTORY_WAVE_WIDE=1`), for a console wave run as two host
+        // waves: widening puts cross-half syncs inside branches and loops, so keep it opt-in
+        // until verified deadlock-free. The 32-lane programs' form below, which has no
+        // barrier, stays on.
+        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
@@ -444,7 +440,7 @@ pub fn emit(
                 // Every skip left out that the code after it cannot see
                 // ([`ir::without_skips`], `deep`): most of the body is then code every
                 // lane runs, where the two host waves can exchange.
-                // (`VICTORY_WAVE_DEEP_SKIPS=0` and `VICTORY_WAVE_WIDE=0` turn the two off.)
+                // (`VICTORY_WAVE_DEEP_SKIPS=0` turns deep skips off; `VICTORY_WAVE_WIDE=1` turns wide branches on.)
                 let deep_on = std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0");
                 let deep = if deep_on { form(ir::without_skips(p, true)) } else { None };
                 if let Some((p, st, io, res)) = &deep {
@@ -571,7 +567,6 @@ fn widen(
     };
     match native.io {
         crate::native::StageIo::Cs(_) => {}
-        crate::native::StageIo::Ms(_) if native.wave64 && lower::host_max_wave() == 32 => {}
         _ => {
             if why {
                 eprintln!("WAVE64-WIDE not tried for stage {:?}", native.stage);
