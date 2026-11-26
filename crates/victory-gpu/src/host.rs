@@ -1623,6 +1623,172 @@ mod tests {
             assert!(errors.is_empty(), "D3D12 Debug Layer reported {} error(s): {errors:?}", errors.len());
         }
     }
+
+    /// Live RTX 3090 D3D12 Debug Layer validation of `card_before`'s direct-staged
+    /// (`<= ring/2`) AND oversized (`> ring/2` fallback to `async_upload_dirty` +
+    /// rehash on recycled `sync` prelude) paths: proves zero `E_FAIL` double-reset,
+    /// zero open-prelude leaks, exact VRAM upload + hash integrity, and 0 D3D12
+    /// Debug Layer Error/Corruption messages.
+    #[test]
+    #[ignore = "enables D3D12 Debug Layer (must run alone, not alongside shared host::host() tests)"]
+    fn live_rtx3090_card_before_direct_and_oversized_debug_layer() {
+        // SAFETY: live hardware D3D12 Debug Layer bring-up using `Host::new` + `stage_dirty_into_ring` + `async_upload_dirty`.
+        unsafe {
+            let mut debug: Option<ID3D12Debug> = None;
+            D3D12GetDebugInterface(&mut debug).expect("D3D12 Debug Layer must be available");
+            debug.unwrap().EnableDebugLayer();
+        }
+        // Initialize the shared hardware Host AFTER enabling the D3D12 Debug Layer so
+        // `test_card_shadow` and `host.queue` share the exact same Debug-Layer device.
+        let host = host().expect("hardware Host with D3D12 Debug Layer");
+        let info_queue: ID3D12InfoQueue = host.device.cast().expect("ID3D12InfoQueue");
+        // SAFETY: clearing initial creation messages.
+        unsafe { info_queue.ClearStoredMessages() };
+
+        // Temporarily shrink ring to 16 MiB (half = 8 MiB) on this isolated test Host so
+        // the oversized > 8 MiB fallback path runs quickly.
+        {
+            let mut guard = host.upload_ring.lock().unwrap();
+            *guard = UploadRing::new(&host.device, 16 << 20, host.gpu_upload_heap);
+        }
+        let work = host.make_card_work().expect("make_card_work");
+        let (sync_alloc, sync_list) = work.sync[0].clone();
+
+        // Create a 10 MiB card-backed shadow + its `Card::before` hash buffer on `host.device`.
+        const SIZE: usize = 10 << 20;
+        let Some(before) = host.uav_buffer(crate::shadow::card_hash_bytes(SIZE as u64)) else { panic!("before hash buf") };
+        let Some(shadow) = crate::shadow::test_card_shadow(SIZE as u64) else { panic!("test_card_shadow") };
+        let cpu_ptr = shadow.cpu_data() as *mut u8;
+
+        // Helper to execute a single `sync` pass and wait on `host.fence`.
+        let mut gfx_fence = 0u64;
+        let run_and_wait = |host: &Host, gfx_fence: &mut u64, lists: &[Option<ID3D12CommandList>], ring_val: Option<u64>| {
+            *gfx_fence += 1;
+            // SAFETY: closed lists and live fences/events.
+            unsafe {
+                host.queue.ExecuteCommandLists(lists);
+                if let (Some(v), Some(uf)) = (ring_val, &host.upload_fence) {
+                    host.queue.Signal(uf, v).unwrap();
+                }
+                host.queue.Signal(&host.fence, *gfx_fence).unwrap();
+                host.fence.SetEventOnCompletion(*gfx_fence, host.event).unwrap();
+                WaitForSingleObject(host.event, INFINITE);
+            }
+        };
+
+        // --- Pass 1: Direct-staged burst (2 MiB <= 8 MiB ring/2) + rehash on `sync_list` ---
+        // SAFETY: `cpu_ptr` maps `SIZE` writable bytes.
+        unsafe { std::ptr::write_bytes(cpu_ptr, 0x11, 2 << 20) };
+        let dirty_small = vec![(shadow.clone(), vec![(0, 2 << 20)])];
+        let (val1, copies1) = host
+            .stage_dirty_into_ring(&dirty_small)
+            .expect("small burst must stage directly")
+            .expect("non-empty small burst");
+        let ring_buf = host.with_upload_ring(|r| r.buffer.clone()).unwrap();
+        // SAFETY: closed idle prelude + live resources.
+        unsafe {
+            sync_alloc.Reset().unwrap();
+            sync_list.Reset(&sync_alloc, None).unwrap();
+            for &(idx, dst_off, ring_off, chunk) in &copies1 {
+                sync_list.CopyBufferRegion(&dirty_small[idx].0.buffer, dst_off, &ring_buf, ring_off, chunk);
+            }
+            sync_list.ResourceBarrier(&[transition(
+                &shadow.buffer,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            )]);
+            sync_list.SetComputeRootSignature(&work.root);
+            sync_list.SetPipelineState(&work.pso);
+            sync_list.SetComputeRootShaderResourceView(1, shadow.buffer.GetGPUVirtualAddress());
+            sync_list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
+            sync_list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
+            let constants = [0u32, 0, SIZE as u32, (2 << 20) / 65536, 0, 0];
+            sync_list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+            sync_list.Dispatch(1, 1, 1);
+            sync_list.Close().unwrap();
+            let cmd: ID3D12CommandList = sync_list.cast().unwrap();
+            run_and_wait(&host, &mut gfx_fence, &[Some(cmd)], Some(val1));
+        }
+
+        // --- Pass 2: Oversized burst (10 MiB > 8 MiB ring/2) -> Err(()) -> `async_upload_dirty` + rehash on recycled `sync_list` ---
+        // SAFETY: `cpu_ptr` maps `SIZE` writable bytes.
+        unsafe { std::ptr::write_bytes(cpu_ptr, 0x22, SIZE) };
+        let dirty_big = vec![(shadow.clone(), vec![(0, SIZE)])];
+        assert!(
+            host.stage_dirty_into_ring(&dirty_big).is_err(),
+            "10 MiB burst must reject direct-list staging cleanly without opening sync_list"
+        );
+        assert_eq!(host.async_upload_dirty(&dirty_big, gfx_fence), Ok(true));
+        // Now open recycled `sync_list` ONCE for rehash (no double-Reset E_FAIL, no COPY_DEST transition!).
+        // SAFETY: closed idle prelude + live resources.
+        unsafe {
+            sync_alloc.Reset().unwrap();
+            sync_list.Reset(&sync_alloc, None).unwrap();
+            sync_list.SetComputeRootSignature(&work.root);
+            sync_list.SetPipelineState(&work.pso);
+            sync_list.SetComputeRootShaderResourceView(1, shadow.buffer.GetGPUVirtualAddress());
+            sync_list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
+            sync_list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
+            let constants = [0u32, 0, SIZE as u32, (SIZE as u32) / 65536, 0, 0];
+            sync_list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+            sync_list.Dispatch(((SIZE as u32) / 65536).div_ceil(64), 1, 1);
+            sync_list.Close().unwrap();
+            let cmd: ID3D12CommandList = sync_list.cast().unwrap();
+            run_and_wait(&host, &mut gfx_fence, &[Some(cmd)], None);
+        }
+
+        // --- Pass 3: Follow-up direct-staged burst (64 KiB) on the SAME recycled `sync_list` + readback check ---
+        // SAFETY: `cpu_ptr` maps `SIZE` writable bytes.
+        unsafe { std::ptr::write_bytes(cpu_ptr, 0x33, 65536) };
+        let dirty_tail = vec![(shadow.clone(), vec![(0, 65536)])];
+        let (val3, copies3) = host
+            .stage_dirty_into_ring(&dirty_tail)
+            .expect("follow-up small burst must stage directly")
+            .expect("non-empty follow-up burst");
+        let rb = host.read_back_buffer(128).expect("readback");
+        // SAFETY: closed idle prelude + live resources.
+        unsafe {
+            sync_alloc.Reset().unwrap();
+            sync_list.Reset(&sync_alloc, None).unwrap();
+            for &(idx, dst_off, ring_off, chunk) in &copies3 {
+                sync_list.CopyBufferRegion(&dirty_tail[idx].0.buffer, dst_off, &ring_buf, ring_off, chunk);
+            }
+            sync_list.ResourceBarrier(&[transition(
+                &shadow.buffer,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            // Read 64 B from offset 0 (0x33 from Pass 3) and 64 B from offset 9 MiB (0x22 from Pass 2 oversized burst).
+            sync_list.CopyBufferRegion(&rb, 0, &shadow.buffer, 0, 64);
+            sync_list.CopyBufferRegion(&rb, 64, &shadow.buffer, 9 << 20, 64);
+            sync_list.Close().unwrap();
+            let cmd: ID3D12CommandList = sync_list.cast().unwrap();
+            run_and_wait(&host, &mut gfx_fence, &[Some(cmd)], Some(val3));
+
+            let mut mapped = std::ptr::null_mut();
+            rb.Map(0, None, Some(&mut mapped)).unwrap();
+            let got = std::slice::from_raw_parts(mapped.cast::<u8>(), 128);
+            assert!(got[..64].iter().all(|&b| b == 0x33), "Pass 3 direct-staged bytes must match 0x33");
+            assert!(got[64..].iter().all(|&b| b == 0x22), "Pass 2 oversized async-uploaded bytes must match 0x22");
+            rb.Unmap(0, None);
+
+            let count = info_queue.GetNumStoredMessages();
+            let mut errors = Vec::new();
+            for i in 0..count {
+                let mut len = 0usize;
+                let _ = info_queue.GetMessage(i, None, &mut len);
+                if len == 0 { continue; }
+                let mut buf = vec![0u8; len];
+                if info_queue.GetMessage(i, Some(buf.as_mut_ptr().cast()), &mut len).is_ok() {
+                    let msg = &*buf.as_ptr().cast::<D3D12_MESSAGE>();
+                    if matches!(msg.Severity, D3D12_MESSAGE_SEVERITY_CORRUPTION | D3D12_MESSAGE_SEVERITY_ERROR) {
+                        errors.push(std::ffi::CStr::from_ptr(msg.pDescription as *const i8).to_string_lossy().into_owned());
+                    }
+                }
+            }
+            assert!(errors.is_empty(), "D3D12 Debug Layer reported {} error(s): {errors:?}", errors.len());
+        }
+    }
 }
 
 /// A host command list and its allocator, always used together.
@@ -4064,43 +4230,62 @@ impl Host {
         guard.as_mut().map(f)
     }
 
-    /// Records dirty byte runs from `dirty` through `UploadRing` (`GPU_UPLOAD`
-    /// when ReBAR is enabled, else `UPLOAD`) directly onto a `DIRECT` command
+    /// Stages dirty byte runs from `dirty` into `UploadRing` (`GPU_UPLOAD` when
+    /// ReBAR is enabled, else `UPLOAD`) for recording onto a `DIRECT` command
     /// list (`self.queue`), avoiding 84 cross-queue semaphore waits/frame while
     /// preserving full `Card::staging` isolation across in-flight `VICTORY_RELAY`
-    /// submissions. Returns `Ok(Some(val))` if copies were recorded (caller MUST
-    /// call `self.queue.Signal(upload_fence, val)` after executing `list`),
-    /// `Ok(None)` if `dirty` had no ranges, or `Err(())` to fall back.
-    fn stage_dirty_into_direct_list(
+    /// submissions.
+    ///
+    /// Does NOT touch any command list, so an `Err(())` fallback (e.g. oversized
+    /// burst `> ring.size / 2`) leaves command-list state untouched and cannot
+    /// double-reset or leak an open prelude.
+    ///
+    /// Returns `Ok(Some((val, copies)))` where each copy is
+    /// `(dirty_index, dst_offset, ring_offset, byte_len)` (caller MUST record
+    /// the copies onto `self.queue` and call `self.queue.Signal(upload_fence, val)`),
+    /// `Ok(None)` if `dirty` had no non-empty byte ranges, or `Err(())` to fall
+    /// back to `async_upload_dirty`.
+    fn stage_dirty_into_ring(
         &self,
-        list: &ID3D12GraphicsCommandList,
         dirty: &[(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)],
-    ) -> Result<Option<u64>, ()> {
+    ) -> Result<Option<(u64, Vec<(usize, u64, u64, u64)>)>, ()> {
         let Some(upload_fence) = &self.upload_fence else {
             return Err(());
         };
         if !dirty.iter().any(|(_, r)| !r.is_empty()) {
             return Ok(None);
         }
-        let staged = self.with_upload_ring(|ring| -> Result<Option<u64>, ()> {
+        let staged = self.with_upload_ring(|ring| -> Result<Option<(u64, Vec<(usize, u64, u64, u64)>)>, ()> {
             let half = ring.size / 2;
-            let total_bytes: u64 = dirty
-                .iter()
-                .filter(|(s, _)| s.card_sides().is_some())
-                .flat_map(|(_, r)| r.iter().map(|&(a, b)| b.saturating_sub(a) as u64))
-                .sum();
+            let mut total_bytes: u64 = 0;
+            let mut padded_bytes: u64 = 0;
+            for (shadow, ranges) in dirty {
+                if shadow.card_sides().is_none() {
+                    continue;
+                }
+                for &(a, b) in ranges {
+                    let len = b.saturating_sub(a) as u64;
+                    if len > 0 {
+                        total_bytes = total_bytes.saturating_add(len);
+                        padded_bytes = padded_bytes.saturating_add(len.next_multiple_of(64));
+                    }
+                }
+            }
             if total_bytes == 0 {
                 return Ok(None);
             }
-            if half == 0 || total_bytes > half {
-                // Oversized burst (> 128 MiB in one submission): let `async_upload_dirty`
-                // split it cleanly across multiple COPY queue ring slots.
+            if half == 0 || padded_bytes > half {
+                // Oversized burst (> half the ring including 64-byte alignment
+                // padding): let `async_upload_dirty` split it cleanly across
+                // multiple COPY queue ring slots without touching `sync`.
                 return Err(());
             }
+            let prev_head = ring.head;
+            let mut copies: Vec<(usize, u64, u64, u64)> = Vec::new();
             let mut spans: Vec<(u64, u64)> = Vec::new();
             let mut keep: Vec<KeptResource> = Vec::new();
             let mut batch_used: u64 = 0;
-            for (shadow, ranges) in dirty {
+            for (entry_idx, (shadow, ranges)) in dirty.iter().enumerate() {
                 if ranges.is_empty() || shadow.card_sides().is_none() {
                     continue;
                 }
@@ -4129,12 +4314,10 @@ impl Host {
                             }
                         },
                     ) else {
+                        ring.head = prev_head;
                         return Err(());
                     };
-                    // SAFETY: open DIRECT list and live resources (`shadow.buffer` kept in `keep`).
-                    unsafe {
-                        list.CopyBufferRegion(&shadow.buffer, a as u64, &ring.buffer, off, chunk);
-                    }
+                    copies.push((entry_idx, a as u64, off, chunk));
                     match spans.last_mut() {
                         Some(last) if off == last.1 => last.1 = end,
                         _ => spans.push((off, end)),
@@ -4143,11 +4326,9 @@ impl Host {
                         keep.push(KeptResource(shadow.buffer.clone()));
                         kept_shadow = true;
                     }
-                    crate::shadow::CARD_STATS[0].fetch_add(chunk, Ordering::Relaxed);
                 }
-                crate::shadow::CARD_STATS[1].fetch_add(ranges.len() as u64, Ordering::Relaxed);
             }
-            if spans.is_empty() {
+            if copies.is_empty() {
                 return Ok(None);
             }
             let val = self.upload_value.fetch_add(1, Ordering::AcqRel) + 1;
@@ -4165,7 +4346,7 @@ impl Host {
                     },
                 });
             }
-            Ok(Some(val))
+            Ok(Some((val, copies)))
         });
         match staged {
             Some(Ok(v)) => Ok(v),
@@ -4719,63 +4900,68 @@ impl Host {
         let mut waited_readback = false;
         if !dirty.is_empty() {
             // Fast path: stage dirty byte runs into the 256 MiB `UploadRing`
-            // (`GPU_UPLOAD` ReBAR) and record `CopyBufferRegion` + rehash
-            // directly on ONE `sync` list on `self.queue` — preserving 100%
-            // `Card::staging` isolation while eliminating 84 cross-queue
-            // semaphore waits/frame and 42 extra copy-queue submissions/frame!
-            // Oversized bursts (> ring/2) fall back cleanly to `async_upload_dirty`.
-            let use_ring = async_upload();
+            // (`GPU_UPLOAD` ReBAR) BEFORE touching any command list, then record
+            // `CopyBufferRegion` + rehash onto ONE `sync` list on `self.queue` —
+            // preserving 100% `Card::staging` isolation while eliminating 84
+            // cross-queue semaphore waits/frame and 42 extra copy-queue submits!
+            // Oversized bursts (> ring/2) fall back cleanly to `async_upload_dirty`
+            // with `sync` never left open or double-reset.
             let mut copied_async = false;
-            let mut sync_opt = work.sync.pop().or_else(|| self.make_prelude());
-            let mut staged_ring_val: Option<u64> = None;
-            let mut recorded_on_sync = false;
-            if use_ring
-                && let Some((allocator, list)) = sync_opt.as_ref()
-            {
-                // SAFETY: idle prelude allocator & list.
-                let prep = unsafe {
-                    (|| -> windows::core::Result<()> {
-                        allocator.Reset()?;
-                        list.Reset(allocator, None)?;
-                        Ok(())
-                    })()
-                };
-                if prep.is_ok() {
-                    match self.stage_dirty_into_direct_list(list, &dirty) {
-                        Ok(val) => {
-                            staged_ring_val = val;
-                            recorded_on_sync = true;
-                        }
-                        Err(()) => {
-                            // Oversized burst (> 128 MiB): split on `upload_queue`.
-                            copied_async = self.async_upload_dirty(&dirty, prev_graphics_fence).is_ok();
-                        }
+            let mut staged_ring: Option<(u64, Vec<(usize, u64, u64, u64)>)> = None;
+            if async_upload() {
+                match self.stage_dirty_into_ring(&dirty) {
+                    Ok(staged) => staged_ring = staged,
+                    Err(()) => {
+                        // Oversized burst (> half the ring): split on `upload_queue`.
+                        copied_async = self.async_upload_dirty(&dirty, prev_graphics_fence).is_ok();
                     }
                 }
             }
             let needs_rehash = dirty
                 .iter()
                 .any(|(s, _)| s.card_sides().is_some_and(|(_, before, _)| before.is_some()));
-            if recorded_on_sync || !copied_async || needs_rehash {
-                let Some(sync) = sync_opt.take().or_else(|| self.make_prelude()) else {
+            let has_staged = staged_ring.is_some();
+            if has_staged || !copied_async || needs_rehash {
+                let Some(sync) = work.sync.pop().or_else(|| self.make_prelude()) else {
                     fail(format_args!("no host list to bring host copies in the card's memory up to date"));
                 };
                 let (allocator, list) = &sync;
-                // SAFETY: the list's last run finished (it ran ahead of a
-                // submission that was waited for, and came back after that);
-                // live buffers, and the ranges lie in them.
+                let ring_buffer = if has_staged {
+                    self.with_upload_ring(|r| r.buffer.clone())
+                } else {
+                    None
+                };
+                // SAFETY: `sync` is always popped closed & idle (its previous run
+                // finished before `card_done` returned it to `work.sync`); live
+                // buffers, and all ranges lie within them.
                 let recorded = unsafe {
                     (|| -> windows::core::Result<()> {
-                        if !recorded_on_sync {
-                            allocator.Reset()?;
-                            list.Reset(allocator, None)?;
-                        }
+                        allocator.Reset()?;
+                        list.Reset(allocator, None)?;
+                        let staged_val = if let (Some((val, copies)), Some(ring_buf)) =
+                            (staged_ring.as_ref(), ring_buffer.as_ref())
+                        {
+                            for &(entry_idx, dst_off, ring_off, chunk) in copies {
+                                list.CopyBufferRegion(
+                                    &dirty[entry_idx].0.buffer,
+                                    dst_off,
+                                    ring_buf,
+                                    ring_off,
+                                    chunk,
+                                );
+                                crate::shadow::CARD_STATS[0].fetch_add(chunk, Ordering::Relaxed);
+                            }
+                            crate::shadow::CARD_STATS[1].fetch_add(copies.len() as u64, Ordering::Relaxed);
+                            Some(*val)
+                        } else {
+                            None
+                        };
                         let mut hash_bound = false;
                         for (shadow, ranges) in &dirty {
                             let Some((staging, before, size)) = shadow.card_sides() else {
                                 continue;
                             };
-                            if !recorded_on_sync && !copied_async {
+                            if staged_val.is_none() && !copied_async {
                                 for &(a, b) in ranges {
                                     list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64);
                                     crate::shadow::CARD_STATS[0].fetch_add((b - a) as u64, Ordering::Relaxed);
@@ -4831,7 +5017,7 @@ impl Host {
                         wait_active_readback();
                         waited_readback = true;
                         self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
-                        if let (Some(val), Some(upload_fence)) = (staged_ring_val, &self.upload_fence) {
+                        if let (Some(val), Some(upload_fence)) = (staged_val, &self.upload_fence) {
                             self.queue.Signal(upload_fence, val)?;
                         }
                         Ok(())
@@ -4841,8 +5027,6 @@ impl Host {
                     fail(format_args!("host copies in the card's memory could not be brought up to date ({e})"));
                 }
                 used.push((false, sync));
-            } else if let Some(sync) = sync_opt {
-                work.sync.push(sync);
             }
         }
         if !waited_readback && !declared.is_empty() {
