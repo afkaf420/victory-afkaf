@@ -2030,3 +2030,98 @@ fn wave_local_zero_lds_earlier_block_ballot_has_no_forward_reference() {
             .expect("earlier-block ballot DXIL validation failed");
     }
 }
+
+/// Phase 9B Track D belt-and-suspenders hardening (`in_half_layout`): a
+/// `wave_local` Wave64 compute shader that declares LDS (`raw_lds_dwords > 0`)
+/// or executes `v_readlane_b32` must retain `halves` (`wave_base` relabelling)
+/// rather than taking the zero-LDS shortcut.
+#[test]
+fn wave_local_in_half_layout_keeps_halves_for_lds_and_readlane() {
+    // Case 1: wave_local shader with raw LDS declared (`rsrc2` bit 15 = 512 B = 128 dwords).
+    let words_lds = [
+        0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+        0x7E0C_0280, // v_mov_b32 v6, 0
+        (0x38 << 26) | (0x1C << 18) | (1 << 12),
+        (128 << 24) | (2 << 16) | (6 << 8) | 2,
+    ];
+    let mut native_lds = native_of(&words_lds, true, 64);
+    if let StageIo::Cs(ref mut cs) = native_lds.io {
+        cs.rsrc2 = (5 << 1) | (1 << 15);
+    }
+    let p1 = ir::build(&native_lds.code, native_lds.wave64, native_lds.vgprs).expect("ir1");
+    let st1 = structure::structure(&p1).expect("st1");
+    let res1 = resource::track(&p1, &native_lds.layout, native_lds.stage, Some(&st1)).expect("r1");
+    let io1 = io::raise(&p1, &native_lds).expect("io1");
+    let was_w = lower::TEST_HOST_WAVE.replace(Some(32));
+    let mut l1 = lower::with_local_waves(|| {
+        lower::lower(&lower::Parts {
+            native: &native_lds,
+            p: &p1,
+            st: &st1,
+            io: &io1,
+            res: &res1,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        })
+    })
+    .expect("lower lds wave_local");
+    lower::TEST_HOST_WAVE.set(was_w);
+    // 128 console LDS dwords + 1 halves slot = 129 dwords (must NOT drop halves!).
+    assert_eq!(
+        l1.lds_dwords, 129,
+        "wave_local with raw_lds_dwords > 0 must keep halves (+1 LDS dword)"
+    );
+    assert!(l1.barriers >= 1, "halves relabelling must keep entry barrier");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut l1.dxil).expect("lds wave_local DXIL valid");
+    }
+
+    // Case 2: wave_local shader with 0 LDS bytes, a cross-lane ballot (which
+    // alone would drop `halves` to `lds_dwords = 0`), plus `v_writelane_b32`
+    // (which forces `in_half_layout = true` so `halves` stays allocated).
+    let words_rl = [
+        0xD48A_0010,
+        (132 << 9) | (256 + 0), // v_cmp_lt_u32 s[16:17], v0, 4
+        0xBE92_1010,            // s_bcnt1_i32_b64 s18, s[16:17]
+        0x7E10_0280,            // v_mov_b32 v8, 0
+        0xD761_0008,            // v_writelane_b32 v8, s18, 0
+        (0x80 << 9) | 18,
+        0x7E0C_0308,            // v_mov_b32 v6, v8
+        0x3404_0082,            // v_lshlrev_b32 v2, 2, v0
+        (0x38 << 26) | (0x1C << 18) | (1 << 12),
+        (128 << 24) | (2 << 16) | (6 << 8) | 2,
+    ];
+    let native_rl = native_of(&words_rl, true, 64);
+    let p2 = ir::build(&native_rl.code, native_rl.wave64, native_rl.vgprs).expect("ir2");
+    let st2 = structure::structure(&p2).expect("st2");
+    let res2 = resource::track(&p2, &native_rl.layout, native_rl.stage, Some(&st2)).expect("r2");
+    let io2 = io::raise(&p2, &native_rl).expect("io2");
+    let was_w = lower::TEST_HOST_WAVE.replace(Some(32));
+    let mut l2 = lower::with_local_waves_any(|| {
+        lower::lower(&lower::Parts {
+            native: &native_rl,
+            p: &p2,
+            st: &st2,
+            io: &io2,
+            res: &res2,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        })
+    })
+    .expect("lower readlane wave_local");
+    lower::TEST_HOST_WAVE.set(was_w);
+    assert_eq!(
+        l2.lds_dwords, 1,
+        "wave_local_any with v_writelane_b32 must keep halves (lds_dwords == 1, got {})",
+        l2.lds_dwords
+    );
+    assert!(l2.barriers >= 1, "halves relabelling must keep entry barrier");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut l2.dxil)
+            .expect("readlane wave_local DXIL valid");
+    }
+}

@@ -580,8 +580,8 @@ extern "system" fn barrier_groups(this: This, count: u32, groups: *const u8) {
     }
     let (globals, buffers) = super::decode_barrier_groups(count, groups);
     if super::enhanced_barriers_on() && globals.is_empty() && buffers.is_empty() {
-        // Pure-texture, SYNC_NONE, or read-to-read buffer barrier groups require
-        // no host barrier under Enhanced Barriers; drop before entering the stream.
+        // Non-UAV texture transitions, SYNC_NONE, or read-to-read buffer barrier
+        // groups require no host barrier under Enhanced Barriers; drop early.
         return;
     }
     let header = u64::from(globals.len() as u32) | (u64::from(buffers.len() as u32) << 32);

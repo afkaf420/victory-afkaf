@@ -128,9 +128,16 @@ enum RebarStreamMode {
     /// Disabled (`0`/`off`/`false`): every card buffer allocates a host RAM `Card::staging` mirror.
     Off,
     /// Safe default (`1`/`ro`/`true`/unset): skip upfront `Card::staging` ONLY for
-    /// `ConsoleMemClass::GpuReadOnly` (write-once/immutable) buffers; mutable
-    /// `WriteCombinedGpuRw` buffers keep their `Card::staging` snapshot at
-    /// `batch.flush()` so `VICTORY_ASYNC_SUBMIT=1` never races frame `N+1` CPU overwrites.
+    /// `ConsoleMemClass::GpuReadOnly` (write-once/immutable) buffers.
+    ///
+    /// Phase 9B audit confirmed mutable `WriteCombinedGpuRw` (`0x2404`) and
+    /// `CachedGpuRw` (`0x2004`) buffers are NOT race-free without `Card::staging`
+    /// under `VICTORY_ASYNC_SUBMIT=1`: the title CPU thread begins overwriting
+    /// dynamic ring/instance buffers for frame `N+1` immediately after queuing
+    /// frame `N`, before `victory-submit` reaches `card_before -> stream_range_into`,
+    /// causing torn transforms / black flicker (Phase 8B-2). Keeping `ReadOnly`
+    /// preserves the synchronous `batch.flush()` staging snapshot for all mutable
+    /// classes while saving RAM on immutable `GpuReadOnly` buffers.
     ReadOnly,
     /// Opt-in (`2`/`all`/`wc`): also stream `lazy_readback`-eligible `WriteCombinedGpuRw`
     /// buffers directly from Title RAM into `UploadRing`.
@@ -2339,6 +2346,16 @@ mod piece_tests {
 /// merged nor a reason to settle; the refresh leaves such ranges alone, and
 /// shaders read zeros there (fxceless/victory-fork#206: missing geometry
 /// with `VICTORY_LATE_WAIT`/`VICTORY_RELAY`).
+/// True when 64 KiB `page` is currently held `GpuResident` in VRAM by a
+/// DIFFERENT shadow (`shadow_id` does not own it — e.g. multi-view alias
+/// `Shadow_A` wrote `VA1` and `Shadow_B` is refreshing `VA2`). Lock-free O(1)
+/// fast reject when `page` is not `GpuResident`.
+#[inline]
+fn is_foreign_lazy_resident(page: usize, carded: bool, shadow_id: u64) -> bool {
+    crate::host::lazy_readback::is_gpu_resident(page)
+        && !(carded && crate::host::native_vram::is_lazy_owner(page, shadow_id))
+}
+
 fn stale_pages_in(base: usize, copied: &[u64], a: usize, e: usize, written: &[(usize, u64)]) -> Vec<usize> {
     (a / PAGE..e.div_ceil(PAGE))
         .filter(|&page| page >= base)
@@ -3133,9 +3150,13 @@ impl Shadow {
         let carded = self.card.is_some();
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         busy.into_iter().any(|(a, e)| match crate::watch::asked(a, e) {
-            Some((_, written)) => stale_pages_in(base, &copied, a, e, &written)
-                .into_iter()
-                .any(|page| !(carded && crate::host::native_vram::is_lazy_owner(page, self.id))),
+            Some((_, written)) => {
+                stale_pages_in(base, &copied, a, e, &written)
+                    .into_iter()
+                    .any(|page| !(carded && crate::host::native_vram::is_lazy_owner(page, self.id)))
+                    || (a / PAGE..e.div_ceil(PAGE))
+                        .any(|page| page >= base && is_foreign_lazy_resident(page, carded, self.id))
+            }
             None => true,
         })
     }
@@ -3188,10 +3209,20 @@ impl Shadow {
             let stale: Vec<usize> = {
                 let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
                 let carded = self.card.is_some();
-                stale_pages_in(base, &copied, a, e, &written)
+                let mut pages: Vec<usize> = stale_pages_in(base, &copied, a, e, &written)
                     .into_iter()
                     .filter(|&page| !(carded && crate::host::native_vram::is_lazy_owner(page, self.id)))
-                    .collect()
+                    .collect();
+                for page in a / PAGE..e.div_ceil(PAGE) {
+                    if page >= base
+                        && is_foreign_lazy_resident(page, carded, self.id)
+                        && !pages.contains(&page)
+                    {
+                        pages.push(page);
+                    }
+                }
+                pages.sort_unstable();
+                pages
             };
             if stale.is_empty() {
                 continue;
@@ -3486,18 +3517,25 @@ impl Shadow {
                 }
                 _ => 0,
             };
-            // Skip blocks owned in VRAM by `lazy_readback`: their latest GPU
-            // bytes are already in `self.buffer` and Title RAM is `PAGE_NOACCESS`.
-            if carded && crate::host::native_vram::is_lazy_owner(page, self.id) {
+            // Skip blocks owned in VRAM by `lazy_readback` for THIS shadow:
+            // their latest GPU bytes are already in `self.buffer` and Title RAM
+            // is `PAGE_NOACCESS`. Conversely, if `page` is `GpuResident` under
+            // ANOTHER shadow (e.g. multi-view alias `Shadow_A` wrote `VA1` and
+            // `Shadow_B` refreshes `VA2`), force a refresh even when `write == 0`
+            // so `Shadow_B` calls `copy()` -> `ensure_cpu_resident` and pulls
+            // `Shadow_A`'s latest GPU bytes into Title RAM and `self.buffer`!
+            let resident = crate::host::lazy_readback::is_gpu_resident(page);
+            if resident && carded && crate::host::native_vram::is_lazy_owner(page, self.id) {
                 if let Some((first, was_first)) = run.take() {
                     let (a, b) = ((first * PAGE).max(from), (page * PAGE).min(to));
                     bytes += if !diff || was_first { self.copy(a, b) } else { self.copy_diff64(a, b) };
                 }
                 continue;
             }
+            let foreign_lazy_resident = resident;
             let at = &mut copied[page - base];
-            if *at == 0 || write > *at {
-                let first_time = *at == 0;
+            if *at == 0 || write > *at || foreign_lazy_resident {
+                let first_time = *at == 0 || foreign_lazy_resident;
                 // A page only partly in the range is copied in part: it
                 // stays stale for the rest.
                 let (start, end) = (self.start as usize, (self.start + self.len) as usize);
@@ -5154,6 +5192,157 @@ mod window_tests {
         }
         assert_eq!(total_runs, pages);
         assert_eq!(left.load(Ordering::Relaxed), 32 - pages as i64);
+    }
+
+    /// Proves that when `Shadow_A` (at `va1`) holds a multi-view aliased 64 KiB
+    /// page `GpuResident` in `lazy_readback`, `Shadow_B` (at sibling alias `va2`,
+    /// which was previously copied so `copied[0] > 0` and has `write == 0` in
+    /// `watch::writes`) still treats the page as stale in `copy_stale()`,
+    /// materializes `Shadow_A`'s latest GPU bytes via `ensure_cpu_resident`,
+    /// and uploads them into `Shadow_B`'s staging mirror instead of serving stale bytes.
+    #[test]
+    fn inter_shadow_multi_alias_refresh_materializes_foreign_lazy_resident_block() {
+        use super::{PAGE, is_foreign_lazy_resident, test_card_shadow_at};
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, PAGE_READWRITE, SEC_COMMIT,
+            UnmapViewOfFile,
+        };
+
+        const LEN_64K: usize = 64 << 10;
+        // SAFETY: anonymous 64 KiB section cleaned up before return.
+        let sec = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE | SEC_COMMIT,
+                0,
+                LEN_64K as u32,
+                std::ptr::null(),
+            )
+        };
+        assert!(!sec.is_null());
+        // SAFETY: mapping 2 alias views of the same 64 KiB physical page.
+        let view1 = unsafe { MapViewOfFile(sec, FILE_MAP_WRITE, 0, 0, LEN_64K) };
+        let view2 = unsafe { MapViewOfFile(sec, FILE_MAP_WRITE, 0, 0, LEN_64K) };
+        assert!(!view1.Value.is_null() && !view2.Value.is_null());
+        let va1 = view1.Value as usize;
+        let va2 = view2.Value as usize;
+        assert_ne!(va1, va2);
+
+        struct Cleanup {
+            sec: windows_sys::Win32::Foundation::HANDLE,
+            view1: windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS,
+            view2: windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS,
+            va1: usize,
+            va2: usize,
+        }
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                crate::host::lazy_readback::evict_range(self.va1, LEN_64K);
+                crate::host::lazy_readback::evict_range(self.va2, LEN_64K);
+                crate::host::lazy_readback::test_clear_mock_fetcher(self.va1);
+                crate::inplace::views_gone(self.va1, LEN_64K);
+                crate::inplace::views_gone(self.va2, LEN_64K);
+                crate::inplace::title_memory_section_gone(self.sec as usize);
+                // SAFETY: unmapping both views and closing section handle.
+                unsafe {
+                    UnmapViewOfFile(self.view1);
+                    UnmapViewOfFile(self.view2);
+                    CloseHandle(self.sec);
+                }
+            }
+        }
+        let _cleanup = Cleanup { sec, view1, view2, va1, va2 };
+
+        crate::inplace::title_memory_section(sec as usize, LEN_64K as u64, true);
+        crate::inplace::title_memory_view(va1, LEN_64K, sec as usize, 0);
+        crate::inplace::title_memory_view(va2, LEN_64K, sec as usize, 0);
+        // Seed initial RAM bytes `0x11`.
+        // SAFETY: committed 64 KiB view.
+        unsafe { std::ptr::write_bytes(va1 as *mut u8, 0x11, LEN_64K) };
+
+        let Some(shadow_a) = test_card_shadow_at(va1 as u64, LEN_64K as u64) else {
+            return; // headless machine without D3D12
+        };
+        let Some(shadow_b) = test_card_shadow_at(va2 as u64, LEN_64K as u64) else {
+            return;
+        };
+        let Some(shadow_c) = test_card_shadow_at(va2 as u64, LEN_64K as u64) else {
+            return;
+        };
+        assert_ne!(shadow_a.id(), shadow_b.id());
+        assert_ne!(shadow_a.id(), shadow_c.id());
+
+        // Materialize staging on `shadow_b` to test the staging-backed `Shadow::copy`
+        // path; keep `shadow_c` in ReBAR-streaming mode to test `copy_dirty_to_ring`.
+        let (_, b_ptr) = shadow_b.ensure_card_staging().expect("card staging");
+        assert!(!b_ptr.is_null());
+        assert!(shadow_c.is_rebar_streaming());
+
+        // 1. `shadow_b` copies initial bytes `0x11` so `shadow_b.copied[0] > 0`
+        //    and `watch::writes(va2)` becomes clean (`write == 0`).
+        let first_bytes = shadow_b.update(va2, LEN_64K);
+        assert_eq!(first_bytes, LEN_64K);
+        // SAFETY: `shadow_b` staging buffer is mapped for `LEN_64K` bytes.
+        assert_eq!(unsafe { *b_ptr }, 0x11);
+        assert_eq!(shadow_b.update(va2, LEN_64K), 0, "second clean update must copy 0 bytes");
+
+        // 2. `shadow_a` writes `0x7E` on the GPU and promotes `[va1, va2]` to
+        //    `GpuResident` (`PAGE_NOACCESS` on both VAs, NO CPU write to `va2`).
+        assert!(crate::host::lazy_readback::test_promote_mock_block(
+            va1,
+            shadow_a.clone(),
+            0x7E
+        ));
+        assert!(crate::host::lazy_readback::is_gpu_resident(va2 / PAGE));
+        assert!(
+            !is_foreign_lazy_resident(va1 / PAGE, true, shadow_a.id()),
+            "owning shadow must NOT treat its own GpuResident block as foreign"
+        );
+        assert!(
+            is_foreign_lazy_resident(va2 / PAGE, true, shadow_b.id()),
+            "sibling shadow must treat foreign GpuResident alias as stale"
+        );
+
+        // 3. `shadow_b.update(va2, LEN_64K)` MUST notice `is_foreign_lazy_resident`,
+        //    materialize `shadow_a`'s `0x7E` GPU bytes into Title RAM, and copy them
+        //    into `shadow_b`'s staging buffer (NOT skip because `write == 0`)!
+        let refreshed = shadow_b.update(va2, LEN_64K);
+        assert_eq!(
+            refreshed, LEN_64K,
+            "Shadow_B must refresh foreign lazy-resident alias even with 0 CPU writes"
+        );
+        assert!(!crate::host::lazy_readback::is_gpu_resident(va2 / PAGE));
+        // SAFETY: `b_ptr` and `va2` are committed & restored `PAGE_READWRITE`.
+        unsafe {
+            let b_slice = std::slice::from_raw_parts(b_ptr, LEN_64K);
+            assert!(
+                b_slice.iter().all(|&b| b == 0x7E),
+                "Shadow_B staging buffer must contain Shadow_A's exact GPU bytes (0x7E)"
+            );
+            assert_eq!(*(va2 as *const u8), 0x7E);
+        }
+
+        // 4. ReBAR-streaming sibling `shadow_c` also refreshes and materializes
+        //    `shadow_a`'s next GPU write (`0x9D`) via `copy_dirty_to_ring`.
+        assert_eq!(shadow_c.update(va2, LEN_64K), LEN_64K);
+        assert_eq!(shadow_c.update(va2, LEN_64K), 0);
+        assert!(crate::host::lazy_readback::test_promote_mock_block(
+            va1,
+            shadow_a.clone(),
+            0x9D
+        ));
+        assert!(is_foreign_lazy_resident(va2 / PAGE, true, shadow_c.id()));
+        assert_eq!(shadow_c.update(va2, LEN_64K), LEN_64K);
+        let mut ring = vec![0u8; LEN_64K];
+        // SAFETY: `ring` holds `LEN_64K` writable bytes.
+        unsafe { shadow_c.copy_dirty_to_ring(0, ring.as_mut_ptr(), LEN_64K) };
+        assert!(!crate::host::lazy_readback::is_gpu_resident(va2 / PAGE));
+        assert!(
+            ring.iter().all(|&b| b == 0x9D),
+            "ReBAR-streaming sibling must materialize and stream Shadow_A's 0x9D bytes"
+        );
     }
 }
 

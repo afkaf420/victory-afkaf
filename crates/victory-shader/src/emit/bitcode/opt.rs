@@ -226,9 +226,13 @@ impl Module {
             // Values merged in one round can make two joins the same in
             // the next (a loop's registers that only go round), and a
             // branch that goes one way leaves blocks with one way in.
+            // Run exact float sign-of-zero / finiteness elision between rounds
+            // so removing an outer tie-breaker's `bitcast` unlocks eliding the
+            // inner `legacy_mul` or `max_min` on the next round.
             for _ in 0..4 {
                 let mut changed = self.merge(passes);
                 if passes & FOLD != 0 {
+                    changed |= self.elide_unobserved_zero_sign();
                     changed |= self.prune();
                 }
                 if !changed {
@@ -402,6 +406,440 @@ impl Module {
         };
         let bits = self.int_bits(*ty)?;
         Some((bits, *x as u64 & mask(bits)))
+    }
+
+    fn is_f32(&self, ty: Ty) -> bool {
+        matches!(self.types[ty.0 as usize], TypeDef::Float)
+    }
+
+    /// If `(f, args)` is a `dx.op.{unary,binary,tertiary}.f32` call, returns its
+    /// arity tag and DXIL opcode.
+    fn dx_f32_op(&self, f: u32, args: &[V]) -> Option<(&'static str, u32)> {
+        let kind = match self.funcs[f as usize].name.as_str() {
+            "dx.op.unary.f32" => "unary",
+            "dx.op.binary.f32" => "binary",
+            "dx.op.tertiary.f32" => "tertiary",
+            _ => return None,
+        };
+        let (_, code) = self.int_k(*args.first()?)?;
+        Some((kind, code as u32))
+    }
+
+    fn float_k_inner(&self, v: V, depth: u32) -> Option<f32> {
+        match v {
+            V::Const(i) => match self.consts[i as usize].1 {
+                Const::Float(bits) => Some(f32::from_bits(bits)),
+                _ => None,
+            },
+            V::Inst(id) => {
+                let depth = depth.checked_sub(1)?;
+                let inst = &self.insts[id as usize];
+                match &inst.op {
+                    Op::Cast(Cast::Bitcast, x) if self.is_f32(inst.ty) => match *x {
+                        V::Const(_) => {
+                            let (bits, k) = self.int_k(*x)?;
+                            (bits == 32).then_some(f32::from_bits(k as u32))
+                        }
+                        V::Inst(j) => match self.insts[j as usize].op {
+                            Op::Cast(Cast::Bitcast, y) if self.is_f32(self.type_of(y)) => {
+                                self.float_k_inner(y, depth)
+                            }
+                            _ => None,
+                        },
+                        _ => None,
+                    },
+                    // `fsrc` emits `v.neg` as `fsub -0.0, x`.
+                    Op::Bin(Bin::Sub, z, x)
+                        if self.is_f32(inst.ty)
+                            && matches!(
+                                *z,
+                                V::Const(ci) if matches!(self.consts[ci as usize].1, Const::Float(0x8000_0000))
+                            ) =>
+                    {
+                        let k = self.float_k_inner(*x, depth)?;
+                        (!k.is_nan()).then_some(f32::from_bits(k.to_bits() ^ 0x8000_0000))
+                    }
+                    // `fsrc` emits `v.abs` as `dx.op.unary.f32(6, x)`.
+                    Op::Call(f, args) if self.dx_f32_op(*f, args) == Some(("unary", 6)) => {
+                        let k = self.float_k_inner(*args.get(1)?, depth)?;
+                        (!k.is_nan()).then_some(f32::from_bits(k.to_bits() & 0x7FFF_FFFF))
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// The value of a 32-bit float constant (directly, via `i32 -> f32` bitcast,
+    /// or folded through `fsrc`'s `-0.0 - k` / `FAbs(k)` modifiers).
+    pub(crate) fn float_k(&self, v: V) -> Option<f32> {
+        self.float_k_inner(v, 4)
+    }
+
+    /// For a float that is provably finite (never `NaN` or `±Inf`) whatever the
+    /// shader reads: a power of two its magnitude does not pass (`< 126.0`).
+    pub(crate) fn bounded(&self, v: V, depth: u32) -> Option<f32> {
+        if let Some(k) = self.float_k(v) {
+            return k.is_finite().then(|| k.abs().max(1e-30).log2().ceil());
+        }
+        let V::Inst(i) = v else { return None };
+        let depth = depth.checked_sub(1)?;
+        let of = |x: V| self.bounded(x, depth);
+        // A power that overflows, or might with rounding, is no bound.
+        let held = |b: f32| (b < 126.0).then_some(b);
+        let inst = &self.insts[i as usize];
+        if !self.is_f32(inst.ty) {
+            return None;
+        }
+        match &inst.op {
+            Op::Cast(Cast::UiToFp | Cast::SiToFp, _) => Some(32.0),
+            Op::Cast(Cast::Bitcast, x) => match *x {
+                V::Inst(j) => match self.insts[j as usize].op {
+                    Op::Cast(Cast::Bitcast, y) if self.type_of(y) == inst.ty => of(y),
+                    Op::Select(_, a_i, b_i) if self.int_bits(self.insts[j as usize].ty) == Some(32) => {
+                        let arm = |arm_v: V| -> Option<f32> {
+                            if let Some((_, k)) = self.int_k(arm_v) {
+                                let fk = f32::from_bits(k as u32);
+                                return fk.is_finite().then(|| fk.abs().max(1e-30).log2().ceil());
+                            }
+                            if let V::Inst(ai) = arm_v
+                                && let Op::Cast(Cast::Bitcast, y) = self.insts[ai as usize].op
+                                && self.type_of(y) == inst.ty
+                            {
+                                return of(y);
+                            }
+                            None
+                        };
+                        Some(arm(a_i)?.max(arm(b_i)?))
+                    }
+                    _ => None,
+                },
+                _ => None,
+            },
+            Op::Bin(Bin::Mul, a, b) => held(of(*a)? + of(*b)?),
+            Op::Bin(Bin::Add | Bin::Sub, a, b) => held(of(*a)?.max(of(*b)?) + 1.0),
+            Op::Select(_, a, b) => Some(of(*a)?.max(of(*b)?)),
+            Op::Call(f, args) => {
+                let (kind, code) = self.dx_f32_op(*f, args)?;
+                match (kind, code, &args[1..]) {
+                    // Saturate clamps any float (including Inf/NaN) to [0, 1].
+                    ("unary", 7, [_]) => Some(0.0),
+                    ("unary", 6, [x]) => of(*x),
+                    // Cos, Sin, Frc of a finite input lie in [-1, 1].
+                    ("unary", 12 | 13 | 22, [x]) => of(*x).map(|_| 0.0),
+                    // Exp (2^x) of |x| <= 64 cannot overflow f32.
+                    ("unary", 21, [x]) => (of(*x)? <= 6.0).then_some(64.0),
+                    // Sqrt of a non-negative finite input is finite.
+                    ("unary", 24, [x]) if self.float_non_negative_allow_nz(*x, depth) => {
+                        held(of(*x)? * 0.5 + 1.0)
+                    }
+                    ("unary", 26..=29, [x]) => held(of(*x)? + 1.0),
+                    // FMax/FMin: either both operands are finite, or one clamps
+                    // the other side of an inner FMin/FMax with a finite constant.
+                    ("binary", 35 | 36, [a, b]) => match (of(*a), of(*b)) {
+                        (Some(x), Some(y)) => Some(x.max(y)),
+                        _ => {
+                            let other = if code == 35 { 36 } else { 35 };
+                            let (inner, k) = if self.float_k(*b).is_some() {
+                                (*a, *b)
+                            } else {
+                                (*b, *a)
+                            };
+                            let kb = self.float_k(k).and_then(|_| of(k))?;
+                            let V::Inst(j) = inner else { return None };
+                            let Op::Call(jf, jargs) = &self.insts[j as usize].op else {
+                                return None;
+                            };
+                            if self.dx_f32_op(*jf, jargs) != Some(("binary", other)) {
+                                return None;
+                            }
+                            let low = jargs[1..].iter().find(|x| self.float_k(**x).is_some())?;
+                            Some(kb.max(of(*low)?))
+                        }
+                    },
+                    ("tertiary", 46, [a, b, c]) => {
+                        held((of(*a)? + of(*b)?).max(of(*c)?) + 1.0)
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether `v` is provably never `NaN` (may be finite or `±Inf`).
+    pub(crate) fn not_nan(&self, v: V, depth: u32) -> bool {
+        if let Some(k) = self.float_k(v) {
+            return !k.is_nan();
+        }
+        if self.bounded(v, depth).is_some() {
+            return true;
+        }
+        let V::Inst(i) = v else { return false };
+        let Some(depth) = depth.checked_sub(1) else {
+            return false;
+        };
+        let inst = &self.insts[i as usize];
+        if !self.is_f32(inst.ty) {
+            return false;
+        }
+        match &inst.op {
+            Op::Cast(Cast::Bitcast, x) => match *x {
+                V::Inst(j) => match self.insts[j as usize].op {
+                    Op::Cast(Cast::Bitcast, y) if self.type_of(y) == inst.ty => {
+                        self.not_nan(y, depth)
+                    }
+                    _ => false,
+                },
+                _ => false,
+            },
+            Op::Bin(Bin::Sub, z, x)
+                if matches!(
+                    *z,
+                    V::Const(ci) if matches!(self.consts[ci as usize].1, Const::Float(0x8000_0000))
+                ) =>
+            {
+                self.not_nan(*x, depth)
+            }
+            Op::Select(_, a, b) => self.not_nan(*a, depth) && self.not_nan(*b, depth),
+            Op::Call(f, args) => match self.dx_f32_op(*f, args) {
+                Some(("unary", 7)) => true,
+                Some(("unary", 6)) => args.get(1).is_some_and(|x| self.not_nan(*x, depth)),
+                // DXIL FMax/FMin implements IEEE-754 maxNum/minNum (skips NaN).
+                Some(("binary", 35 | 36)) => {
+                    args.get(1).is_some_and(|x| self.not_nan(*x, depth))
+                        || args.get(2).is_some_and(|x| self.not_nan(*x, depth))
+                }
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    /// Whether `v` is provably never `±0.0` (`(bits & 0x7FFF_FFFF) != 0`).
+    pub(crate) fn float_nonzero(&self, v: V, depth: u32) -> bool {
+        if let Some(k) = self.float_k(v) {
+            return k.to_bits() & 0x7FFF_FFFF != 0;
+        }
+        let V::Inst(i) = v else { return false };
+        let Some(depth) = depth.checked_sub(1) else {
+            return false;
+        };
+        let inst = &self.insts[i as usize];
+        if !self.is_f32(inst.ty) {
+            return false;
+        }
+        match &inst.op {
+            Op::Cast(Cast::Bitcast, x) => match *x {
+                V::Inst(j) => match self.insts[j as usize].op {
+                    Op::Cast(Cast::Bitcast, y) if self.type_of(y) == inst.ty => {
+                        self.float_nonzero(y, depth)
+                    }
+                    _ => false,
+                },
+                _ => false,
+            },
+            Op::Bin(Bin::Sub, z, x)
+                if matches!(
+                    *z,
+                    V::Const(ci) if matches!(self.consts[ci as usize].1, Const::Float(0x8000_0000))
+                ) =>
+            {
+                self.float_nonzero(*x, depth)
+            }
+            Op::Bin(Bin::Add, a, b) => {
+                (self.float_k(*a).is_some_and(|k| k > 0.0 && k.is_finite())
+                    && self.float_non_negative_allow_nz(*b, depth))
+                    || (self.float_k(*b).is_some_and(|k| k > 0.0 && k.is_finite())
+                        && self.float_non_negative_allow_nz(*a, depth))
+            }
+            Op::Select(_, a, b) => {
+                self.float_nonzero(*a, depth) && self.float_nonzero(*b, depth)
+            }
+            Op::Call(f, args) => match (self.dx_f32_op(*f, args), args.get(1..)) {
+                (Some(("unary", 6)), Some([x])) => self.float_nonzero(*x, depth),
+                (Some(("binary", 35)), Some([a, b])) => {
+                    self.float_k(*a).is_some_and(|k| k > 0.0)
+                        || self.float_k(*b).is_some_and(|k| k > 0.0)
+                }
+                (Some(("binary", 36)), Some([a, b])) => {
+                    self.float_k(*a).is_some_and(|k| k < 0.0)
+                        || self.float_k(*b).is_some_and(|k| k < 0.0)
+                }
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    /// Whether `v` is provably never `-0.0` (`0x8000_0000`). May be `+0.0`,
+    /// any non-zero finite value, `±Inf`, or `NaN`.
+    pub(crate) fn float_not_neg_zero(&self, v: V, depth: u32) -> bool {
+        if let Some(k) = self.float_k(v) {
+            return k.to_bits() != 0x8000_0000;
+        }
+        if self.float_nonzero(v, depth) {
+            return true;
+        }
+        let V::Inst(i) = v else { return false };
+        let Some(depth) = depth.checked_sub(1) else {
+            return false;
+        };
+        let inst = &self.insts[i as usize];
+        if !self.is_f32(inst.ty) {
+            return false;
+        }
+        match &inst.op {
+            Op::Cast(Cast::UiToFp | Cast::SiToFp, _) => true,
+            Op::Cast(Cast::Bitcast, x) => match *x {
+                V::Inst(j) => match self.insts[j as usize].op {
+                    Op::Cast(Cast::Bitcast, y) if self.type_of(y) == inst.ty => {
+                        self.float_not_neg_zero(y, depth)
+                    }
+                    _ => false,
+                },
+                _ => false,
+            },
+            // IEEE-754 §6.3 (round-to-nearest-even): `a + b == -0.0` iff BOTH
+            // operands are `-0.0`.
+            Op::Bin(Bin::Add, a, b) => {
+                self.float_not_neg_zero(*a, depth) || self.float_not_neg_zero(*b, depth)
+            }
+            Op::Bin(Bin::Mul, a, b) => {
+                self.same_bits(*a, *b)
+                    || (self.float_pos_or_pos_zero(*a, depth)
+                        && self.float_pos_or_pos_zero(*b, depth))
+            }
+            Op::Select(_, a, b) => {
+                self.float_not_neg_zero(*a, depth) && self.float_not_neg_zero(*b, depth)
+            }
+            Op::Call(f, args) => match (self.dx_f32_op(*f, args), args.get(1..)) {
+                (Some(("unary", 6 | 21)), Some([_])) => true,
+                (Some(("binary", 35 | 36)), Some([a, b])) => {
+                    self.float_not_neg_zero(*a, depth) && self.float_not_neg_zero(*b, depth)
+                }
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    /// Whether `v` is provably non-negative with sign bit 0 (`>= +0.0`, never
+    /// negative and never `-0.0`).
+    pub(crate) fn float_pos_or_pos_zero(&self, v: V, depth: u32) -> bool {
+        if let Some(k) = self.float_k(v) {
+            return !k.is_nan() && (k.to_bits() & 0x8000_0000 == 0);
+        }
+        let V::Inst(i) = v else { return false };
+        let Some(depth) = depth.checked_sub(1) else {
+            return false;
+        };
+        let inst = &self.insts[i as usize];
+        if !self.is_f32(inst.ty) {
+            return false;
+        }
+        match &inst.op {
+            Op::Cast(Cast::UiToFp, _) => true,
+            Op::Cast(Cast::Bitcast, x) => match *x {
+                V::Inst(j) => match self.insts[j as usize].op {
+                    Op::Cast(Cast::Bitcast, y) if self.type_of(y) == inst.ty => {
+                        self.float_pos_or_pos_zero(y, depth)
+                    }
+                    _ => false,
+                },
+                _ => false,
+            },
+            Op::Bin(Bin::Add, a, b) => {
+                self.float_pos_or_pos_zero(*a, depth) && self.float_pos_or_pos_zero(*b, depth)
+            }
+            Op::Bin(Bin::Mul, a, b) => {
+                self.same_bits(*a, *b)
+                    || (self.float_pos_or_pos_zero(*a, depth)
+                        && self.float_pos_or_pos_zero(*b, depth))
+            }
+            Op::Select(_, a, b) => {
+                self.float_pos_or_pos_zero(*a, depth) && self.float_pos_or_pos_zero(*b, depth)
+            }
+            Op::Call(f, args) => match (self.dx_f32_op(*f, args), args.get(1..)) {
+                (Some(("unary", 6 | 21)), Some([_])) => true,
+                (Some(("binary", 35)), Some([a, b])) => {
+                    self.float_k(*a).is_some_and(|k| k > 0.0)
+                        || self.float_k(*b).is_some_and(|k| k > 0.0)
+                        || (self.float_pos_or_pos_zero(*a, depth)
+                            && self.float_pos_or_pos_zero(*b, depth))
+                }
+                (Some(("binary", 36)), Some([a, b])) => {
+                    self.float_pos_or_pos_zero(*a, depth) && self.float_pos_or_pos_zero(*b, depth)
+                }
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    /// Whether `v` is provably never `< 0.0` (`-0.0`, `+0.0`, `> 0`, `+Inf`,
+    /// and `NaN` are all allowed). Used to prove `v_fract_f32` cannot hit the
+    /// tiny-negative `1.0` rounding corner case.
+    pub(crate) fn float_non_negative_allow_nz(&self, v: V, depth: u32) -> bool {
+        if let Some(k) = self.float_k(v) {
+            return !(k < 0.0);
+        }
+        if self.float_pos_or_pos_zero(v, depth) {
+            return true;
+        }
+        let V::Inst(i) = v else { return false };
+        let Some(depth) = depth.checked_sub(1) else {
+            return false;
+        };
+        let inst = &self.insts[i as usize];
+        if !self.is_f32(inst.ty) {
+            return false;
+        }
+        match &inst.op {
+            Op::Cast(Cast::Bitcast, x) => match *x {
+                V::Inst(j) => match self.insts[j as usize].op {
+                    Op::Cast(Cast::Bitcast, y) if self.type_of(y) == inst.ty => {
+                        self.float_non_negative_allow_nz(y, depth)
+                    }
+                    _ => false,
+                },
+                _ => false,
+            },
+            Op::Bin(Bin::Add | Bin::Mul, a, b) => {
+                self.float_non_negative_allow_nz(*a, depth)
+                    && self.float_non_negative_allow_nz(*b, depth)
+            }
+            Op::Select(_, a, b) => {
+                self.float_non_negative_allow_nz(*a, depth)
+                    && self.float_non_negative_allow_nz(*b, depth)
+            }
+            Op::Call(f, args) => match (self.dx_f32_op(*f, args), args.get(1..)) {
+                (Some(("unary", 6 | 7 | 21 | 22 | 24)), Some([_])) => true,
+                // FMax skips NaN, so require the non-negative operand to also
+                // be non-NaN unless both operands are non-negative.
+                (Some(("binary", 35)), Some([a, b])) => {
+                    (self.float_non_negative_allow_nz(*a, depth) && self.not_nan(*a, depth))
+                        || (self.float_non_negative_allow_nz(*b, depth) && self.not_nan(*b, depth))
+                        || (self.float_non_negative_allow_nz(*a, depth)
+                            && self.float_non_negative_allow_nz(*b, depth))
+                }
+                (Some(("binary", 36)), Some([a, b])) => {
+                    self.float_non_negative_allow_nz(*a, depth)
+                        && self.float_non_negative_allow_nz(*b, depth)
+                }
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    /// Whether `v` is provably never `+0.0` (`0x0000_0000`).
+    fn float_not_pos_zero(&self, v: V, depth: u32) -> bool {
+        if let Some(k) = self.float_k(v) {
+            return k.to_bits() != 0;
+        }
+        self.float_nonzero(v, depth)
     }
 
     /// The constant `x` of the integer type `ty`, kept sign-extended as
@@ -1036,6 +1474,492 @@ impl Module {
             }
         }
         true
+    }
+
+    /// If `v` is `fcmp oeq x, ±0.0`, returns `x`.
+    fn zero_fcmp_arg(&self, v: V) -> Option<V> {
+        let V::Inst(id) = v else { return None };
+        let Op::Cmp(pred::OEQ, a, b) = self.insts[id as usize].op else {
+            return None;
+        };
+        if self.float_k(b).is_some_and(|k| k == 0.0) {
+            Some(a)
+        } else if self.float_k(a).is_some_and(|k| k == 0.0) {
+            Some(b)
+        } else {
+            None
+        }
+    }
+
+    /// Whether `cond` is a boolean that holds whenever `x == ±0.0` (either
+    /// `fcmp oeq x, 0.0` directly or an `or` containing it).
+    fn cond_checks_zero(&self, cond: V, x: V) -> bool {
+        if self.zero_fcmp_arg(cond).is_some_and(|a| self.same_bits(a, x)) {
+            return true;
+        }
+        if let V::Inst(id) = cond
+            && let Op::Bin(Bin::Or, p, q) = self.insts[id as usize].op
+        {
+            return self.zero_fcmp_arg(p).is_some_and(|a| self.same_bits(a, x))
+                || self.zero_fcmp_arg(q).is_some_and(|a| self.same_bits(a, x));
+        }
+        false
+    }
+
+    /// Matches a `max_min` `-0 < +0` tie-breaker `select zeros, signed, FMax/FMin(a, b)`
+    /// (both unfolded 2-dynamic and `merge()`-folded constant-zero shapes).
+    /// Returns `Some((a, b))` when `select` and `FMax/FMin(a, b)` can only ever
+    /// differ in the sign bit of `±0.0`.
+    fn match_max_min_tiebreaker(&self, zeros: V, signed_v: V, r_v: V) -> Option<(V, V)> {
+        let V::Inst(ri) = r_v else { return None };
+        let Op::Call(rf, rargs) = &self.insts[ri as usize].op else {
+            return None;
+        };
+        if !matches!(self.dx_f32_op(*rf, rargs), Some(("binary", 35 | 36))) {
+            return None;
+        }
+        let (&a, &b) = (rargs.get(1)?, rargs.get(2)?);
+        let V::Inst(zi) = zeros else { return None };
+        let Op::Cmp(pred::EQ, cl, cr) = self.insts[zi as usize].op else {
+            return None;
+        };
+        let masked = if self.int_k(cr).is_some_and(|(_, k)| k == 0) {
+            cl
+        } else if self.int_k(cl).is_some_and(|(_, k)| k == 0) {
+            cr
+        } else {
+            return None;
+        };
+        let V::Inst(mi) = masked else { return None };
+        let Op::Bin(Bin::And, ml, mr) = self.insts[mi as usize].op else {
+            return None;
+        };
+        let either = if self.int_k(mr).is_some_and(|(_, k)| k == 0x7FFF_FFFF) {
+            ml
+        } else if self.int_k(ml).is_some_and(|(_, k)| k == 0x7FFF_FFFF) {
+            mr
+        } else {
+            return None;
+        };
+        let checks_both_zero = if let V::Inst(oi) = either
+            && let Op::Bin(Bin::Or, x, y) = self.insts[oi as usize].op
+        {
+            (self.same_bits(x, a) && self.same_bits(y, b))
+                || (self.same_bits(x, b) && self.same_bits(y, a))
+                || (self.same_bits(x, a) && self.int_k(y).is_some_and(|(_, k)| k == 0x8000_0000) && self.float_k(b).is_some_and(|k| k == 0.0))
+                || (self.same_bits(y, a) && self.int_k(x).is_some_and(|(_, k)| k == 0x8000_0000) && self.float_k(b).is_some_and(|k| k == 0.0))
+                || (self.same_bits(x, b) && self.int_k(y).is_some_and(|(_, k)| k == 0x8000_0000) && self.float_k(a).is_some_and(|k| k == 0.0))
+                || (self.same_bits(y, b) && self.int_k(x).is_some_and(|(_, k)| k == 0x8000_0000) && self.float_k(a).is_some_and(|k| k == 0.0))
+        } else {
+            (self.same_bits(either, a) && self.float_k(b).is_some_and(|k| k == 0.0))
+                || (self.same_bits(either, b) && self.float_k(a).is_some_and(|k| k == 0.0))
+        };
+        if !checks_both_zero {
+            return None;
+        }
+        // Verify `signed_v` is always `±0.0` when `zeros` holds.
+        let zero_bit_src = |v: V| {
+            self.same_bits(v, a)
+                || self.same_bits(v, b)
+                || self.int_k(v).is_some_and(|(_, k)| k == 0 || k == 0x8000_0000)
+        };
+        let signed_is_zero = self.float_k(signed_v).is_some_and(|k| k == 0.0)
+            || self.same_bits(signed_v, a)
+            || self.same_bits(signed_v, b)
+            || (matches!(
+                signed_v,
+                V::Inst(si)
+                    if matches!(
+                        self.insts[si as usize].op,
+                        Op::Cast(Cast::Bitcast, V::Inst(bi))
+                            if matches!(
+                                self.insts[bi as usize].op,
+                                Op::Bin(Bin::And | Bin::Or, x, y) if zero_bit_src(x) && zero_bit_src(y)
+                            )
+                    )
+            ));
+        signed_is_zero.then_some((a, b))
+    }
+
+    /// Whether replacing `-0.0` with `+0.0` (or vice versa) in `root` is 100%
+    /// unobservable by every transitive live consumer in the shader.
+    fn sign_of_zero_unobserved(
+        &self,
+        root: u32,
+        uses: &[Vec<u32>],
+        used_in_term: &[bool],
+    ) -> bool {
+        // `(inst, is_i32_carrier)`: when `is_i32_carrier` is true, `inst` is a
+        // 32-bit integer value carrying the unmodified bit pattern of the float
+        // across `write_f` bitcasts, lane-guard `Select`s, or `Phi`s; any
+        // non-transport integer op (bit math, compare, store, call) immediately
+        // rejects elision.
+        let mut work = vec![(root, false)];
+        let mut seen = std::collections::HashSet::new();
+        seen.insert((root, false));
+        while let Some((cur, is_i32)) = work.pop() {
+            if used_in_term[cur as usize] {
+                return false;
+            }
+            let cur_v = V::Inst(cur);
+            for &u in &uses[cur as usize] {
+                let u_inst = &self.insts[u as usize];
+                let next: Option<bool> = if is_i32 {
+                    match &u_inst.op {
+                        Op::Cast(Cast::Bitcast, _) if self.is_f32(u_inst.ty) => Some(false),
+                        Op::Select(_, t, f)
+                            if self.int_bits(u_inst.ty) == Some(32)
+                                && (*t == cur_v || *f == cur_v) =>
+                        {
+                            Some(true)
+                        }
+                        Op::Phi(_) if self.int_bits(u_inst.ty) == Some(32) => Some(true),
+                        _ => return false,
+                    }
+                } else {
+                    match &u_inst.op {
+                        // Float comparisons treat -0.0 and +0.0 identically.
+                        Op::Cmp(p, _, _) if *p <= pred::TRUE => None,
+                        // Integer conversions map both -0.0 and +0.0 to 0.
+                        Op::Cast(Cast::FpToUi | Cast::FpToSi, _) => None,
+                        // Bitcast to i32: only sound if every transitive i32
+                        // consumer merely transports the bits back to f32.
+                        Op::Cast(Cast::Bitcast, _) if self.int_bits(u_inst.ty) == Some(32) => {
+                            Some(true)
+                        }
+                        // Float add: `±0.0 + other` absorbs sign-of-zero whenever
+                        // `other != -0.0`; otherwise propagates sign-of-zero only.
+                        Op::Bin(Bin::Add, x, y) if self.is_f32(u_inst.ty) => {
+                            if *x == cur_v && *y != cur_v && self.float_not_neg_zero(*y, 6) {
+                                None
+                            } else if *y == cur_v && *x != cur_v && self.float_not_neg_zero(*x, 6) {
+                                None
+                            } else {
+                                Some(false)
+                            }
+                        }
+                        // Float sub: `(±0.0) - y` absorbs when `y != +0.0`;
+                        // `x - (±0.0)` absorbs when `x != -0.0`.
+                        Op::Bin(Bin::Sub, x, y) if self.is_f32(u_inst.ty) => {
+                            if *x == cur_v && *y != cur_v && self.float_not_pos_zero(*y, 6) {
+                                None
+                            } else if *y == cur_v && *x != cur_v && self.float_not_neg_zero(*x, 6) {
+                                None
+                            } else {
+                                Some(false)
+                            }
+                        }
+                        // Float mul: `x * x` always produces +0.0; `x * bounded`
+                        // cannot create `0 * Inf` NaN and at worst flips sign-of-zero;
+                        // an un-elided `legacy_mul` select overrides `±0.0 * other`
+                        // with `+0.0`.
+                        Op::Bin(Bin::Mul, x, y) if self.is_f32(u_inst.ty) => {
+                            if self.same_bits(*x, *y) {
+                                None
+                            } else {
+                                let other = if *x == cur_v { *y } else { *x };
+                                if self.bounded(other, 8).is_some() {
+                                    Some(false)
+                                } else if let [sel] = uses[u as usize][..]
+                                    && !used_in_term[u as usize]
+                                    && let Op::Select(cond, t, f) = self.insts[sel as usize].op
+                                    && f == V::Inst(u)
+                                    && matches!(
+                                        t,
+                                        V::Const(ci) if matches!(self.consts[ci as usize].1, Const::Float(0))
+                                    )
+                                    && self.cond_checks_zero(cond, cur_v)
+                                {
+                                    None
+                                } else {
+                                    return false;
+                                }
+                            }
+                        }
+                        Op::Select(_, t, f)
+                            if self.is_f32(u_inst.ty) && (*t == cur_v || *f == cur_v) =>
+                        {
+                            Some(false)
+                        }
+                        Op::Phi(_) if self.is_f32(u_inst.ty) => Some(false),
+                        Op::Call(f, args) => match (self.dx_f32_op(*f, args), args.get(1..)) {
+                            // FAbs, Cos, Exp, Frc produce bit-identical results for ±0.0
+                            // (Frc(±0.0) = (±0.0) - floor(±0.0) = +0.0 per IEEE-754 §6.3).
+                            (Some(("unary", 6 | 12 | 21 | 22)), Some([_])) => None,
+                            // Saturate at worst preserves ±0.0.
+                            (Some(("unary", 7)), Some([_])) => Some(false),
+                            // FMax with positive const / FMin with negative const
+                            // absorbs ±0.0; otherwise propagates at worst ±0.0.
+                            (Some(("binary", 35)), Some([x, y])) => {
+                                let other = if *x == cur_v { *y } else { *x };
+                                (!self.float_k(other).is_some_and(|k| k > 0.0)).then_some(false)
+                            }
+                            (Some(("binary", 36)), Some([x, y])) => {
+                                let other = if *x == cur_v { *y } else { *x };
+                                (!self.float_k(other).is_some_and(|k| k < 0.0)).then_some(false)
+                            }
+                            (Some(("tertiary", 46)), Some([a, b, c])) => {
+                                let in_a = *a == cur_v;
+                                let in_b = *b == cur_v;
+                                let in_c = *c == cur_v;
+                                if in_a && in_b {
+                                    // `v * v` is always `+0.0` for `v = ±0.0`.
+                                    in_c.then_some(false)
+                                } else if in_a || in_b {
+                                    let other = if in_a { *b } else { *a };
+                                    if self.bounded(other, 8).is_none() {
+                                        return false;
+                                    }
+                                    if !in_c && self.float_not_neg_zero(*c, 6) {
+                                        None
+                                    } else {
+                                        Some(false)
+                                    }
+                                } else {
+                                    Some(false)
+                                }
+                            }
+                            _ => return false,
+                        },
+                        _ => return false,
+                    }
+                };
+                if let Some(next_i32) = next
+                    && seen.insert((u, next_i32))
+                {
+                    if seen.len() > 48 {
+                        return false;
+                    }
+                    work.push((u, next_i32));
+                }
+            }
+        }
+        true
+    }
+
+    /// Exact post-merge elision of `legacy_mul`, `max_min` `-0 < +0` tie-breakers,
+    /// and `fract` clamps whose guards are provably redundant after constant
+    /// folding/CSE or whose `+0.0`/`-0.0` sign bit is unobservable by every
+    /// transitive live consumer.
+    fn elide_unobserved_zero_sign(&mut self) -> bool {
+        if self.blocks.is_empty() {
+            return false;
+        }
+        let effects = self.effects();
+        let reached = self.reached();
+        let n = self.insts.len();
+        // Compute live instructions so dead `write_f` bitcasts and dead
+        // tie-breakers from earlier rounds do not poison `uses`.
+        let mut live = vec![false; n];
+        let mut lwork: Vec<u32> = Vec::new();
+        let mark_live = |live: &mut [bool], lwork: &mut Vec<u32>, v: V| {
+            if let V::Inst(i) = v
+                && !live[i as usize]
+            {
+                live[i as usize] = true;
+                lwork.push(i);
+            }
+        };
+        for (b, blk) in self.blocks.iter().enumerate() {
+            if !reached[b] {
+                continue;
+            }
+            for &i in &blk.body {
+                if self.has_effect(&effects, i) {
+                    mark_live(&mut live, &mut lwork, V::Inst(i));
+                }
+            }
+            if let Some(Term::CondBr(c, ..)) = blk.term {
+                mark_live(&mut live, &mut lwork, c);
+            }
+        }
+        while let Some(i) = lwork.pop() {
+            for_each_operand(&self.insts[i as usize].op, |v| {
+                mark_live(&mut live, &mut lwork, v);
+            });
+        }
+        let mut uses: Vec<Vec<u32>> = vec![Vec::new(); n];
+        let mut used_in_term = vec![false; n];
+        for (b, blk) in self.blocks.iter().enumerate() {
+            if !reached[b] {
+                continue;
+            }
+            for &i in blk.phis.iter().chain(&blk.body) {
+                if !live[i as usize] {
+                    continue;
+                }
+                for_each_operand(&self.insts[i as usize].op, |v| {
+                    if let V::Inst(def) = v {
+                        uses[def as usize].push(i);
+                    }
+                });
+            }
+            if let Some(Term::CondBr(V::Inst(def), ..)) = blk.term {
+                used_in_term[def as usize] = true;
+            }
+        }
+
+        let mut repl: Vec<Option<V>> = vec![None; n];
+        let mut changed = false;
+        let mut any_repl = false;
+
+        for b in 0..self.blocks.len() {
+            if !reached[b] {
+                continue;
+            }
+            let body = std::mem::take(&mut self.blocks[b].body);
+            let mut kept = Vec::with_capacity(body.len());
+            for i in body {
+                let Op::Select(cond, t, f) = self.insts[i as usize].op else {
+                    kept.push(i);
+                    continue;
+                };
+                if !self.is_f32(self.insts[i as usize].ty) {
+                    kept.push(i);
+                    continue;
+                }
+                // Pattern A: `legacy_mul` select -> `fmul` (or 1-operand check).
+                if matches!(
+                    t,
+                    V::Const(ci) if matches!(self.consts[ci as usize].1, Const::Float(0))
+                ) && let V::Inst(mi) = f
+                    && let Op::Bin(Bin::Mul, a, b) = self.insts[mi as usize].op
+                {
+                    let fa = self.bounded(a, 12).is_some();
+                    let fb = self.bounded(b, 12).is_some();
+                    let nz_a = self.float_nonzero(a, 8);
+                    let nz_b = self.float_nonzero(b, 8);
+                    let pos_finite = |v: V| {
+                        self.float_k(v).is_some_and(|k| k > 0.0 && k.is_finite())
+                    };
+                    // Single-operand check: `select (fcmp oeq checked, 0.0), +0.0, (fmul a, b)`.
+                    if let Some(checked) = self.zero_fcmp_arg(cond) {
+                        let pair = if self.same_bits(checked, a) {
+                            Some((a, b, nz_a, fb))
+                        } else if self.same_bits(checked, b) {
+                            Some((b, a, nz_b, fa))
+                        } else {
+                            None
+                        };
+                        if let Some((chk, other, nz_chk, finite_other)) = pair {
+                            let bit_exact = self.same_bits(a, b)
+                                || nz_chk
+                                || (finite_other
+                                    && self.float_pos_or_pos_zero(chk, 8)
+                                    && self.float_pos_or_pos_zero(other, 8))
+                                || (pos_finite(other) && self.float_not_neg_zero(chk, 8));
+                            if bit_exact
+                                || (finite_other
+                                    && self.sign_of_zero_unobserved(i, &uses, &used_in_term))
+                            {
+                                repl[i as usize] = Some(f);
+                                any_repl = true;
+                                changed = true;
+                                continue;
+                            }
+                        }
+                    }
+                    // Two-operand check: `select (or az, bz), +0.0, (fmul a, b)`.
+                    if let V::Inst(oi) = cond
+                        && let Op::Bin(Bin::Or, p, q) = self.insts[oi as usize].op
+                        && let (Some(pa), Some(qa)) =
+                            (self.zero_fcmp_arg(p), self.zero_fcmp_arg(q))
+                    {
+                        let ab_cmps = if self.same_bits(pa, a) && self.same_bits(qa, b) {
+                            Some((p, q))
+                        } else if self.same_bits(pa, b) && self.same_bits(qa, a) {
+                            Some((q, p))
+                        } else {
+                            None
+                        };
+                        if let Some((cmp_a, cmp_b)) = ab_cmps {
+                            let bit_exact = self.same_bits(a, b)
+                                || (nz_a && nz_b)
+                                || (fa
+                                    && fb
+                                    && self.float_pos_or_pos_zero(a, 8)
+                                    && self.float_pos_or_pos_zero(b, 8))
+                                || (pos_finite(a) && self.float_not_neg_zero(b, 8))
+                                || (pos_finite(b) && self.float_not_neg_zero(a, 8));
+                            if bit_exact {
+                                repl[i as usize] = Some(f);
+                                any_repl = true;
+                                changed = true;
+                                continue;
+                            }
+                            if self.sign_of_zero_unobserved(i, &uses, &used_in_term) {
+                                if (fa && fb) || (fa && nz_a) || (fb && nz_b) {
+                                    repl[i as usize] = Some(f);
+                                    any_repl = true;
+                                    changed = true;
+                                    continue;
+                                }
+                                if fa || fb {
+                                    let only = if fa { cmp_a } else { cmp_b };
+                                    self.insts[i as usize].op = Op::Select(only, t, f);
+                                    changed = true;
+                                    kept.push(i);
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Pattern B: `max_min` `-0 < +0` tie-breaker select -> `FMax`/`FMin`.
+                if let Some((a, b)) = self.match_max_min_tiebreaker(cond, t, f) {
+                    if self.float_nonzero(a, 8)
+                        || self.float_nonzero(b, 8)
+                        || (self.float_not_neg_zero(a, 8) && self.float_not_neg_zero(b, 8))
+                        || self.sign_of_zero_unobserved(i, &uses, &used_in_term)
+                    {
+                        repl[i as usize] = Some(f);
+                        any_repl = true;
+                        changed = true;
+                        continue;
+                    }
+                }
+
+                // Pattern C: `fract` `< 1.0` clamp when input became provably non-negative.
+                if matches!(
+                    t,
+                    V::Const(ci) if matches!(self.consts[ci as usize].1, Const::Float(0x3F7F_FFFF))
+                ) && let V::Inst(ri) = f
+                    && let Op::Call(rf, rargs) = &self.insts[ri as usize].op
+                    && self.dx_f32_op(*rf, rargs) == Some(("unary", 22))
+                    && let Some(&arg) = rargs.get(1)
+                    && let V::Inst(ci) = cond
+                    && let Op::Cmp(pred::OGE, cl, cr) = self.insts[ci as usize].op
+                    && cl == f
+                    && self.float_k(cr).is_some_and(|k| k == 1.0)
+                    && self.float_non_negative_allow_nz(arg, 8)
+                {
+                    repl[i as usize] = Some(f);
+                    any_repl = true;
+                    changed = true;
+                    continue;
+                }
+
+                kept.push(i);
+            }
+            self.blocks[b].body = kept;
+        }
+
+        if any_repl {
+            let (blocks, insts) = (&mut self.blocks, &mut self.insts);
+            for (b, blk) in blocks.iter_mut().enumerate() {
+                if !reached[b] {
+                    continue;
+                }
+                if let Some(Term::CondBr(c, t, f)) = blk.term {
+                    blk.term = Some(Term::CondBr(resolve(&repl, c), t, f));
+                }
+                for &i in blk.phis.iter().chain(&blk.body) {
+                    map_operands(&mut insts[i as usize].op, |v| resolve(&repl, v));
+                }
+            }
+        }
+        changed
     }
 
     /// [`FOLD`]: a branch on a constant goes one way. The side not taken
@@ -2471,6 +3395,90 @@ mod tests {
             raw_loads.len(),
             4,
             "pure metadata table loads must CSE across barriers/stores/blocks while regular SRV keeps both"
+        );
+    }
+
+    #[test]
+    fn elide_unobserved_zero_sign_elides_fadd_chains_and_preserves_bitcast_and_rcp() {
+        let mut m = Module::default();
+        let i32t = m.int(32);
+        let f32t = m.float();
+        let void = m.void();
+        let ld_ty = m.func_ty(f32t, vec![i32t]);
+        let bin_f32_ty = m.func_ty(f32t, vec![i32t, f32t, f32t]);
+        let st_i32_ty = m.func_ty(void, vec![i32t, i32t]);
+        let st_f32_ty = m.func_ty(void, vec![i32t, f32t]);
+        let main_ty = m.func_ty(void, vec![]);
+        for ty in [ld_ty, bin_f32_ty, st_i32_ty, st_f32_ty, main_ty] {
+            m.ptr(ty);
+        }
+        let ld = m.function("dx.op.loadInput.f32", ld_ty, Some(Attr::ReadNone), false);
+        let bin_f32 = m.function("dx.op.binary.f32", bin_f32_ty, Some(Attr::ReadNone), false);
+        let st_i32 = m.function("dx.op.bufferStore.i32", st_i32_ty, Some(Attr::NoUnwind), false);
+        let st_f32 = m.function("dx.op.bufferStore.f32", st_f32_ty, Some(Attr::NoUnwind), false);
+        m.function("main", main_ty, None, true);
+
+        let b = m.new_block();
+        let (k0, k1, k2, k3, k35) = (m.i32(0), m.i32(1), m.i32(2), m.i32(3), m.i32(35));
+        let f0 = m.f32(0);
+        let f1 = m.f32(1.0f32.to_bits());
+        let fm2 = m.f32((-2.0f32).to_bits());
+        let kmask = m.i32(0x7FFF_FFFF);
+
+        // Input 0: `legacy_mul(-2.0, x0)` -> bitcast i32 -> bitcast f32 -> `+ 1.0` -> store
+        // Sign of `-0.0` is absorbed by `+ 1.0`, so the select MUST be elided.
+        let x0 = m.call(b, ld, vec![k0]);
+        let mul0 = m.bin(b, Bin::Mul, fm2, x0);
+        let z0 = m.cmp(b, pred::OEQ, x0, f0);
+        let lm0 = m.select(b, z0, f0, mul0);
+        let lm0_i = m.cast(b, Cast::Bitcast, lm0, i32t);
+        let lm0_f = m.cast(b, Cast::Bitcast, lm0_i, f32t);
+        let sum0 = m.bin(b, Bin::Add, lm0_f, f1);
+        m.call(b, st_f32, vec![k0, sum0]);
+
+        // Input 1: `max_min(true, x1, +0.0)` -> `+ 1.0` -> store
+        // Sign of `-0.0` is absorbed by `+ 1.0`, so the 8-op tie-breaker MUST be elided.
+        let x1 = m.call(b, ld, vec![k1]);
+        let fmax1 = m.call(b, bin_f32, vec![k35, x1, f0]);
+        let ix1 = m.cast(b, Cast::Bitcast, x1, i32t);
+        let mag1 = m.bin(b, Bin::And, ix1, kmask);
+        let zeros1 = m.cmp(b, pred::EQ, mag1, k0);
+        let mm1 = m.select(b, zeros1, f0, fmax1);
+        let sum1 = m.bin(b, Bin::Add, mm1, f1);
+        m.call(b, st_f32, vec![k1, sum1]);
+
+        // Input 2: `legacy_mul(-2.0, x2)` -> bitcast i32 -> store (OBSERVES sign bit!)
+        // Must KEEP its select!
+        let x2 = m.call(b, ld, vec![k2]);
+        let mul2 = m.bin(b, Bin::Mul, fm2, x2);
+        let z2 = m.cmp(b, pred::OEQ, x2, f0);
+        let lm2 = m.select(b, z2, f0, mul2);
+        let lm2_i = m.cast(b, Cast::Bitcast, lm2, i32t);
+        m.call(b, st_i32, vec![k2, lm2_i]);
+
+        // Input 3: `legacy_mul(-2.0, x3)` -> `1.0 / r` (OBSERVES sign of zero: ±Inf!)
+        // Must KEEP its select!
+        let x3 = m.call(b, ld, vec![k3]);
+        let mul3 = m.bin(b, Bin::Mul, fm2, x3);
+        let z3 = m.cmp(b, pred::OEQ, x3, f0);
+        let lm3 = m.select(b, z3, f0, mul3);
+        let rcp3 = m.bin(b, Bin::SDiv, f1, lm3);
+        m.call(b, st_f32, vec![k3, rcp3]);
+
+        m.terminate(b, Term::Ret);
+        m.optimise(ALL);
+
+        let selects: Vec<u32> = m.blocks[0]
+            .body
+            .iter()
+            .copied()
+            .filter(|&id| matches!(m.insts[id as usize].op, Op::Select(..)))
+            .collect();
+        assert_eq!(
+            selects.len(),
+            2,
+            "expected exactly 2 selects kept (bitcast-store and 1/x) and 2 elided (fadd +1.0 chains), got {}",
+            selects.len()
         );
     }
 }

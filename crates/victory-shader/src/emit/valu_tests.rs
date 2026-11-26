@@ -2342,3 +2342,192 @@ fn typed_non_d16_table_load_preserves_integer_bits() {
         }
     }
 }
+
+#[test]
+fn legacy_mul_and_float_elisions_exact_on_gpu_with_zero_redundant_selects() {
+    // Phase 9B Track D end-to-end live-GPU + WARP + DXIL Validator test proving:
+    // 1. Sound automatic elision emits ZERO redundant `select`s for:
+    //    - `v_mul_legacy_f32(2.0, abs(v))` (positive finite const * not_neg_zero)
+    //    - `v_mad_legacy_f32(-2.0, v, 1.0)` (sign-of-zero-blind addend)
+    //    - `v_mul_legacy_f32(-2.0, v) + 1.0` (post-merge sign-of-zero elision)
+    //    - `v_max_f32(v, 1.0)` & `v_min_f32(v, -1.0)` (non-zero constant)
+    //    - `v_max_f32(v, 0.0) + 1.0` (unobserved sign-of-zero)
+    //    - `v_med3_f32(v, 0.0, 1.0)` (ordered non-NaN constants -> 2-op FMin/FMax)
+    //    - `v_fract_f32(v_max_f32(v, 0.0))` (non-negative input cannot hit 1.0)
+    // 2. Every single edge case (`0*Inf`, `2.0*NaN`, `2.0*Inf`, `2.0*0.0`,
+    //    `2.0*-0.0`, `-2.0*+0.0`, `FMin`/`FMax` NaN, `med3` NaN -> `low`)
+    //    produces exact RDNA2 bit-for-bit results on RTX hardware & WARP.
+    let v_mov_imm = |dst: u8, lit: u32| [0x7E00_02FF | ((dst as u32) << 17), lit];
+    // VOP3 with abs bit on src1 (bit 9 of word 0):
+    let vop3_abs1 = |op: u16, dst: u8, s0: u16, s1: u16, s2: u16| -> [u32; 2] {
+        [
+            0xD400_0000 | ((op as u32) << 16) | (1 << 9) | (dst as u32),
+            (s0 as u32) | ((s1 as u32) << 9) | ((s2 as u32) << 18),
+        ]
+    };
+
+    // Part A: Pure elided shader — EVERY op below is provably elidable -> 0 selects!
+    let mut w: Vec<u32> = Vec::new();
+    w.push(s_mov_b32(5, 0x80)); // s[4:5] = Table base (heap[0] = out UAV)
+    w.extend_from_slice(&s_load_dwordx4(8, 4));
+    for i in 0..4u8 {
+        w.push(vop1(0x001, 4 + i, sgpr(i))); // v4..v7 = s0..s3
+    }
+    w.extend_from_slice(&v_mov_imm(10, 2.0f32.to_bits()));
+    w.extend_from_slice(&v_mov_imm(11, (-2.0f32).to_bits()));
+    w.extend_from_slice(&v_mov_imm(12, 1.0f32.to_bits()));
+    w.extend_from_slice(&v_mov_imm(13, (-1.0f32).to_bits()));
+    w.extend_from_slice(&v_mov_imm(14, 0.0f32.to_bits()));
+    // out[0] = v_mul_legacy_f32(2.0, abs(v4))
+    w.extend_from_slice(&vop3_abs1(0x107, 15, vgpr(10), vgpr(4), 0));
+    // out[1] = v_mad_legacy_f32(-2.0, v4, 1.0)
+    w.extend_from_slice(&vop3(0x140, 16, vgpr(11), vgpr(4), vgpr(12)));
+    // out[2] = v_mul_legacy_f32(-2.0, v4) + 1.0
+    w.extend_from_slice(&vop3(0x107, 17, vgpr(11), vgpr(4), 0));
+    w.extend_from_slice(&vop3(0x103, 17, vgpr(17), vgpr(12), 0));
+    // out[3] = v_max_f32(v5, 1.0)
+    w.extend_from_slice(&vop3(0x110, 18, vgpr(5), vgpr(12), 0));
+    // out[4] = v_min_f32(v5, -1.0)
+    w.extend_from_slice(&vop3(0x10F, 19, vgpr(5), vgpr(13), 0));
+    // out[5] = v_med3_f32(v5, 0.0, 1.0)
+    w.extend_from_slice(&vop3(0x157, 20, vgpr(5), vgpr(14), vgpr(12)));
+    // out[6] = v_fract_f32(v_max_f32(v6, 0.0))
+    w.extend_from_slice(&vop3(0x110, 21, vgpr(6), vgpr(14), 0));
+    w.push(vop1(0x020, 21, vgpr(21)));
+    // out[7] = v_max_f32(v6, 0.0) + 1.0
+    w.extend_from_slice(&vop3(0x110, 22, vgpr(6), vgpr(14), 0));
+    w.extend_from_slice(&vop3(0x103, 22, vgpr(22), vgpr(12), 0));
+    for (idx, reg) in (15u8..=22).enumerate() {
+        w.extend_from_slice(&buffer_store_dword(reg, 8, (idx as u16) * 4));
+    }
+    w.push(S_ENDPGM);
+
+    let (shader, selects) = lower_m0_test_cs(&w, 24);
+    assert_eq!(
+        selects, 0,
+        "all 8 sound float patterns must emit 0 selects under default settings, got {selects}"
+    );
+
+    let f = f32::to_bits;
+    let pz = f(0.0);
+    let nz = f(-0.0);
+    let nan = 0x7FC0_0000u32;
+    let inf = f(f32::INFINITY);
+    let ninf = f(f32::NEG_INFINITY);
+
+    // Helper that runs on both hardware & WARP, checking NaN outputs by `is_nan`
+    // (hardware canonicalizes qNaN to 0x7FFF_FFFF, WARP to 0x7FC0_0000) and all
+    // non-NaN outputs bit-for-bit.
+    let check_m0 = |sh: &HostShader, inp: [u32; 4], want: &[Option<u32>], label: &str| {
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        for (backend, warp) in [("hardware", false), ("warp", true)] {
+            let Ok(host) = Host::new(warp) else { continue };
+            let (root, pso) = host
+                .compute_pipeline(sh)
+                .unwrap_or_else(|e| panic!("{backend} {label}: pipeline failed: {e}"));
+            let mut ud = vec![0u32; sh.user_data_dwords().max(4) as usize];
+            ud[..4].copy_from_slice(&inp);
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &[View::RawUav(want.len() as u32)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{backend} {label}: dispatch failed: {e}"));
+            for (i, &w) in want.iter().enumerate() {
+                let got = out[0][i];
+                match w {
+                    Some(exp) => assert_eq!(
+                        got, exp,
+                        "{backend} {label} out[{i}]: got {got:#010x} ({:?}), want {exp:#010x} ({:?})",
+                        f32::from_bits(got),
+                        f32::from_bits(exp),
+                    ),
+                    None => assert!(
+                        f32::from_bits(got).is_nan(),
+                        "{backend} {label} out[{i}]: got {got:#010x} ({:?}), want NaN",
+                        f32::from_bits(got),
+                    ),
+                }
+            }
+        }
+    };
+
+    // Case 1: v4 = -0.0, v5 = NaN, v6 = -5.0
+    check_m0(
+        &shader,
+        [nz, nan, f(-5.0), 0],
+        &[
+            Some(pz),
+            Some(f(1.0)),
+            Some(f(1.0)),
+            Some(f(1.0)),
+            Some(f(-1.0)),
+            Some(pz),
+            Some(pz),
+            Some(f(1.0)),
+        ],
+        "case1(-0,NaN,-5)",
+    );
+
+    // Case 2: v4 = +Inf, v5 = -2.5, v6 = 3.25
+    check_m0(
+        &shader,
+        [inf, f(-2.5), f(3.25), 0],
+        &[
+            Some(inf),
+            Some(ninf),
+            Some(ninf),
+            Some(f(1.0)),
+            Some(f(-2.5)),
+            Some(pz),
+            Some(f(0.25)),
+            Some(f(4.25)),
+        ],
+        "case2(+Inf,-2.5,3.25)",
+    );
+
+    // Case 3: v4 = NaN, v5 = 0.5, v6 = NaN
+    check_m0(
+        &shader,
+        [nan, f(0.5), nan, 0],
+        &[
+            None,
+            None,
+            None,
+            Some(f(1.0)),
+            Some(f(-1.0)),
+            Some(f(0.5)),
+            Some(pz),
+            Some(f(1.0)),
+        ],
+        "case3(NaN,0.5,NaN)",
+    );
+
+    // Part B: Verify dynamic `0 * Inf` and `2.0 * (-0.0)` direct-store STILL
+    // preserve exact RDNA2 `+0.0` (never over-elided!).
+    let mut w2: Vec<u32> = Vec::new();
+    w2.push(s_mov_b32(5, 0x80));
+    w2.extend_from_slice(&s_load_dwordx4(8, 4));
+    for i in 0..4u8 {
+        w2.push(vop1(0x001, 4 + i, sgpr(i)));
+    }
+    w2.extend_from_slice(&v_mov_imm(10, 2.0f32.to_bits()));
+    // out[0] = v4 * v5 (0 * Inf -> +0.0)
+    w2.extend_from_slice(&vop3(0x107, 11, vgpr(4), vgpr(5), 0));
+    // out[1] = 2.0 * v4 (2.0 * NaN -> NaN, 2.0 * Inf -> Inf, 2.0 * -0.0 -> +0.0)
+    w2.extend_from_slice(&vop3(0x107, 12, vgpr(10), vgpr(4), 0));
+    w2.extend_from_slice(&buffer_store_dword(11, 8, 0));
+    w2.extend_from_slice(&buffer_store_dword(12, 8, 4));
+    w2.push(S_ENDPGM);
+    let (sh2, _) = lower_m0_test_cs(&w2, 16);
+    check_m0(&sh2, [pz, inf, 0, 0], &[Some(pz), Some(pz)], "0*Inf & 2*0");
+    check_m0(&sh2, [nz, inf, 0, 0], &[Some(pz), Some(pz)], "-0*Inf & 2*-0");
+    check_m0(&sh2, [nan, pz, 0, 0], &[Some(pz), None], "NaN*0 & 2*NaN");
+    check_m0(&sh2, [inf, f(1.0), 0, 0], &[Some(inf), Some(inf)], "Inf*1 & 2*Inf");
+}

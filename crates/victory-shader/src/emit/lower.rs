@@ -949,18 +949,24 @@ impl<'a> Lower<'a> {
             }
             let local_waves = exchange.is_some() && LOCAL_WAVES.get();
             // Intra-half layout operations (`ds_swizzle`, DPP, `v_permlane*`,
-            // lane-constant masks) require `wave_base` relabelling so host
-            // lanes hold consecutive console thread IDs; `wave_local` shaders
-            // without them can use hardware `SV_GroupThreadID` and
-            // `waveGetLaneIndex` directly with zero TGSM and zero entry barrier.
-            let in_half_layout = p.blocks.iter().any(|blk| {
-                blk.insts.iter().any(|inst| {
-                    let n = inst.name();
-                    n.starts_with("ds_swizzle")
-                        || n.starts_with("v_permlane")
-                        || matches!(&inst.fields, Fields::Valu(v) if v.dpp.is_some())
+            // `v_readlane_b32`/`v_writelane_b32`, permute, lane-constant masks)
+            // and any LDS usage (`raw_lds_dwords > 0`) keep `wave_base`
+            // relabelling so host lanes match the console's exact thread
+            // layout; `wave_local` shaders without them use hardware
+            // `SV_GroupThreadID` and `waveGetLaneIndex` directly with zero TGSM
+            // and zero entry barrier.
+            let in_half_layout = raw_lds_dwords > 0
+                || p.blocks.iter().any(|blk| {
+                    blk.insts.iter().any(|inst| {
+                        let n = inst.name();
+                        n.starts_with("ds_swizzle")
+                            || n.starts_with("v_permlane")
+                            || matches!(n, "v_readlane_b32" | "v_writelane_b32")
+                            || n.contains("permute")
+                            || matches!(&inst.fields, Fields::Valu(v) if v.dpp.is_some())
+                    })
                 })
-            }) || lane_constant_masks(x.st);
+                || lane_constant_masks(x.st);
             let halves_needed = wave == 32 && x.native.wave64 && (!local_waves || in_half_layout);
             let reserved_dwords = u32::from(halves_needed) + exchange_dwords;
             let max_console = MAX_LDS_DWORDS.saturating_sub(reserved_dwords);
@@ -3139,6 +3145,16 @@ impl<'a> Lower<'a> {
     fn max_min(&mut self, max: bool, a: V, b: V) -> V {
         let c = self.cur;
         let r = self.binary(if max { 35 } else { 36 }, a, b);
+        // The `-0 < +0` tie-breaker only affects the case where BOTH operands
+        // are `±0.0` with opposite signs. If either operand is provably non-zero,
+        // or neither can be `-0.0`, plain DXIL `FMax`/`FMin` is 100% bit-exact.
+        if (super::rdna_float() & super::rdna::MAX_MIN != 0)
+            || self.s.m.float_nonzero(a, 8)
+            || self.s.m.float_nonzero(b, 8)
+            || (self.s.m.float_not_neg_zero(a, 8) && self.s.m.float_not_neg_zero(b, 8))
+        {
+            return r;
+        }
         let (ia, ib) = (self.as_int(a), self.as_int(b));
         let either = self.s.m.bin(c, Bin::Or, ia, ib);
         let magnitude = self.s.m.i32(0x7FFF_FFFF);
@@ -3272,16 +3288,58 @@ impl<'a> Lower<'a> {
     /// is the smallest number among them).
     fn med3(&mut self, a: V, b: V, third: V) -> V {
         let c = self.cur;
+        // Between two non-NaN constants `low <= high`, `FMin(FMax(v, low), high)`
+        // returns `low` when `v` is NaN (because DXIL FMax/FMin skips NaN),
+        // matching RDNA2's min-of-non-NaNs rule in 2 ops instead of 17.
+        let k = [a, b, third].map(|x| self.s.m.float_k(x));
+        if let [Some(x), Some(y), Some(z)] = k
+            && !x.is_nan()
+            && !y.is_nan()
+            && !z.is_nan()
+        {
+            let mut arr = [x, y, z];
+            arr.sort_by(f32::total_cmp);
+            return self.s.m.f32(arr[1].to_bits());
+        }
+        let ordered = match k {
+            [_, Some(x), Some(y)] if !x.is_nan() && !y.is_nan() => Some((a, b, third, x, y)),
+            [Some(x), _, Some(y)] if !x.is_nan() && !y.is_nan() => Some((b, a, third, x, y)),
+            [Some(x), Some(y), _] if !x.is_nan() && !y.is_nan() => Some((third, a, b, x, y)),
+            _ => None,
+        };
+        if let Some((v, p, q, x, y)) = ordered {
+            if x == y {
+                if x.to_bits() == y.to_bits() {
+                    return p;
+                }
+            } else {
+                let (low, high) = if x < y { (p, q) } else { (q, p) };
+                let t = self.binary(35, v, low);
+                return self.binary(36, t, high);
+            }
+        }
         let lo = self.binary(36, a, b);
         let hi = self.binary(35, a, b);
         let t = self.binary(36, hi, third);
         let median = self.binary(35, lo, t);
+        if super::rdna_float() & super::rdna::MED3 != 0 {
+            return median;
+        }
+        // Only test `is_nan_f32` for operands that can actually be NaN.
+        let mut nan: Option<V> = None;
+        for x in [a, b, third] {
+            if !self.s.m.not_nan(x, 8) {
+                let nx = self.is_nan_f32(x);
+                nan = Some(match nan {
+                    Some(prev) => self.s.m.bin(c, Bin::Or, prev, nx),
+                    None => nx,
+                });
+            }
+        }
+        let Some(nan) = nan else {
+            return median;
+        };
         let least = self.binary(36, lo, third);
-        let nan_a = self.is_nan_f32(a);
-        let nan_b = self.is_nan_f32(b);
-        let nan_3 = self.is_nan_f32(third);
-        let nan_ab = self.s.m.bin(c, Bin::Or, nan_a, nan_b);
-        let nan = self.s.m.bin(c, Bin::Or, nan_ab, nan_3);
         self.s.m.select(c, nan, least, median)
     }
 
@@ -3294,6 +3352,15 @@ impl<'a> Lower<'a> {
     fn fract(&mut self, a: V, threshold: f32, below_one: f32) -> V {
         let c = self.cur;
         let r = self.unary(22, a);
+        // Only tiny negative inputs `(-2^-24, 0)` can round `a - floor(a)` up
+        // to 1.0; any provably non-negative input (or NaN/+Inf) already yields
+        // `< 1.0` (or NaN) from host `Frc` directly.
+        if below_one == f32::from_bits(0x3F7F_FFFF)
+            && (self.s.m.float_non_negative_allow_nz(a, 8)
+                || (super::rdna_float() & super::rdna::FRACT != 0))
+        {
+            return r;
+        }
         let limit = self.s.m.f32(threshold.to_bits());
         let k = self.s.m.f32(below_one.to_bits());
         let over = self.s.m.cmp(c, pred::OGE, r, limit);
@@ -3342,22 +3409,76 @@ impl<'a> Lower<'a> {
 
     /// `0 × anything = 0`, as in D3D9.
     fn legacy_mul(&mut self, a: V, b: V) -> V {
+        self.legacy_mul_inner(a, b, false)
+    }
+
+    /// `0 × anything = 0`, as in D3D9. When `sign_of_zero_blind` is true (e.g.
+    /// `v_mad_legacy_f32` / `v_mac_legacy_f32` whose addend is provably not
+    /// `-0.0`), `+0.0` vs `-0.0` is mathematically unobservable so finite or
+    /// non-zero-finite operands drop the zero select guard completely.
+    fn legacy_mul_inner(&mut self, a: V, b: V, sign_of_zero_blind: bool) -> V {
         let c = self.cur;
-        let fa = self.s.m.float_value(a);
-        let fb = self.s.m.float_value(b);
-        if fa.is_some_and(|x| x == 0.0) || fb.is_some_and(|x| x == 0.0) {
+        let ka = self.s.m.float_k(a);
+        let kb = self.s.m.float_k(b);
+        if ka.is_some_and(|x| x == 0.0) || kb.is_some_and(|x| x == 0.0) {
             return self.s.m.f32(0);
+        }
+        if let (Some(x), Some(y)) = (ka, kb) {
+            return self.s.m.f32((x * y).to_bits());
         }
         // `x * x` is bit-for-bit identical to IEEE `fmul` across all 2^32 f32
         // patterns (`(±0)^2 = +0`, `(±Inf)^2 = +Inf`, `NaN^2 = NaN`).
-        if self.s.m.same_bits(a, b) || (super::rdna_float() & super::rdna::LEGACY != 0) {
+        if self.s.m.same_bits(a, b) {
+            return self.s.m.bin(c, Bin::Mul, a, b);
+        }
+        let fa = self.s.m.bounded(a, 12).is_some();
+        let fb = self.s.m.bounded(b, 12).is_some();
+        let nz_a = self.s.m.float_nonzero(a, 8);
+        let nz_b = self.s.m.float_nonzero(b, 8);
+        let nz_finite = |k: Option<f32>| k.is_some_and(|x| x != 0.0 && x.is_finite());
+        let pos_finite = |k: Option<f32>| k.is_some_and(|x| x > 0.0 && x.is_finite());
+        // 100% bit-exact (including `+0.0` vs `-0.0` sign bit):
+        // - Neither operand can be `±0.0`.
+        // - Both operands are provably finite and non-negative (`>= +0.0`, never `-0.0`).
+        // - One operand is a positive finite constant and the other is never `-0.0`.
+        if (nz_a && nz_b)
+            || (fa
+                && fb
+                && self.s.m.float_pos_or_pos_zero(a, 8)
+                && self.s.m.float_pos_or_pos_zero(b, 8))
+            || (pos_finite(ka) && self.s.m.float_not_neg_zero(b, 8))
+            || (pos_finite(kb) && self.s.m.float_not_neg_zero(a, 8))
+        {
             return self.s.m.bin(c, Bin::Mul, a, b);
         }
         let m = self.s.m.bin(c, Bin::Mul, a, b);
+        if super::rdna_float() & super::rdna::LEGACY != 0 {
+            return m;
+        }
         let zero = self.s.m.f32(0);
-        let az = self.s.m.cmp(c, pred::OEQ, a, zero);
-        let bz = self.s.m.cmp(c, pred::OEQ, b, zero);
-        let z = self.s.m.bin(c, Bin::Or, az, bz);
+        if sign_of_zero_blind {
+            // `0 * Inf/NaN` cannot occur when both factors are finite, or when
+            // either factor is finite and non-zero.
+            if (fa && fb) || (fa && nz_a) || (fb && nz_b) || nz_finite(ka) || nz_finite(kb) {
+                return m;
+            }
+            // When only one factor is finite, only that factor being 0 can
+            // collide with Inf/NaN in the other.
+            if fa || fb {
+                let finite = if fa { a } else { b };
+                let z = self.s.m.cmp(c, pred::OEQ, finite, zero);
+                return self.s.m.select(c, z, zero, m);
+            }
+        }
+        let z = match (nz_a, nz_b) {
+            (true, false) => self.s.m.cmp(c, pred::OEQ, b, zero),
+            (false, true) => self.s.m.cmp(c, pred::OEQ, a, zero),
+            _ => {
+                let az = self.s.m.cmp(c, pred::OEQ, a, zero);
+                let bz = self.s.m.cmp(c, pred::OEQ, b, zero);
+                self.s.m.bin(c, Bin::Or, az, bz)
+            }
+        };
         self.s.m.select(c, z, zero, m)
     }
 

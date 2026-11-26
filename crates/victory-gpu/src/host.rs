@@ -390,6 +390,103 @@ impl UploadRing {
         *batch_used = new_used;
         Some((offset, end))
     }
+
+    /// Reserves one contiguous `[offset, end)` slice in the write-only ring
+    /// buffer (with one fence retire/wait check instead of one per dirty range)
+    /// and returns `(offset, end, mapped_base_ptr)`. Caller populates strictly
+    /// disjoint sub-slices within `[offset, end)` before releasing the ring lock.
+    fn reserve_batch(
+        &mut self,
+        bytes: u64,
+        align: u64,
+        batch_used: &mut u64,
+        copy_fence: &ID3D12Fence,
+        copy_event: HANDLE,
+        direct_fence: Option<(&ID3D12Fence, HANDLE)>,
+    ) -> Option<(u64, u64, *mut u8)> {
+        let (offset, end, new_used) =
+            plan_ring_alloc(self.head, self.size, bytes, align, *batch_used)?;
+        let query = || {
+            // SAFETY: plain fence queries.
+            let c = unsafe { copy_fence.GetCompletedValue() };
+            let d = direct_fence.map_or(u64::MAX, |(f, _)| unsafe { f.GetCompletedValue() });
+            (c, d)
+        };
+        let (c, d) = query();
+        self.retire(c, d);
+        while let Some((target, is_direct)) = self
+            .in_flight
+            .iter()
+            .find(|f| f.start < f.end && f.start < end && offset < f.end)
+            .map(|f| (f.fence, f.direct))
+        {
+            if is_direct {
+                if let Some((df, de)) = direct_fence {
+                    Self::wait_fence(df, de, target);
+                } else {
+                    break;
+                }
+            } else {
+                Self::wait_fence(copy_fence, copy_event, target);
+            }
+            let (c, d) = query();
+            self.retire(c, d);
+        }
+        self.head = end;
+        *batch_used = new_used;
+        // SAFETY: `[offset, end)` lies within the mapped ring buffer.
+        Some((offset, end, unsafe { self.data.add(offset as usize) }))
+    }
+}
+
+/// Coalesces strictly overlapping or touching (`a2 <= b1`) dirty byte ranges
+/// without bridging gaps (which could overwrite live in-flight shader writes).
+fn coalesce_dirty_ranges(ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    if ranges.is_empty() {
+        return Vec::new();
+    }
+    if ranges.len() == 1 {
+        let (a, b) = ranges[0];
+        return if a < b { vec![(a, b)] } else { Vec::new() };
+    }
+    let strictly_sorted_disjoint = ranges
+        .windows(2)
+        .all(|w| w[0].0 < w[0].1 && w[1].0 < w[1].1 && w[0].1 < w[1].0);
+    if strictly_sorted_disjoint {
+        return ranges.to_vec();
+    }
+    let mut sorted: Vec<(usize, usize)> = ranges.iter().copied().filter(|&(a, b)| a < b).collect();
+    sorted.sort_unstable_by_key(|&(a, _)| a);
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(sorted.len());
+    for (a, b) in sorted {
+        match merged.last_mut() {
+            Some(last) if a <= last.1 => last.1 = last.1.max(b),
+            _ => merged.push((a, b)),
+        }
+    }
+    merged
+}
+
+/// Coalesces consecutive staged `CopyBufferRegion` entries that target the
+/// same buffer with strictly contiguous destination AND ring offsets.
+fn coalesce_staged_copies(copies: &[(usize, u64, u64, u64)]) -> Vec<(usize, u64, u64, u64)> {
+    let mut out: Vec<(usize, u64, u64, u64)> = Vec::with_capacity(copies.len());
+    for &(entry_idx, dst_off, ring_off, chunk) in copies {
+        if chunk == 0 {
+            continue;
+        }
+        match out.last_mut() {
+            Some(last)
+                if last.0 == entry_idx
+                    && last.1 + last.3 == dst_off
+                    && last.2 + last.3 == ring_off =>
+            {
+                last.3 += chunk;
+            }
+            _ => out.push((entry_idx, dst_off, ring_off, chunk)),
+        }
+    }
+    out
 }
 
 /// Computes `(offset, end, new_batch_used)` for staging `bytes` aligned to
@@ -4816,93 +4913,150 @@ impl Host {
         if !dirty.iter().any(|(_, r)| !r.is_empty()) {
             return Ok(None);
         }
+        /// Minimum total dirty payload (512 KiB) or range count (`64`) to fan
+        /// `UploadRing` writes across worker threads instead of copying inline.
+        const PARALLEL_MIN_BYTES: u64 = 512 << 10;
+        const PARALLEL_MIN_RANGES: usize = 64;
+        /// Sub-chunk size (256 KiB) for splitting single huge dirty ranges
+        /// across worker threads while preserving one contiguous `CopyBufferRegion`.
+        const PARALLEL_CHUNK_BYTES: usize = 256 << 10;
+
         let staged = self.with_upload_ring(|ring| -> Result<Option<(u64, Vec<(usize, u64, u64, u64)>)>, ()> {
             let half = ring.size / 2;
-            let mut total_bytes: u64 = 0;
-            let mut padded_bytes: u64 = 0;
-            for (shadow, ranges) in dirty {
-                if !shadow.carded() {
-                    continue;
-                }
-                for &(a, b) in ranges {
-                    let len = b.saturating_sub(a) as u64;
-                    if len > 0 {
-                        total_bytes = total_bytes.saturating_add(len);
-                        padded_bytes = padded_bytes.saturating_add(len.next_multiple_of(64));
-                    }
-                }
-            }
-            if total_bytes == 0 {
-                return Ok(None);
-            }
-            if half == 0 || padded_bytes > half {
-                // Oversized burst (> half the ring including 64-byte alignment
-                // padding): let `async_upload_dirty` split it cleanly across
-                // multiple COPY queue ring slots without touching `sync`.
-                return Err(());
-            }
-            let prev_head = ring.head;
-            let mut copies: Vec<(usize, u64, u64, u64)> = Vec::new();
-            let mut spans: Vec<(u64, u64)> = Vec::new();
+            let mut planned: Vec<(usize, usize, usize, u64)> = Vec::new();
             let mut keep: Vec<KeptResource> = Vec::new();
-            let mut batch_used: u64 = 0;
+            let mut total_bytes: u64 = 0;
+            let mut packed_cursor: u64 = 0;
             for (entry_idx, (shadow, ranges)) in dirty.iter().enumerate() {
                 if ranges.is_empty() || !shadow.carded() {
                     continue;
                 }
-                let mut kept_shadow = false;
-                for &(a, b) in ranges {
-                    if a >= b {
-                        continue;
-                    }
+                let merged = coalesce_dirty_ranges(ranges);
+                if merged.is_empty() {
+                    continue;
+                }
+                keep.push(KeptResource(shadow.buffer.clone()));
+                for (a, b) in merged {
                     let chunk = (b - a) as u64;
-                    let Some((off, end)) = ring.stage_write(
-                        chunk,
-                        64,
-                        &mut batch_used,
-                        upload_fence,
-                        self.upload_event,
-                        Some((direct_fence, self.direct_ring_event)),
-                        |dst| {
-                            // SAFETY: `dst` holds `chunk` writable bytes in `UploadRing`,
-                            // and `[a, b)` lies inside `shadow`. Streams directly from
-                            // Title RAM under `VICTORY_REBAR_STREAM=1`, else from `Card::staging`.
-                            unsafe { shadow.copy_dirty_to_ring(a, dst, chunk as usize) };
-                        },
-                    ) else {
-                        ring.head = prev_head;
-                        return Err(());
-                    };
-                    copies.push((entry_idx, a as u64, off, chunk));
-                    match spans.last_mut() {
-                        Some(last) if off == last.1 => last.1 = end,
-                        _ => spans.push((off, end)),
-                    }
-                    if !kept_shadow {
-                        keep.push(KeptResource(shadow.buffer.clone()));
-                        kept_shadow = true;
-                    }
+                    // Align each range to 64 bytes for clean WC write-combining
+                    // line separation across worker threads (no false sharing).
+                    let rel_off = packed_cursor.next_multiple_of(64);
+                    packed_cursor = rel_off.saturating_add(chunk);
+                    total_bytes = total_bytes.saturating_add(chunk);
+                    planned.push((entry_idx, a, b - a, rel_off));
                 }
             }
-            if copies.is_empty() {
+            if total_bytes == 0 || planned.is_empty() {
                 return Ok(None);
             }
-            let val = self.direct_ring_value.fetch_add(1, Ordering::AcqRel) + 1;
-            let last = spans.len().saturating_sub(1);
-            let mut keep_opt = Some(keep);
-            for (idx, (start, end)) in spans.into_iter().enumerate() {
-                ring.in_flight.push_back(RingFlight {
-                    start,
-                    end,
-                    fence: val,
-                    direct: true,
-                    _keep: if idx == last {
-                        keep_opt.take().unwrap_or_default()
-                    } else {
-                        Vec::new()
-                    },
-                });
+            if half == 0 || packed_cursor > half {
+                // Oversized burst (> half the ring including alignment padding):
+                // let `async_upload_dirty` split it across multiple COPY batches.
+                return Err(());
             }
+            let prev_head = ring.head;
+            let mut batch_used: u64 = 0;
+            let Some((ring_base, ring_end, base_ptr)) = ring.reserve_batch(
+                packed_cursor,
+                64,
+                &mut batch_used,
+                upload_fence,
+                self.upload_event,
+                Some((direct_fence, self.direct_ring_event)),
+            ) else {
+                ring.head = prev_head;
+                return Err(());
+            };
+
+            let mut copies: Vec<(usize, u64, u64, u64)> = Vec::with_capacity(planned.len());
+            for &(entry_idx, a, len, rel_off) in &planned {
+                copies.push((entry_idx, a as u64, ring_base + rel_off, len as u64));
+            }
+            let copies = coalesce_staged_copies(&copies);
+
+            let parallel = total_bytes >= PARALLEL_MIN_BYTES || planned.len() >= PARALLEL_MIN_RANGES;
+            if !parallel {
+                for &(entry_idx, a, len, rel_off) in &planned {
+                    // SAFETY: `[rel_off, rel_off + len)` lies inside the reserved ring slice.
+                    unsafe {
+                        dirty[entry_idx]
+                            .0
+                            .copy_dirty_to_ring(a, base_ptr.add(rel_off as usize), len);
+                    }
+                }
+            } else {
+                // Build flat sub-tasks (splitting huge single ranges >= 512 KiB into
+                // 256 KiB slices) and partition by byte weight into contiguous runs so
+                // each worker streams WC `GPU_UPLOAD` memory sequentially with zero
+                // 64-byte write-combining line sharing.
+                let mut tasks: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, usize)> =
+                    Vec::with_capacity(planned.len());
+                for &(entry_idx, a, len, rel_off) in &planned {
+                    let shadow = &dirty[entry_idx].0;
+                    if len >= PARALLEL_CHUNK_BYTES * 2 {
+                        let mut done = 0usize;
+                        while done < len {
+                            let piece = (len - done).min(PARALLEL_CHUNK_BYTES);
+                            tasks.push((shadow.clone(), a + done, rel_off as usize + done, piece));
+                            done += piece;
+                        }
+                    } else {
+                        tasks.push((shadow.clone(), a, rel_off as usize, len));
+                    }
+                }
+                let workers = std::thread::available_parallelism()
+                    .map_or(4, |p| p.get() / 4)
+                    .clamp(2, 6)
+                    .min(tasks.len());
+                if workers <= 1 {
+                    for (shadow, a, rel_off, len) in &tasks {
+                        // SAFETY: disjoint reserved ring slice.
+                        unsafe { shadow.copy_dirty_to_ring(*a, base_ptr.add(*rel_off), *len) };
+                    }
+                } else {
+                    // Partition `tasks` into `workers` contiguous ranges balanced by bytes.
+                    let target = (total_bytes as usize).div_ceil(workers);
+                    let mut bounds: Vec<(usize, usize)> = Vec::with_capacity(workers);
+                    let mut start = 0usize;
+                    let mut acc = 0usize;
+                    for (idx, task) in tasks.iter().enumerate() {
+                        acc += task.3;
+                        let remaining_parts = workers - bounds.len();
+                        let remaining_tasks = tasks.len() - (idx + 1);
+                        if remaining_parts > 1 && (acc >= target || remaining_tasks < remaining_parts - 1) {
+                            bounds.push((start, idx + 1));
+                            start = idx + 1;
+                            acc = 0;
+                        }
+                    }
+                    if start < tasks.len() {
+                        bounds.push((start, tasks.len()));
+                    }
+                    let tasks = std::sync::Arc::new(tasks);
+                    let bounds = std::sync::Arc::new(bounds);
+                    let base_addr = base_ptr as usize;
+                    let n_parts = bounds.len();
+                    crate::shadow::wide_each(n_parts, move |part| {
+                        let (lo, hi) = bounds[part];
+                        for (shadow, a, rel_off, len) in &tasks[lo..hi] {
+                            // SAFETY: every `(rel_off, len)` is strictly disjoint inside the
+                            // reserved ring slice and `base_addr` stays mapped across `wide_each`.
+                            unsafe {
+                                shadow.copy_dirty_to_ring(*a, (base_addr + *rel_off) as *mut u8, *len);
+                            }
+                        }
+                    });
+                }
+            }
+
+            let val = self.direct_ring_value.fetch_add(1, Ordering::AcqRel) + 1;
+            ring.in_flight.push_back(RingFlight {
+                start: ring_base,
+                end: ring_end,
+                fence: val,
+                direct: true,
+                _keep: keep,
+            });
             Ok(Some((val, copies)))
         });
         match staged {
@@ -5548,11 +5702,12 @@ impl Host {
                             };
                             if staged_val.is_none() && !copied_async && !ranges.is_empty() {
                                 if let Some(staging) = shadow.card_staging_for_fallback() {
-                                    for &(a, b) in ranges {
+                                    let merged = coalesce_dirty_ranges(ranges);
+                                    for &(a, b) in &merged {
                                         list.CopyBufferRegion(&shadow.buffer, a as u64, &staging, a as u64, (b - a) as u64);
                                         crate::shadow::CARD_STATS[0].fetch_add((b - a) as u64, Ordering::Relaxed);
                                     }
-                                    crate::shadow::CARD_STATS[1].fetch_add(ranges.len() as u64, Ordering::Relaxed);
+                                    crate::shadow::CARD_STATS[1].fetch_add(merged.len() as u64, Ordering::Relaxed);
                                 }
                             }
                             let Some(before) = before else {
@@ -6845,7 +7000,7 @@ impl Host {
         let t_deferred = std::time::Instant::now();
         let air = if late { line().written.clone() } else { Vec::new() };
         if refresh_front() {
-            batch.refresh_front(runs, &parts);
+            batch.refresh_front(runs, &parts, &air);
         }
         for list in runs {
             list.run_deferred(&mut batch, &air, |i| own.as_ref().is_some_and(|own| own.takes(list, i)));
@@ -7380,6 +7535,7 @@ impl HostList {
 
     /// Whether a global `UAV(NULL)` barrier is currently pending on this list
     /// (read-only query; does not clear the flag).
+    #[cfg(test)]
     pub(crate) fn uav_dirty(&self) -> bool {
         self.uav_dirty.load(Ordering::Relaxed)
     }
@@ -8735,14 +8891,14 @@ impl Batch {
 
     /// Before the steps of `runs` ([`refresh_front`]), a new part of the
     /// submission beginning at each of `parts`.
-    fn refresh_front(&mut self, runs: &[&HostList], parts: &[usize]) {
+    fn refresh_front(&mut self, runs: &[&HostList], parts: &[usize], air: &[(usize, usize)]) {
         let mut copies: std::collections::HashMap<usize, std::sync::Arc<crate::shadow::Shadow>> =
             std::collections::HashMap::new();
         let mut due = Vec::new();
-        let mut touches = Vec::new();
+        let mut touches_list = Vec::new();
         'steps: for (n, list) in runs.iter().enumerate() {
             if parts.contains(&n) {
-                touches.push(Touch::Part);
+                touches_list.push(Touch::Part);
             }
             let mut last = 0;
             for step in &list.deferred().copies {
@@ -8753,22 +8909,34 @@ impl Batch {
                             copies.entry(key).or_insert_with(|| shadow.clone());
                             last = key;
                         }
-                        touches.push(Touch::Refresh(key, *at, *at + *len));
+                        touches_list.push(Touch::Refresh(key, *at, *at + *len));
                     }
                     Step::GpuWrite(shadow, ..) => {
-                        touches.push(Touch::Write(std::sync::Arc::as_ptr(shadow) as usize));
+                        touches_list.push(Touch::Write(std::sync::Arc::as_ptr(shadow) as usize));
                     }
                     Step::Texture(staging) if wide_textures() => {
                         if self.texture_due(staging) {
                             due.push(staging.clone());
                         }
                     }
-                    Step::Copy(..) | Step::Run(_) | Step::Placed(_) => break 'steps,
+                    Step::Placed(p) => {
+                        // A placed copy touching in-flight shader writes (`!free`)
+                        // runs purely on the GPU and never mutates CPU title memory
+                        // or calls `batch.title_written()`: treat it like a GPU
+                        // write to `p.shadow` instead of aborting parallel refresh.
+                        let free = !touches(air, p.src, p.src + p.len)
+                            && !touches(air, p.dst, p.dst + p.len);
+                        if free {
+                            break 'steps;
+                        }
+                        touches_list.push(Touch::Write(std::sync::Arc::as_ptr(&p.shadow) as usize));
+                    }
+                    Step::Copy(..) | Step::Run(_) => break 'steps,
                     _ => {}
                 }
             }
         }
-        let spans: Vec<_> = front_spans(touches.into_iter())
+        let spans: Vec<_> = front_spans(touches_list.into_iter())
             .into_iter()
             .filter_map(|(key, from, to)| Some((copies.remove(&key)?, from, to)))
             .collect();
@@ -10457,5 +10625,31 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
 
         // SAFETY: freeing test allocation.
         unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn coalesce_dirty_ranges_merges_touching_without_bridging_gaps() {
+        assert_eq!(super::coalesce_dirty_ranges(&[]), vec![]);
+        assert_eq!(super::coalesce_dirty_ranges(&[(10, 10)]), vec![]);
+        // Strictly disjoint gaps MUST stay separate (never overwrite shader-written gaps).
+        assert_eq!(
+            super::coalesce_dirty_ranges(&[(0, 16), (20, 32), (64, 128)]),
+            vec![(0, 16), (20, 32), (64, 128)]
+        );
+        // Touching and overlapping ranges merge cleanly even when unsorted.
+        assert_eq!(
+            super::coalesce_dirty_ranges(&[(64, 96), (0, 16), (16, 32), (24, 48), (100, 100), (96, 128)]),
+            vec![(0, 48), (64, 128)]
+        );
+        // Contiguous CopyBufferRegion coalescing preserves gaps and distinct buffers.
+        assert_eq!(
+            super::coalesce_staged_copies(&[
+                (0, 100, 0, 64),
+                (0, 164, 64, 32),
+                (0, 200, 96, 16), // dst gap -> must NOT merge
+                (1, 216, 112, 16), // different buffer -> must NOT merge
+            ]),
+            vec![(0, 100, 0, 96), (0, 200, 96, 16), (1, 216, 112, 16)]
+        );
     }
 }

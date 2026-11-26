@@ -54,11 +54,10 @@ fn resolve_skip_flags(
     activate_rays_env: Option<&str>,
 ) -> (bool, bool) {
     let skip_rt = !bvh_builder && rt_resolve_env.is_none_or(|v| v.trim() == "0");
-    let skip_activate = if bvh_builder {
-        activate_rays_env.is_some_and(|v| v.trim() == "0")
-    } else {
-        activate_rays_env.is_none_or(|v| v.trim() == "0")
-    };
+    // `CS_ScreenProbes_ActivateRays` does not trace BVH rays; it initializes and
+    // clears 5 ScreenProbes GI UAVs consumed by non-BVH voxel/fallback passes,
+    // so keep it enabled by default and only skip on explicit `VICTORY_ACTIVATE_RAYS=0`.
+    let skip_activate = activate_rays_env.is_some_and(|v| v.trim() == "0");
     (skip_rt, skip_activate)
 }
 
@@ -213,8 +212,10 @@ pub(crate) fn waiting() -> u64 {
 /// queues it on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     if p.left_out.is_some() {
+        crate::draw::set_last_left_out(true);
         return None;
     }
+    crate::draw::set_last_left_out(false);
     // A still-pending pipeline was requested by the title too. Prewarm it
     // on the next launch, even if this run never got to use it.
     if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
@@ -541,21 +542,25 @@ mod tests {
             left_out_with(shaders, sr, sa)
         };
 
-        // Default (BVH=0): both dead RT shaders are skipped; normal shaders are not.
+        // Default (BVH=0): CS_RaytracingResolve is skipped, while CS_ScreenProbes_ActivateRays
+        // stays enabled because it initializes 5 ScreenProbes GI UAVs for non-BVH passes.
         assert!(check(&rt_resolve, false, None, None).is_some());
-        assert!(check(&activate, false, None, None).is_some());
+        assert!(check(&activate, false, None, None).is_none());
         assert!(check(&normal, false, None, None).is_none());
 
-        // Explicit overrides re-enable them.
+        // Explicit overrides toggle both cleanly.
         assert!(check(&rt_resolve, false, Some("1"), None).is_none());
-        assert!(check(&activate, false, None, Some("1")).is_none());
+        assert!(check(&activate, false, None, Some("0")).is_some());
 
         // With BVH=1: both enabled by default, unless VICTORY_ACTIVATE_RAYS=0.
         assert!(check(&rt_resolve, true, None, None).is_none());
         assert!(check(&activate, true, None, None).is_none());
         assert!(check(&activate, true, None, Some("0")).is_some());
 
-        // Pending::new marks left_out and short-circuits ready()/now()/early() without queuing.
+        // Pending::new marks left_out and short-circuits ready()/now()/early() without queuing,
+        // while keeping `CS_ScreenProbes_ActivateRays` enabled.
+        let p_act = Arc::new(Pending::new(activate, None));
+        assert!(p_act.left_out.is_none());
         let p = Arc::new(Pending::new(rt_resolve, None));
         assert!(p.left_out.is_some());
         assert!(ready(&p).is_none());

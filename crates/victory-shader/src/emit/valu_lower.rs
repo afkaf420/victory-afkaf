@@ -474,7 +474,8 @@ impl<'a> Lower<'a> {
                         self.s.m.bin(c, Bin::Add, m, acc)
                     }
                     _ => {
-                        let m = self.legacy_mul(a, bb);
+                        let blind = self.s.m.float_not_neg_zero(acc, 8);
+                        let m = self.legacy_mul_inner(a, bb, blind);
                         self.s.m.bin(c, Bin::Add, m, acc)
                     }
                 };
@@ -483,7 +484,8 @@ impl<'a> Lower<'a> {
             "v_mad_f32" | "v_madak_f32" | "v_madmk_f32" | "v_mad_legacy_f32" => {
                 let (a, bb, cc) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
                 let m = if name == "v_mad_legacy_f32" {
-                    self.legacy_mul(a, bb)
+                    let blind = self.s.m.float_not_neg_zero(cc, 8);
+                    self.legacy_mul_inner(a, bb, blind)
                 } else {
                     self.s.m.bin(c, Bin::Mul, a, bb)
                 };

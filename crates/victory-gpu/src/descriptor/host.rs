@@ -200,8 +200,75 @@ pub(crate) struct HostHeap {
 
 /// The spans of every view heap made ([`HostHeap::placed`]), for the
 /// texture code, which has no heap at hand ([`next_start`],
-/// [`first_viewed`]).
+/// [`first_viewed`], [`overlaps_placed_texture`]).
 static PLACED_SPANS: Mutex<Vec<std::sync::Weak<Mutex<Spans>>>> = Mutex::new(Vec::new());
+
+/// Monotonic generation bumped whenever a placed texture span is added to any
+/// view heap, letting `lazy_readback` cache negative texture-overlap checks on
+/// its O(1) steady-state fast path without locking `PLACED_SPANS`.
+static PLACED_SPANS_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Current placed-texture span generation (`Acquire` pairs with `Release` bumps).
+#[inline]
+pub(crate) fn placed_spans_gen() -> u64 {
+    PLACED_SPANS_GEN.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Fast read-only check: true if `[at, at + len)` overlaps any active placed
+/// texture descriptor span across any view heap. Uses atomic `SPANNED` bounds
+/// for an O(1) lock-free reject when outside all placed textures.
+pub(crate) fn overlaps_placed_texture(at: usize, len: usize) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    if len == 0 {
+        return false;
+    }
+    let start = at as u64;
+    let end = at.saturating_add(len) as u64;
+    if end <= SPANNED[0].load(Relaxed) || start >= SPANNED[1].load(Relaxed) {
+        return false;
+    }
+    let heaps = PLACED_SPANS.lock().unwrap_or_else(|e| e.into_inner());
+    heaps.iter().filter_map(std::sync::Weak::upgrade).any(|spans| {
+        spans
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .has_overlap(start, end)
+    })
+}
+
+/// RAII test helper registering a synthetic active placed texture span `[start, end)`
+/// in `PLACED_SPANS` and pruning it on drop.
+#[cfg(test)]
+pub(crate) struct TestPlacedSpanGuard {
+    _spans: std::sync::Arc<Mutex<Spans>>,
+}
+
+#[cfg(test)]
+impl Drop for TestPlacedSpanGuard {
+    fn drop(&mut self) {
+        // Drop our strong Arc reference via clearing the span first, then prune dead Weaks.
+        self._spans.lock().unwrap_or_else(|e| e.into_inner()).forget(0);
+        PLACED_SPANS_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
+        PLACED_SPANS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|w| w.strong_count() > 0);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_register_placed_span(start: u64, end: u64) -> TestPlacedSpanGuard {
+    use std::sync::atomic::Ordering::Relaxed;
+    let spans = std::sync::Arc::new(Mutex::new(Spans::default()));
+    SPANNED[0].fetch_min(start, Relaxed);
+    SPANNED[1].fetch_max(end, Relaxed);
+    spans.lock().unwrap_or_else(|e| e.into_inner()).note(0, start, end, true);
+    PLACED_SPANS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(std::sync::Arc::downgrade(&spans));
+    TestPlacedSpanGuard { _spans: spans }
+}
 
 /// Where the next texture placed inside `[start, end)` starts, past the
 /// first bytes of the one at `start` ([`HEAD`]): what is there of the
@@ -633,7 +700,24 @@ impl Spans {
         }
         self.by_start.entry(start).or_insert_with(|| (end, Default::default())).1.insert(index);
         self.by_slot.insert(index, start);
+        PLACED_SPANS_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
         stale
+    }
+
+    /// True if any active placed texture span overlaps `[start, end)`.
+    fn has_overlap(&self, start: u64, end: u64) -> bool {
+        if start >= end {
+            return false;
+        }
+        if self
+            .by_start
+            .range(..start)
+            .next_back()
+            .is_some_and(|(_, span)| span.0 > start)
+        {
+            return true;
+        }
+        self.by_start.range(start..end).next().is_some()
     }
 
     /// The view in slot `index` starts at level `first` of its texture.

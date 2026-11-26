@@ -85,13 +85,22 @@ thread_local! {
 /// that picks its sources by index: whatever was not on the card then was
 /// baked as nothing, once, for the run. On the console a texture is there
 /// when its bytes are.
+/// Resolves `(early_ms, bake_ms)` from optional env strings (`VICTORY_EARLY_TEXTURES_MS`
+/// default `12`, `VICTORY_BAKE_TEXTURES_MS` default `8000` — TDR-safe via 128 MiB
+/// `cut_for_tdr_now` slices so large cutscene-entry bake bursts drain `due` to 0).
+fn resolve_early_budgets(early_env: Option<&str>, bake_env: Option<&str>) -> (u64, u64) {
+    let parse = |env: Option<&str>, default: u64| {
+        env.and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default)
+    };
+    (parse(early_env, 12), parse(bake_env, 8000))
+}
+
 fn early_budgets() -> (u64, u64) {
     static MS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
     *MS.get_or_init(|| {
-        let ms = |name: &str, default: u64| {
-            std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default)
-        };
-        (ms("VICTORY_EARLY_TEXTURES_MS", 12), ms("VICTORY_BAKE_TEXTURES_MS", 1500))
+        let early = std::env::var("VICTORY_EARLY_TEXTURES_MS").ok();
+        let bake = std::env::var("VICTORY_BAKE_TEXTURES_MS").ok();
+        resolve_early_budgets(early.as_deref(), bake.as_deref())
     })
 }
 
@@ -115,6 +124,53 @@ static EARLY_BAKED_MS: AtomicU64 = AtomicU64::new(0);
 /// `VICTORY_LIST_CHUNK_OPS` is active, preventing multi-gigabyte bake bursts
 /// from tripping Windows' 2.0 s WDDM TDR.
 const CHUNK_TEXTURE_BYTES: u64 = 128 << 20;
+
+/// Step result from [`State::step_early_textures`] guiding `list.rs::flush_early_textures`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StepEarly {
+    Done,
+    Continue { needs_cut: bool },
+}
+
+/// Summary of one `heap_textures_chunked` slice (at most 4,096 due slots).
+#[derive(Clone, Copy, Debug, Default)]
+struct TextureChunkOutcome {
+    done_bytes: u64,
+    hit_cap: bool,
+    remaining_due: u64,
+    uploaded: u64,
+    handled: u64,
+}
+
+impl TextureChunkOutcome {
+    fn progressed(&self) -> bool {
+        self.uploaded > 0 || self.done_bytes > 0 || self.handled > 0
+    }
+}
+
+/// Decides whether an early/bake texture pass should run another slice.
+/// For decoration bakes (`bake == true`), continues draining whenever more due
+/// slots remain beyond a 4,096-slot batch (`remaining_due > 0`) and forward
+/// progress was made, even if the slice stayed below `CHUNK_TEXTURE_BYTES` (`!hit_cap`).
+fn early_pass_next_step(
+    bake: bool,
+    outcome: TextureChunkOutcome,
+    uploaded_bytes: u64,
+    total_bytes: u64,
+    elapsed_ms: u64,
+    total_ms: u64,
+) -> StepEarly {
+    if uploaded_bytes >= total_bytes || elapsed_ms >= total_ms {
+        return StepEarly::Done;
+    }
+    if outcome.hit_cap {
+        return StepEarly::Continue { needs_cut: true };
+    }
+    if bake && outcome.remaining_due > 0 && outcome.progressed() {
+        return StepEarly::Continue { needs_cut: false };
+    }
+    StepEarly::Done
+}
 
 /// Active early/bake texture upload pass split across TDR-safe `HostList`
 /// chunks by `list.rs::flush_early_textures`.
@@ -1652,38 +1708,61 @@ impl State {
             return Some(gpu);
         }
         let started = std::time::Instant::now();
-        // Per host heap: the host copy and range each slot's buffer view
-        // reads, kept from pass to pass. Only the slots written since the
-        // last pass are looked at again (83,000 slots a pass otherwise, 0.1 s
-        // at best); all of them every 16 passes, because a view of a
-        // released resource goes stale without a write, and a slot written
-        // before its memory had a host copy is only made then.
+        // Per host heap: incrementally track buffer views across frames without
+        // clearing & rescanning all ~83,000 slots every 16 passes (which caused
+        // periodic ~200 ms stalls on thin-list worker threads). Changed slots are
+        // processed immediately via `buffer_changes()`, previously unready slots
+        // are retried from `pending`, and a tiny rotating `HEAP_BUFFER_SWEEP_BATCH`
+        // (512 slots/pass) retires views of released resources without spikes.
+        // Coalesced per-shadow `spans` are only rebuilt when `ranges` mutates.
         type Ranges = std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
-        static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, Ranges)>>> =
+        #[derive(Default)]
+        struct HeapBufferCache {
+            initialized: bool,
+            ranges: Ranges,
+            pending: Vec<u32>,
+            sweep: IncrementalSweep,
+            spans: Vec<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)>,
+            spans_dirty: bool,
+        }
+        static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, HeapBufferCache>>> =
             std::sync::Mutex::new(None);
         let mut kept = RANGES.lock().unwrap_or_else(|e| e.into_inner());
-        let (passes, ranges) = kept
+        let cache = kept
             .get_or_insert_with(Default::default)
             .entry(std::ptr::from_ref(host) as usize)
-            .or_insert_with(|| (0, Ranges::new()));
+            .or_default();
         let changed = host.buffer_changes();
-        let slots = if *passes % 16 == 0 {
-            ranges.clear();
-            host.buffer_slots()
+        let slots = if !cache.initialized {
+            cache.initialized = true;
+            let all = host.buffer_slots();
+            cache.sweep.reset(all.clone());
+            all
         } else {
-            changed
+            let mut work = changed;
+            if !cache.pending.is_empty() {
+                work.append(&mut cache.pending);
+            }
+            cache.sweep.take_batch(&mut work, || host.buffer_slots());
+            work.sort_unstable();
+            work.dedup();
+            work
         };
-        *passes += 1;
         // Whether the device was there before the pass: a view that removes
         // it is named below.
         static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let mut alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
         for (n, &index) in slots.iter().enumerate() {
-            ranges.remove(&index);
             let Some(handle) = heap.handle(index) else {
+                if cache.ranges.remove(&index).is_some() {
+                    cache.spans_dirty = true;
+                }
                 continue;
             };
             let Some(view) = host.mirror(index, handle, true) else {
+                if cache.ranges.remove(&index).is_some() {
+                    cache.spans_dirty = true;
+                }
                 continue;
             };
             // Every 64 views while the device lives (a cheap query).
@@ -1704,26 +1783,44 @@ impl State {
             // The copy the slot shows (`buffer_copy`), not the one the
             // view's range alone would find.
             let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
+                if cache.ranges.remove(&index).is_some() {
+                    cache.spans_dirty = true;
+                }
+                // Retry slots written before their backing buffer shadow existed.
+                if cache.pending.len() < HEAP_BUFFER_PENDING_CAP {
+                    cache.pending.push(index);
+                }
                 continue;
             };
             #[cfg(feature = "diagnostics")]
             if host.shows(index, &shadow.buffer) == Some(false) {
                 HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
             }
-            ranges.insert(index, (shadow, address, address + len));
+            let end = address + len;
+            let unchanged = cache.ranges.get(&index).is_some_and(|(prev_s, prev_from, prev_to)| {
+                std::sync::Arc::ptr_eq(prev_s, &shadow) && *prev_from == address && *prev_to == end
+            });
+            if !unchanged {
+                cache.ranges.insert(index, (shadow, address, end));
+                cache.spans_dirty = true;
+            }
         }
-        let views = ranges.len() as u32;
-        // Per host copy, the span its picked views cover.
-        let mut spans: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
-            std::collections::HashMap::new();
-        for (shadow, from, to) in ranges.values() {
-            let key = std::sync::Arc::as_ptr(shadow) as usize;
-            let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
-            span.1 = span.1.min(*from);
-            span.2 = span.2.max(*to);
+        let views = cache.ranges.len() as u32;
+        if cache.spans_dirty {
+            let mut spans: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
+                std::collections::HashMap::new();
+            for (shadow, from, to) in cache.ranges.values() {
+                let key = std::sync::Arc::as_ptr(shadow) as usize;
+                let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
+                span.1 = span.1.min(*from);
+                span.2 = span.2.max(*to);
+            }
+            cache.spans = spans.into_values().collect();
+            cache.spans_dirty = false;
         }
+        let spans = cache.spans.clone();
         drop(kept);
-        let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
+        let bytes: u64 = spans.iter().map(|s| s.2 - s.1).sum();
         // Memory that is not write-watched is copied whole by every refresh.
         // It was once refreshed only every 120 frames (unmapped pages read
         // one by one cost 14 GB a frame in run 11, before they were
@@ -1734,7 +1831,7 @@ impl State {
         static WHOLE: std::sync::Mutex<Option<std::collections::HashMap<usize, u64>>> = std::sync::Mutex::new(None);
         let mut whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner());
         let whole = whole.get_or_insert_with(Default::default);
-        for (shadow, from, to) in spans.values() {
+        for (shadow, from, to) in &spans {
             if shadow.unwatched() {
                 // By the copy's number: a copy made where one let go was
                 // (`shadow::let_go_idle`) has never been refreshed.
@@ -1925,12 +2022,12 @@ impl State {
         list: &HostList,
         pass: &mut EarlyPass,
         chunk_ops: u32,
-    ) -> bool {
+    ) -> StepEarly {
         let elapsed_ms = pass.started.elapsed().as_millis() as u64;
         let left_ms = pass.total_ms.saturating_sub(elapsed_ms);
         let left_bytes = pass.total_bytes.saturating_sub(pass.uploaded_bytes);
         if left_ms == 0 || left_bytes == 0 {
-            return false;
+            return StepEarly::Done;
         }
         let Some(heap) = self
             .heaps
@@ -1939,10 +2036,10 @@ impl State {
             .map(|&h| crate::descriptor::heap(h as This))
             .find(|h| !h.samplers())
         else {
-            return false;
+            return StepEarly::Done;
         };
         let Some(host) = heap.host() else {
-            return false;
+            return StepEarly::Done;
         };
         if pass.bake && pass.uploaded_bytes == 0 {
             crate::texture::BAKING.set(true);
@@ -1952,20 +2049,24 @@ impl State {
         }
         let chunk_bytes = if chunk_ops > 0 { CHUNK_TEXTURE_BYTES } else { u64::MAX };
         PASS_BUDGET.set(Some((left_ms, left_bytes)));
-        let (done_bytes, hit_cap) =
-            self.heap_textures_chunked(list, heap, host, chunk_ops, chunk_bytes);
+        let outcome = self.heap_textures_chunked(list, heap, host, chunk_ops, chunk_bytes);
         PASS_BUDGET.set(None);
-        pass.uploaded_bytes = pass.uploaded_bytes.saturating_add(done_bytes);
-        let more = hit_cap
-            && pass.uploaded_bytes < pass.total_bytes
-            && (pass.started.elapsed().as_millis() as u64) < pass.total_ms;
+        pass.uploaded_bytes = pass.uploaded_bytes.saturating_add(outcome.done_bytes);
+        let next = early_pass_next_step(
+            pass.bake,
+            outcome,
+            pass.uploaded_bytes,
+            pass.total_bytes,
+            pass.started.elapsed().as_millis() as u64,
+            pass.total_ms,
+        );
         if pass.bake {
-            if !more {
+            if matches!(next, StepEarly::Done) {
                 self.flush_for_bake(list, host);
             }
             crate::texture::BAKING.set(false);
         }
-        more
+        next
     }
 
     pub(crate) fn finish_early_textures(pass: EarlyPass) {
@@ -1998,11 +2099,11 @@ impl State {
             EARLY_BAKED_MS.store(0, Ordering::Relaxed);
         }
         let left = bake_ms.saturating_sub(EARLY_BAKED_MS.load(Ordering::Relaxed));
-        let budget = if bake && left > 0 {
+        let budget: (u64, u64) = if bake && left > 0 {
             // What a bake may read must be there now: up to 2 GiB.
-            (left, 2 << 30)
+            (left, 2u64 << 30)
         } else if first && early_ms > 0 {
-            (early_ms, 64 << 20)
+            (early_ms, 64u64 << 20)
         } else {
             return;
         };
@@ -2034,17 +2135,42 @@ impl State {
         let began = std::time::Instant::now();
         let chunk_ops = if bake { 0 } else { crate::list::list_chunk_ops() };
         let chunk_bytes = if chunk_ops > 0 { CHUNK_TEXTURE_BYTES } else { u64::MAX };
-        PASS_BUDGET.set(Some(budget));
         if bake {
             crate::texture::BAKING.set(true);
             self.flush_for_bake(list, host);
         }
-        self.heap_textures_chunked(list, heap, host, chunk_ops, chunk_bytes);
+        let mut uploaded_bytes = 0u64;
+        loop {
+            let elapsed_ms = began.elapsed().as_millis() as u64;
+            let left_ms = budget.0.saturating_sub(elapsed_ms);
+            let left_bytes = budget.1.saturating_sub(uploaded_bytes);
+            if left_ms == 0 || left_bytes == 0 {
+                break;
+            }
+            PASS_BUDGET.set(Some((left_ms, left_bytes)));
+            let outcome = self.heap_textures_chunked(list, heap, host, chunk_ops, chunk_bytes);
+            PASS_BUDGET.set(None);
+            uploaded_bytes = uploaded_bytes.saturating_add(outcome.done_bytes);
+            if !bake
+                || matches!(
+                    early_pass_next_step(
+                        true,
+                        outcome,
+                        uploaded_bytes,
+                        budget.1,
+                        began.elapsed().as_millis() as u64,
+                        budget.0,
+                    ),
+                    StepEarly::Done
+                )
+            {
+                break;
+            }
+        }
         if bake {
             self.flush_for_bake(list, host);
             crate::texture::BAKING.set(false);
         }
-        PASS_BUDGET.set(None);
         if bake {
             EARLY_BAKED_MS.fetch_add(began.elapsed().as_millis() as u64, Ordering::Relaxed);
         }
@@ -2146,10 +2272,10 @@ impl State {
         host: &crate::descriptor::host::HostHeap,
         chunk_ops: u32,
         chunk_bytes: u64,
-    ) -> (u64, bool) {
+    ) -> TextureChunkOutcome {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_TEXTURES").is_none_or(|v| v != "0")) {
-            return (0, false);
+            return TextureChunkOutcome::default();
         }
         /// Bytes of texture memory staged per frame.
         // `VICTORY_TEXTURE_STAGE_MB` raises it: a backlog of tens of thousands of
@@ -2198,6 +2324,7 @@ impl State {
         }
         host.texture_slots_short(frame);
         let (due, census) = host.texture_slots_due(frame, 4096);
+        let initial_due = census[1];
         HEAP_TEXTURES_WAITING.store(census[0], Ordering::Relaxed);
         for (count, now) in HEAP_TEXTURES_QUEUE.iter().zip(census) {
             count.store(now, Ordering::Relaxed);
@@ -2264,6 +2391,8 @@ impl State {
         // else has been done yet, to avoid starvation).
         let mut done_bytes: u64 = 0;
         let mut hit_chunk_cap = false;
+        let mut uploaded: u64 = 0;
+        let mut handled: u64 = 0;
         for (index, write) in due {
             if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
                 break;
@@ -2294,15 +2423,22 @@ impl State {
             // first look for the rest of the run. The look reads 48 KiB;
             // only a changed texture is uploaded again.
             // `VICTORY_HEAP_RECHECK=0`: uploaded once, as before.
-            if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
+            if let Some((at, len, print, looks, uploaded_frame)) = host.texture_slot_checked(index) {
                 if crate::texture::fingerprint(at, len) == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
                     match RECHECK_FRAMES.get(usize::from(looks) + 1) {
-                        Some(wait) => {
-                            host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks + 1, uploaded)
-                        }
+                        Some(wait) => host.texture_slot_recheck(
+                            index,
+                            write,
+                            frame + wait,
+                            (at, len),
+                            print,
+                            looks + 1,
+                            uploaded_frame,
+                        ),
                         None => host.texture_slot_done(index, write, None),
                     }
+                    handled += 1;
                     continue;
                 }
                 let n = HEAP_TEXTURES_RECHECKED[1].fetch_add(1, Ordering::Relaxed);
@@ -2311,7 +2447,7 @@ impl State {
                         slot = index,
                         address = format_args!("{at:#x}"),
                         bytes = len,
-                        frames_after_upload = frame.saturating_sub(uploaded),
+                        frames_after_upload = frame.saturating_sub(uploaded_frame),
                         looks,
                         changed = n + 1,
                         "a texture picked by index changed after its upload with nothing to tell of it: uploaded again"
@@ -2328,16 +2464,18 @@ impl State {
                 if mapped == 0 {
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
                     // Only immediately unmake (clearing the slot to a solid-black
-                    // null SRV) if we lack VRAM headroom (`!room`) or the slot's
-                    // descriptor record changed from its currently-uploaded view.
-                    // Otherwise keep the existing host texture alive across
-                    // `UNMAPPED_GRACE_LOOKS` consecutive unmapped looks so transient
-                    // streaming remaps do not flash black.
-                    let same_view = heap.handle(index).is_some_and(|h| host.texture_slot_made_from(index, h));
+                    // null SRV) if we lack VRAM headroom (`!room`) or the slot now
+                    // describes a completely different texture. Treat mip-streaming
+                    // rewrites of the SAME placed texture (`texture_slot_shows_other`)
+                    // as `same_view` so transient streaming remaps receive full grace.
+                    let same_view = heap.handle(index).is_some_and(|h| {
+                        host.texture_slot_made_from(index, h) || host.texture_slot_shows_other(index, h)
+                    });
                     if unmapped_grace_should_evict(slot_key, write, same_view, room) {
                         host.texture_slot_gone(index);
                     }
                     host.texture_slot_later(index, write, frame, most);
+                    handled += 1;
                     continue;
                 }
                 unmapped_grace_clear(slot_key);
@@ -2346,6 +2484,7 @@ impl State {
                     if mapped <= host.texture_slot_mapped(index) {
                         HEAP_TEXTURES_PARTLY[0].fetch_add(1, Ordering::Relaxed);
                         host.texture_slot_later(index, write, frame, most);
+                        handled += 1;
                         continue;
                     }
                     if !crate::texture::committed(address as *const u8, 1) {
@@ -2363,6 +2502,7 @@ impl State {
                 && !crate::resource::title_fills(object as This)
             {
                 host.texture_slot_done(index, write, None);
+                handled += 1;
                 continue;
             }
             // From here on a host texture is made: not without room. The
@@ -2455,6 +2595,7 @@ impl State {
                 _ => {
                     at_once();
                     host.texture_slot_done(index, write, None);
+                    handled += 1;
                     continue;
                 }
             };
@@ -2467,6 +2608,7 @@ impl State {
                 at_once();
                 // a render target, a depth or unordered access texture: the host's own
                 host.texture_slot_done(index, write, None);
+                handled += 1;
                 continue;
             }
             // A texture that has a staging buffer now is one draws read
@@ -2502,6 +2644,7 @@ impl State {
                     }
                     None => host.texture_slot_done(index, write, again),
                 }
+                handled += 1;
                 continue;
             }
             // The first upload of a fresh texture no list has used: offload to
@@ -2553,7 +2696,13 @@ impl State {
                 let text: String = format!("{view:?}").chars().take(300).collect();
                 tracing::error!(why, slot = index, "the host device went while textures picked by index were made ready; last: {text}");
                 crate::host::log_removal_context();
-                return (done_bytes, false);
+                return TextureChunkOutcome {
+                    done_bytes,
+                    hit_cap: false,
+                    remaining_due: 0,
+                    uploaded,
+                    handled,
+                };
             }
             let (bytes, whole) = crate::texture::staged(resource, there.is_none()).unwrap_or((0, true));
             // Not all of it there: looked at again next frame, and from
@@ -2574,6 +2723,7 @@ impl State {
                 // detile and upload all of it once more.
                 HEAP_TEXTURES_TABLED.fetch_add(1, Ordering::Relaxed);
                 host.texture_slot_done(index, write, again);
+                handled += 1;
                 continue;
             }
             // Uploaded: the list holds the staging buffer until it has run;
@@ -2589,6 +2739,8 @@ impl State {
             crate::texture::unstage(resource);
             SPENT.fetch_add(bytes, Ordering::Relaxed);
             done_bytes = done_bytes.saturating_add(bytes);
+            uploaded += 1;
+            handled += 1;
             HEAP_TEXTURE_BYTES.fetch_add(bytes, Ordering::Relaxed);
             HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);
             match memory {
@@ -2600,7 +2752,15 @@ impl State {
                 None => host.texture_slot_done(index, write, again),
             }
         }
-        (done_bytes, hit_chunk_cap)
+        let remaining_due = initial_due.saturating_sub(handled);
+        HEAP_TEXTURES_QUEUE[1].store(remaining_due, Ordering::Relaxed);
+        TextureChunkOutcome {
+            done_bytes,
+            hit_cap: hit_chunk_cap,
+            remaining_due,
+            uploaded,
+            handled,
+        }
     }
 
     /// For the frame listing, after a dropped dispatch's line: its group
@@ -3635,28 +3795,51 @@ impl State {
     }
 }
 
+thread_local! {
+    /// Whether the most recent `pipeline::make::ready` call on this thread
+    /// returned `None` because the pipeline is intentionally `left_out`.
+    static LAST_LEFT_OUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) fn set_last_left_out(v: bool) {
+    LAST_LEFT_OUT.with(|c| c.set(v));
+}
+
+fn take_last_left_out() -> bool {
+    LAST_LEFT_OUT.with(|c| c.replace(false))
+}
+
+/// Outcome of [`State::execute_indirect`]: distinguishes intentionally skipped
+/// `left_out` pipelines (e.g., BVH-less RT resolve shaders) from real indirect drops.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IndirectOutcome {
+    Ran,
+    LeftOut,
+    Dropped,
+}
+
 impl State {
     /// Indirect execution of a one-argument signature of `kind` (PC
     /// numbering: 0 draw, 1 indexed draw, 2 dispatch, 10 mesh dispatch) with
     /// records `stride` bytes apart at title address `arguments`, and the
     /// record count at `count` if the title gives one: the GPU reads them
     /// from the buffer's host copy, where earlier dispatches may have
-    /// written them. False if it cannot run on the host.
+    /// written them.
     pub(crate) fn execute_indirect(
         &mut self,
         list: &HostList,
         (kind, stride, max): (u32, u32, u32),
         arguments: u64,
         count: Option<u64>,
-    ) -> bool {
+    ) -> IndirectOutcome {
         // Skip before the argument clamp can mutate the indirect buffer.
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             crate::pipeline::note_drop(self.pipeline as This);
-            return false;
+            return IndirectOutcome::Dropped;
         }
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
-            return false;
+            return IndirectOutcome::Dropped;
         }
         const DRAW: u32 = 0;
         const INDEXED: u32 = 1;
@@ -3667,9 +3850,12 @@ impl State {
         #[cfg(not(feature = "diagnostics"))]
         let why = |_: &str| {};
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            if take_last_left_out() {
+                return IndirectOutcome::LeftOut;
+            }
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
-            return false;
+            return IndirectOutcome::Dropped;
         };
         // Indirect rectangles (the title's tiled lighting, 256
         // indirect draws a frame, makes their corners from the vertex
@@ -3699,19 +3885,19 @@ impl State {
                 "pipeline mismatch (compute {}, mesh {}, topology {})",
                 p.compute, p.mesh, self.topology
             ));
-            return false;
+            return IndirectOutcome::Dropped;
         }
         let len = u64::from(stride) * u64::from(max.max(1));
         let Some(args) = crate::shadow::find_any(arguments, len) else {
             why("arguments outside title buffers");
-            return false;
+            return IndirectOutcome::Dropped;
         };
         let counter = match count {
             Some(at) => match crate::shadow::find_any(at, 4) {
                 Some(s) => Some((s, at)),
                 None => {
                     why("count outside title buffers");
-                    return false;
+                    return IndirectOutcome::Dropped;
                 }
             },
             None => None,
@@ -3721,11 +3907,11 @@ impl State {
             .flatten()
         else {
             why("no host signature");
-            return false;
+            return IndirectOutcome::Dropped;
         };
         if kind == MESH && (mesh_test() == 1 || !mesh_kept(self.pipeline)) {
             why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
-            return false;
+            return IndirectOutcome::Dropped;
         }
         // Track batched indirect clamping (`VICTORY_INDIRECT_BATCH`).
         let batch = if batches() > 0 && max == 1 && count.is_none() {
@@ -3807,7 +3993,7 @@ impl State {
                 let Some(bounded) = bounded else {
                     self.window = None;
                     why("not bounded (no clamp, or arguments not 4-byte aligned)");
-                    return false;
+                    return IndirectOutcome::Dropped;
                 };
                 self.host_pipeline = 0;
                 self.host_roots[1] = 0;
@@ -3832,7 +4018,7 @@ impl State {
         };
         if !ran {
             why("prepare failed");
-            return false;
+            return IndirectOutcome::Dropped;
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {
@@ -3873,7 +4059,7 @@ impl State {
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
-        true
+        IndirectOutcome::Ran
     }
 
     /// A compute dispatch ran and may have written indirect argument buffers.
@@ -4276,11 +4462,41 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
     }
 }
 
+/// Rotating incremental slice size for `heap_buffers` stale-slot sweeping
+/// (replaces the old 83,000-slot full-heap clear every 16 frames).
+const HEAP_BUFFER_SWEEP_BATCH: usize = 512;
+const HEAP_BUFFER_PENDING_CAP: usize = 512;
+
+#[derive(Default)]
+struct IncrementalSweep {
+    slots: Vec<u32>,
+    cursor: usize,
+}
+
+impl IncrementalSweep {
+    fn reset(&mut self, slots: Vec<u32>) {
+        self.slots = slots;
+        self.cursor = 0;
+    }
+
+    /// Appends up to `HEAP_BUFFER_SWEEP_BATCH` slots from the rotating snapshot
+    /// into `out`, refreshing the snapshot from `refresh` once a full cycle completes.
+    fn take_batch(&mut self, out: &mut Vec<u32>, refresh: impl FnOnce() -> Vec<u32>) {
+        if self.cursor >= self.slots.len() {
+            self.slots = refresh();
+            self.cursor = 0;
+        }
+        let end = (self.cursor + HEAP_BUFFER_SWEEP_BATCH).min(self.slots.len());
+        out.extend_from_slice(&self.slots[self.cursor..end]);
+        self.cursor = end;
+    }
+}
+
 /// Consecutive `mapped == 0` looks tolerated before unmaking an already-uploaded
-/// placed texture slot (while VRAM has room and the descriptor record still
-/// matches the uploaded view). Prevents transient streaming remaps from flashing
-/// live slots to solid-black null SRVs.
-const UNMAPPED_GRACE_LOOKS: u8 = 16;
+/// placed texture slot (while VRAM has room and the descriptor still views the
+/// same placed texture). Prevents transient streaming remaps and mip rewrites
+/// from flashing live slots to solid-black null SRVs.
+const UNMAPPED_GRACE_LOOKS: u8 = 64;
 
 #[derive(Default)]
 struct UnmappedGrace {
@@ -4341,10 +4557,11 @@ mod state_tests {
 
     #[test]
     fn unmapped_grace_holds_uploaded_slot_until_threshold_and_resets_on_remap() {
+        assert_eq!(UNMAPPED_GRACE_LOOKS, 64);
         let mut grace = UnmappedGrace::default();
         let key = (0x1000usize, 7u32);
 
-        // First 15 consecutive unmapped looks keep the existing uploaded SRV alive.
+        // First 63 consecutive unmapped looks keep the existing uploaded SRV alive.
         for _ in 1..UNMAPPED_GRACE_LOOKS {
             assert!(!grace.should_evict(key, 42, true, true));
         }
@@ -4353,11 +4570,17 @@ mod state_tests {
         for _ in 1..UNMAPPED_GRACE_LOOKS {
             assert!(!grace.should_evict(key, 42, true, true));
         }
-        // The 16th consecutive unmapped look evicts the stale slot and clears tracking.
-        assert!(grace.should_evict(key, 42, true, true));
+        // A mip-streaming rewrite of the SAME placed texture (`texture_slot_shows_other`
+        // sets `same_view == true` while bumping `write`) preserves grace instead of
+        // immediately nulling the slot to black!
+        for _ in 1..UNMAPPED_GRACE_LOOKS {
+            assert!(!grace.should_evict(key, 43, true, true));
+        }
+        // The 64th consecutive unmapped look evicts the stale slot and clears tracking.
+        assert!(grace.should_evict(key, 43, true, true));
         assert!(grace.seen.is_empty());
 
-        // Losing VRAM headroom (`!room`) or changing descriptor record (`!same_view`)
+        // Losing VRAM headroom (`!room`) or switching to an unrelated texture (`!same_view`)
         // evicts immediately even mid-grace.
         assert!(!grace.should_evict(key, 99, true, true));
         assert!(grace.should_evict(key, 99, true, false));
@@ -4366,6 +4589,102 @@ mod state_tests {
         assert!(!grace.should_evict(key, 100, true, true));
         assert!(grace.should_evict(key, 100, false, true));
         assert!(grace.seen.is_empty());
+    }
+
+    #[test]
+    fn bake_early_pass_drains_over_4096_due_slots_under_128mib_without_premature_exit() {
+        assert_eq!(resolve_early_budgets(None, None), (12, 8000));
+        assert_eq!(resolve_early_budgets(Some("20"), Some("3000")), (20, 3000));
+
+        // 8,527 due slots across 3 slices of <= 4,096 slots, each only 40 MiB (< 128 MiB -> !hit_cap).
+        let slice1 = TextureChunkOutcome {
+            done_bytes: 40 << 20,
+            hit_cap: false,
+            remaining_due: 4431,
+            uploaded: 4096,
+            handled: 4096,
+        };
+        assert_eq!(
+            early_pass_next_step(true, slice1, 40 << 20, 2 << 30, 500, 8000),
+            StepEarly::Continue { needs_cut: false },
+            "bake must continue draining remaining 4,431 slots even when slice < 128 MiB"
+        );
+        // Non-bake early pass does NOT keep looping once !hit_cap.
+        assert_eq!(
+            early_pass_next_step(false, slice1, 40 << 20, 64 << 20, 5, 12),
+            StepEarly::Done
+        );
+        // When TDR chunk cap IS hit, caller must cut the list before continuing.
+        let slice_capped = TextureChunkOutcome {
+            done_bytes: CHUNK_TEXTURE_BYTES,
+            hit_cap: true,
+            remaining_due: 3000,
+            uploaded: 1200,
+            handled: 1200,
+        };
+        assert_eq!(
+            early_pass_next_step(true, slice_capped, CHUNK_TEXTURE_BYTES, 2 << 30, 1200, 8000),
+            StepEarly::Continue { needs_cut: true }
+        );
+        // Zero remaining due slots ends cleanly.
+        let slice_done = TextureChunkOutcome {
+            done_bytes: 12 << 20,
+            hit_cap: false,
+            remaining_due: 0,
+            uploaded: 335,
+            handled: 335,
+        };
+        assert_eq!(
+            early_pass_next_step(true, slice_done, 92 << 20, 2 << 30, 2100, 8000),
+            StepEarly::Done
+        );
+        // Zero progress or expired budget terminates safely (no infinite loop).
+        let stalled = TextureChunkOutcome {
+            done_bytes: 0,
+            hit_cap: false,
+            remaining_due: 5000,
+            uploaded: 0,
+            handled: 0,
+        };
+        assert_eq!(
+            early_pass_next_step(true, stalled, 0, 2 << 30, 100, 8000),
+            StepEarly::Done
+        );
+        assert_eq!(
+            early_pass_next_step(true, slice1, 40 << 20, 2 << 30, 8000, 8000),
+            StepEarly::Done
+        );
+    }
+
+    #[test]
+    fn incremental_heap_buffer_sweep_covers_all_slots_without_full_rescan_spikes() {
+        let total = HEAP_BUFFER_SWEEP_BATCH * 3 + 17;
+        let all: Vec<u32> = (0..total as u32).collect();
+        let mut sweep = IncrementalSweep::default();
+        sweep.reset(all.clone());
+
+        let mut seen = Vec::new();
+        let mut refreshes = 0usize;
+        for _ in 0..4 {
+            let mut batch = Vec::new();
+            sweep.take_batch(&mut batch, || {
+                refreshes += 1;
+                all.clone()
+            });
+            assert!(batch.len() <= HEAP_BUFFER_SWEEP_BATCH);
+            seen.extend(batch);
+        }
+        assert_eq!(refreshes, 0, "snapshot must not refresh mid-cycle");
+        assert_eq!(seen, all, "4 incremental batches must cover all slots exactly once");
+
+        // Next batch starts a fresh cycle cleanly.
+        let mut next_batch = Vec::new();
+        sweep.take_batch(&mut next_batch, || {
+            refreshes += 1;
+            all.clone()
+        });
+        assert_eq!(refreshes, 1);
+        assert_eq!(next_batch.len(), HEAP_BUFFER_SWEEP_BATCH);
     }
 
     #[test]
