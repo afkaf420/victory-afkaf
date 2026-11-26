@@ -707,6 +707,69 @@ impl Module {
         }
     }
 
+    /// Whether a `dx.op.rawBufferLoad.*` call reads one of Victory's immutable
+    /// draw-constant metadata tables (`SLOT_TABLE_STRIDES = 250`,
+    /// `SLOT_VIEWS = 252`, `SLOT_MEMORY = 254`, `SLOT_STRIDES = 255`), whose
+    /// contents never change during a draw or dispatch.
+    fn is_pure_metadata_table_load(&self, f: u32, args: &[V]) -> bool {
+        use super::super::shader::{
+            ROOT_CBV_SPACE, SLOT_MEMORY, SLOT_STRIDES, SLOT_TABLE_STRIDES, SLOT_VIEWS,
+        };
+        if !self.funcs[f as usize]
+            .name
+            .starts_with("dx.op.rawBufferLoad.")
+        {
+            return false;
+        }
+        let Some(&mut_handle) = args.get(1) else {
+            return false;
+        };
+        let mut h = mut_handle;
+        // Unwrap `dx.op.annotateHandle` -> `dx.op.createHandleFromBinding`.
+        if let V::Inst(id) = h
+            && let Op::Call(cf, cargs) = &self.insts[id as usize].op
+            && self.funcs[*cf as usize].name == "dx.op.annotateHandle"
+            && let Some(&inner) = cargs.get(1)
+        {
+            h = inner;
+        }
+        let V::Inst(id) = h else { return false };
+        let Op::Call(cf, cargs) = &self.insts[id as usize].op else {
+            return false;
+        };
+        if self.funcs[*cf as usize].name != "dx.op.createHandleFromBinding" {
+            return false;
+        }
+        let Some(&V::Const(ci)) = cargs.get(1) else {
+            return false;
+        };
+        let Const::Aggregate(elems) = &self.consts[ci as usize].1 else {
+            return false;
+        };
+        if elems.len() != 4 {
+            return false;
+        }
+        let int_elem = |k: usize| match self.consts[elems[k] as usize].1 {
+            Const::Int(v) => Some(v as u32),
+            _ => None,
+        };
+        let (Some(lo), Some(hi), Some(space), Some(class)) =
+            (int_elem(0), int_elem(1), int_elem(2), int_elem(3))
+        else {
+            return false;
+        };
+        space == ROOT_CBV_SPACE
+            && class == 0
+            && lo == hi
+            && matches!(
+                lo,
+                x if x == u32::from(SLOT_TABLE_STRIDES)
+                    || x == u32::from(SLOT_VIEWS)
+                    || x == u32::from(SLOT_MEMORY)
+                    || x == u32::from(SLOT_STRIDES)
+            )
+    }
+
     /// What kind of instruction `i` is for merging.
     fn class(&self, effects: &[Effect], i: u32) -> Effect {
         match &self.insts[i as usize].op {
@@ -732,7 +795,14 @@ impl Module {
             }
             Op::Store(..) | Op::AtomicRmw(..) | Op::CmpXchg(..) => Effect::Writes,
             Op::Phi(_) => Effect::Lanes,
-            Op::Call(f, _) => effects[*f as usize],
+            Op::Call(f, args) => {
+                let e = effects[*f as usize];
+                if e == Effect::Reads && self.is_pure_metadata_table_load(*f, args) {
+                    Effect::Pure
+                } else {
+                    e
+                }
+            }
         }
     }
 
@@ -2297,6 +2367,110 @@ mod tests {
                 .iter()
                 .any(|&id| matches!(m.insts[id as usize].op, Op::Select(..) | Op::Cmp(..))),
             "bit-exact x * x legacy_mul select and fcmp must simplify to plain fmul"
+        );
+    }
+
+    #[test]
+    fn pure_metadata_table_loads_cse_across_stores_and_blocks() {
+        use crate::emit::shader::{ROOT_CBV_SPACE, SLOT_MEMORY, SLOT_STRIDES};
+        let mut m = Module::default();
+        let i1t = m.int(1);
+        let i8t = m.int(8);
+        let i32t = m.int(32);
+        let f32t = m.float();
+        let void = m.void();
+        let i8p = m.ptr(i8t);
+        let handle = m.named_struct("dx.types.Handle", vec![i8p]);
+        let bind_ty = m.named_struct("dx.types.ResBind", vec![i32t, i32t, i32t, i8t]);
+        let props_ty = m.named_struct("dx.types.ResourceProperties", vec![i32t, i32t]);
+        let res_ret = m.named_struct("dx.types.ResRet.f32", vec![f32t, f32t, f32t, f32t, i32t]);
+
+        let bind_f_ty = m.func_ty(handle, vec![i32t, bind_ty, i32t, i1t]);
+        let ann_f_ty = m.func_ty(handle, vec![i32t, handle, props_ty]);
+        let rld_f_ty = m.func_ty(res_ret, vec![i32t, handle, i32t, i32t, i8t, i32t]);
+        let bar_f_ty = m.func_ty(void, vec![i32t, i32t]);
+        let sink_f_ty = m.func_ty(void, vec![f32t, f32t, f32t]);
+        let main_ty = m.func_ty(void, vec![]);
+        for ty in [bind_f_ty, ann_f_ty, rld_f_ty, bar_f_ty, sink_f_ty, main_ty] {
+            m.ptr(ty);
+        }
+        let bind_f = m.function("dx.op.createHandleFromBinding", bind_f_ty, Some(Attr::ReadNone), false);
+        let ann_f = m.function("dx.op.annotateHandle", ann_f_ty, Some(Attr::ReadNone), false);
+        let rld_f = m.function("dx.op.rawBufferLoad.f32", rld_f_ty, Some(Attr::ReadOnly), false);
+        let bar_f = m.function("dx.op.barrier", bar_f_ty, Some(Attr::NoDuplicate), false);
+        let sink_f = m.function("dx.op.bufferStore.f32", sink_f_ty, Some(Attr::NoUnwind), false);
+        m.function("main", main_ty, None, true);
+
+        let b0 = m.new_block();
+        let b1 = m.new_block();
+        let make_srv = |m: &mut Module, blk: usize, slot: u32| {
+            let r = m.i32(slot);
+            let sp = m.i32(ROOT_CBV_SPACE);
+            let cls = m.i8(0);
+            let bind = m.aggregate(bind_ty, &[r, r, sp, cls]);
+            let op_b = m.i32(217);
+            let f_false = m.bool(false);
+            let h = m.call(blk, bind_f, vec![op_b, bind, r, f_false]);
+            let p0 = m.i32(11);
+            let p1 = m.i32(0);
+            let props = m.aggregate(props_ty, &[p0, p1]);
+            let op_a = m.i32(216);
+            m.call(blk, ann_f, vec![op_a, h, props])
+        };
+        let h_strides = make_srv(&mut m, b0, u32::from(SLOT_STRIDES));
+        let h_memory = make_srv(&mut m, b0, u32::from(SLOT_MEMORY));
+        let h_regular = make_srv(&mut m, b0, 0);
+
+        let (op_rld, op_bar, k0, k4, iu, m1, bar9) = (
+            m.i32(139),
+            m.i32(80),
+            m.i32(0),
+            m.i32(4),
+            m.undef(i32t),
+            m.i8(1),
+            m.i32(9),
+        );
+        // First loads in entry block `b0`.
+        let r_s1 = m.call(b0, rld_f, vec![op_rld, h_strides, k0, iu, m1, k4]);
+        let r_m1 = m.call(b0, rld_f, vec![op_rld, h_memory, k4, iu, m1, k4]);
+        let r_u1 = m.call(b0, rld_f, vec![op_rld, h_regular, k0, iu, m1, k4]);
+        let v_s1 = m.extract(b0, r_s1, 0);
+        let v_m1 = m.extract(b0, r_m1, 0);
+        let v_u1 = m.extract(b0, r_u1, 0);
+        // Barrier + store between first and second loads, then branch to dominated `b1`.
+        m.call(b0, bar_f, vec![op_bar, bar9]);
+        m.call(b0, sink_f, vec![v_s1, v_m1, v_u1]);
+        m.terminate(b0, Term::Br(b1));
+
+        // Duplicate loads in dominated child block `b1`.
+        let r_s2 = m.call(b1, rld_f, vec![op_rld, h_strides, k0, iu, m1, k4]);
+        let r_m2 = m.call(b1, rld_f, vec![op_rld, h_memory, k4, iu, m1, k4]);
+        let r_u2 = m.call(b1, rld_f, vec![op_rld, h_regular, k0, iu, m1, k4]);
+        let v_s2 = m.extract(b1, r_s2, 0);
+        let v_m2 = m.extract(b1, r_m2, 0);
+        let v_u2 = m.extract(b1, r_u2, 0);
+        m.call(b1, sink_f, vec![v_s2, v_m2, v_u2]);
+        m.terminate(b1, Term::Ret);
+
+        m.optimise(ALL);
+
+        let raw_loads: Vec<V> = m
+            .blocks
+            .iter()
+            .flat_map(|blk| blk.body.iter())
+            .filter_map(|&id| match &m.insts[id as usize].op {
+                Op::Call(cf, args) if m.funcs[*cf as usize].name == "dx.op.rawBufferLoad.f32" => {
+                    Some(args[1])
+                }
+                _ => None,
+            })
+            .collect();
+        // `SLOT_STRIDES` (1) + `SLOT_MEMORY` (1) CSE'd across barrier/store/blocks;
+        // regular SRV `t0` kept both loads (2) -> 4 total instead of 6!
+        assert_eq!(
+            raw_loads.len(),
+            4,
+            "pure metadata table loads must CSE across barriers/stores/blocks while regular SRV keeps both"
         );
     }
 }

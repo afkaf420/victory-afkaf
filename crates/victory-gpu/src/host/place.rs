@@ -139,7 +139,7 @@ pub(super) fn read_by(runs: &[&HostList], mut ranges: Vec<(usize, usize)>) -> bo
 }
 
 /// Whether the host device supports D3D12 Enhanced Barriers (`OPTIONS12`).
-fn enhanced_barriers(host: &Host) -> bool {
+pub(super) fn enhanced_barriers(host: &Host) -> bool {
     static ENHANCED: OnceLock<bool> = OnceLock::new();
     *ENHANCED.get_or_init(|| {
         let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS12::default();

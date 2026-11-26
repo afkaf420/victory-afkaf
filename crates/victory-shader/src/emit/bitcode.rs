@@ -602,6 +602,25 @@ impl Module {
         (gc, plain_raw_uav, store_blocks, entry_cond)
     }
 
+    #[cfg(test)]
+    pub(crate) fn raw_load_masks(&self) -> Vec<u8> {
+        let mut masks = Vec::new();
+        for blk in &self.blocks {
+            for &id in &blk.body {
+                if let Op::Call(f, args) = &self.insts[id as usize].op
+                    && self.funcs[*f as usize]
+                        .name
+                        .starts_with("dx.op.rawBufferLoad.")
+                    && let Some(&V::Const(ci)) = args.get(4)
+                    && let Const::Int(m) = self.consts[ci as usize].1
+                {
+                    masks.push(m as u8);
+                }
+            }
+        }
+        masks
+    }
+
     pub fn md_str(&mut self, s: &str) -> Md {
         self.mds.push(MdDef::Str(s.into()));
         Md(self.mds.len() as u32 - 1)

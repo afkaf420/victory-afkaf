@@ -2306,24 +2306,626 @@ extern "system" fn wait_value64(this: This, address: u64, comparison: u32, refer
     wait_for(this, address, comparison, reference, true);
 }
 
-/// The enhanced barriers `(group count, groups)`: buffer, texture and
-/// global barriers with layouts instead of states. Every host use of a
-/// title texture (clears, copies) moves its host copy to the state it needs
-/// first, so only their ordering matters: one barrier on every shader
-/// write (the title's buffer barriers order compute passes).
-extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
-    #[cfg(windows)]
-    if count > 0 {
-        with_state(this, |_, state| state.synced());
+/// Whether `VICTORY_ENHANCED_BARRIERS` is active (default ON; `=0` falls back
+/// to legacy global `UAV(NULL)` barriers on `barrier_groups`).
+fn resolve_enhanced_barriers(env: Option<&str>) -> bool {
+    env.is_none_or(|v| v.trim() != "0")
+}
+
+pub(super) fn enhanced_barriers_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let env = std::env::var("VICTORY_ENHANCED_BARRIERS").ok();
+        resolve_enhanced_barriers(env.as_deref())
+    })
+}
+
+const BARRIER_TYPE_GLOBAL: u32 = 0;
+const BARRIER_TYPE_TEXTURE: u32 = 1;
+const BARRIER_TYPE_BUFFER: u32 = 2;
+
+/// Console/Win32 `D3D12_BARRIER_GROUP` header (`Type`: 0=GLOBAL, 1=TEXTURE, 2=BUFFER).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(super) struct TitleBarrierGroup {
+    pub(super) kind: u32,
+    pub(super) count: u32,
+    pub(super) ptr: *const u8,
+}
+
+/// Console/Win32 `D3D12_GLOBAL_BARRIER` (16 bytes).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct TitleGlobalBarrier {
+    pub(super) sync_before: u32,
+    pub(super) sync_after: u32,
+    pub(super) access_before: u32,
+    pub(super) access_after: u32,
+}
+
+/// Console/Win32 `D3D12_BUFFER_BARRIER` (40 bytes on x64).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(super) struct TitleBufferBarrier {
+    pub(super) sync_before: u32,
+    pub(super) sync_after: u32,
+    pub(super) access_before: u32,
+    pub(super) access_after: u32,
+    pub(super) resource: This,
+    pub(super) offset: u64,
+    pub(super) size: u64,
+}
+
+/// Compact decoded buffer barrier carried across the thin stream (32 bytes):
+/// resolves title buffer `(addr, len)` at record time while the title COM
+/// resource is guaranteed live, avoiding dangling pointers during replay.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct DecodedBufferBarrier {
+    pub(super) sync_before: u32,
+    pub(super) sync_after: u32,
+    pub(super) access_before: u32,
+    pub(super) access_after: u32,
+    pub(super) addr: u64,
+    pub(super) len: u64,
+}
+
+#[cfg(windows)]
+const _: () = {
+    use windows::Win32::Graphics::Direct3D12::*;
+    assert!(size_of::<TitleBarrierGroup>() == size_of::<D3D12_BARRIER_GROUP>());
+    assert!(size_of::<TitleGlobalBarrier>() == size_of::<D3D12_GLOBAL_BARRIER>());
+    assert!(size_of::<TitleBufferBarrier>() == size_of::<D3D12_BUFFER_BARRIER>());
+};
+
+/// Buffer access bits that represent writes (or `ACCESS_COMMON == 0`, which may
+/// include writes). Used to filter out pure read-to-read buffer barriers.
+const RAW_BUFFER_WRITE_ACCESS: u32 = 0x10 /* UAV */ | 0x100 /* STREAM_OUTPUT */ | 0x400 /* COPY_DEST */ | 0x80_0000 /* RTAS_WRITE */;
+const RAW_SYNC_SPLIT: u32 = 0x8000_0000;
+
+#[inline]
+fn raw_buffer_is_read_only(access_before: u32, access_after: u32) -> bool {
+    let before_write = access_before == 0 || (access_before & RAW_BUFFER_WRITE_ACCESS) != 0;
+    let after_write = access_after == 0 || (access_after & RAW_BUFFER_WRITE_ACCESS) != 0;
+    !before_write && !after_write
+}
+
+/// Decodes title `D3D12_BARRIER_GROUP` payloads, skipping pure-texture groups
+/// (already managed by `ensure_state()`), `SYNC_NONE` no-ops, split-begins,
+/// and read-to-read buffer barriers.
+pub(super) fn decode_barrier_groups(
+    count: u32,
+    groups: *const u8,
+) -> (Vec<TitleGlobalBarrier>, Vec<DecodedBufferBarrier>) {
+    const MAX_GROUPS: usize = 1024;
+    const MAX_PER_GROUP: usize = 4096;
+    let mut globals = Vec::new();
+    let mut buffers = Vec::new();
+    if count == 0 || groups.is_null() {
+        return (globals, buffers);
     }
+    let n = (count as usize).min(MAX_GROUPS);
+    // SAFETY: title passed `count` `D3D12_BARRIER_GROUP` records.
+    let slice = unsafe { std::slice::from_raw_parts(groups.cast::<TitleBarrierGroup>(), n) };
+    for g in slice {
+        if g.count == 0 || g.ptr.is_null() {
+            continue;
+        }
+        let m = (g.count as usize).min(MAX_PER_GROUP);
+        match g.kind {
+            BARRIER_TYPE_TEXTURE => {
+                // Host texture states/layouts are tracked per-use by `ensure_state()`.
+            }
+            BARRIER_TYPE_GLOBAL => {
+                // SAFETY: `g.ptr` points to `g.count` `D3D12_GLOBAL_BARRIER` records.
+                let items = unsafe { std::slice::from_raw_parts(g.ptr.cast::<TitleGlobalBarrier>(), m) };
+                for &b in items {
+                    if (b.sync_before == 0 && b.sync_after == 0) || b.sync_after == RAW_SYNC_SPLIT {
+                        continue;
+                    }
+                    globals.push(b);
+                }
+            }
+            BARRIER_TYPE_BUFFER => {
+                // SAFETY: `g.ptr` points to `g.count` `D3D12_BUFFER_BARRIER` records.
+                let items = unsafe { std::slice::from_raw_parts(g.ptr.cast::<TitleBufferBarrier>(), m) };
+                for &b in items {
+                    if (b.sync_before == 0 && b.sync_after == 0)
+                        || b.sync_after == RAW_SYNC_SPLIT
+                        || raw_buffer_is_read_only(b.access_before, b.access_after)
+                    {
+                        continue;
+                    }
+                    let (addr, len) = crate::resource::buffer_bytes(b.resource)
+                        .map_or((0, 0), |(ptr, len)| (ptr as u64, len));
+                    buffers.push(DecodedBufferBarrier {
+                        sync_before: b.sync_before,
+                        sync_after: b.sync_after,
+                        access_before: b.access_before,
+                        access_after: b.access_after,
+                        addr,
+                        len,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    (globals, buffers)
+}
+
+#[cfg(windows)]
+mod enhanced {
+    use windows::Win32::Graphics::Direct3D12::*;
+
+    const SYNC_ALL: i32 = D3D12_BARRIER_SYNC_ALL.0;
+    const SYNC_SPLIT: i32 = D3D12_BARRIER_SYNC_SPLIT.0;
+    const ACCESS_NO_ACCESS: i32 = D3D12_BARRIER_ACCESS_NO_ACCESS.0;
+
+    const DIRECT_SYNC_MASK: i32 = D3D12_BARRIER_SYNC_ALL.0
+        | D3D12_BARRIER_SYNC_DRAW.0
+        | D3D12_BARRIER_SYNC_INDEX_INPUT.0
+        | D3D12_BARRIER_SYNC_VERTEX_SHADING.0
+        | D3D12_BARRIER_SYNC_PIXEL_SHADING.0
+        | D3D12_BARRIER_SYNC_DEPTH_STENCIL.0
+        | D3D12_BARRIER_SYNC_RENDER_TARGET.0
+        | D3D12_BARRIER_SYNC_COMPUTE_SHADING.0
+        | D3D12_BARRIER_SYNC_RAYTRACING.0
+        | D3D12_BARRIER_SYNC_COPY.0
+        | D3D12_BARRIER_SYNC_RESOLVE.0
+        | D3D12_BARRIER_SYNC_EXECUTE_INDIRECT.0
+        | D3D12_BARRIER_SYNC_ALL_SHADING.0
+        | D3D12_BARRIER_SYNC_NON_PIXEL_SHADING.0
+        | D3D12_BARRIER_SYNC_EMIT_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO.0
+        | D3D12_BARRIER_SYNC_CLEAR_UNORDERED_ACCESS_VIEW.0
+        | D3D12_BARRIER_SYNC_BUILD_RAYTRACING_ACCELERATION_STRUCTURE.0
+        | D3D12_BARRIER_SYNC_COPY_RAYTRACING_ACCELERATION_STRUCTURE.0;
+
+    const COMPUTE_SYNC_MASK: i32 = D3D12_BARRIER_SYNC_ALL.0
+        | D3D12_BARRIER_SYNC_COMPUTE_SHADING.0
+        | D3D12_BARRIER_SYNC_RAYTRACING.0
+        | D3D12_BARRIER_SYNC_COPY.0
+        | D3D12_BARRIER_SYNC_EXECUTE_INDIRECT.0
+        | D3D12_BARRIER_SYNC_EMIT_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO.0
+        | D3D12_BARRIER_SYNC_CLEAR_UNORDERED_ACCESS_VIEW.0
+        | D3D12_BARRIER_SYNC_BUILD_RAYTRACING_ACCELERATION_STRUCTURE.0
+        | D3D12_BARRIER_SYNC_COPY_RAYTRACING_ACCELERATION_STRUCTURE.0;
+
+    const COPY_SYNC_MASK: i32 = D3D12_BARRIER_SYNC_ALL.0 | D3D12_BARRIER_SYNC_COPY.0;
+
+    /// Legal `D3D12_BARRIER_ACCESS` bits on a non-RTAS `Shadow::buffer`.
+    /// Note: `RAYTRACING_ACCELERATION_STRUCTURE_READ/WRITE` are illegal on
+    /// `D3D12_BUFFER_BARRIER` unless the target resource was created with
+    /// `D3D12_RESOURCE_FLAG_RAYTRACING_ACCELERATION_STRUCTURE` (they stay in
+    /// `GLOBAL_ACCESS_MASK` for `D3D12_GLOBAL_BARRIER`).
+    const BUFFER_ACCESS_MASK: i32 = D3D12_BARRIER_ACCESS_VERTEX_BUFFER.0
+        | D3D12_BARRIER_ACCESS_CONSTANT_BUFFER.0
+        | D3D12_BARRIER_ACCESS_INDEX_BUFFER.0
+        | D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0
+        | D3D12_BARRIER_ACCESS_SHADER_RESOURCE.0
+        | D3D12_BARRIER_ACCESS_STREAM_OUTPUT.0
+        | D3D12_BARRIER_ACCESS_INDIRECT_ARGUMENT.0
+        | D3D12_BARRIER_ACCESS_COPY_DEST.0
+        | D3D12_BARRIER_ACCESS_COPY_SOURCE.0;
+
+    const GLOBAL_ACCESS_MASK: i32 = BUFFER_ACCESS_MASK
+        | D3D12_BARRIER_ACCESS_RENDER_TARGET.0
+        | D3D12_BARRIER_ACCESS_DEPTH_STENCIL_WRITE.0
+        | D3D12_BARRIER_ACCESS_DEPTH_STENCIL_READ.0
+        | D3D12_BARRIER_ACCESS_RESOLVE_DEST.0
+        | D3D12_BARRIER_ACCESS_RESOLVE_SOURCE.0
+        | D3D12_BARRIER_ACCESS_SHADING_RATE_SOURCE.0
+        | D3D12_BARRIER_ACCESS_RAYTRACING_ACCELERATION_STRUCTURE_READ.0
+        | D3D12_BARRIER_ACCESS_RAYTRACING_ACCELERATION_STRUCTURE_WRITE.0;
+
+    const COMPUTE_ACCESS_MASK: i32 = D3D12_BARRIER_ACCESS_CONSTANT_BUFFER.0
+        | D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0
+        | D3D12_BARRIER_ACCESS_SHADER_RESOURCE.0
+        | D3D12_BARRIER_ACCESS_INDIRECT_ARGUMENT.0
+        | D3D12_BARRIER_ACCESS_COPY_DEST.0
+        | D3D12_BARRIER_ACCESS_COPY_SOURCE.0
+        | D3D12_BARRIER_ACCESS_RAYTRACING_ACCELERATION_STRUCTURE_READ.0
+        | D3D12_BARRIER_ACCESS_RAYTRACING_ACCELERATION_STRUCTURE_WRITE.0;
+
+    const COPY_ACCESS_MASK: i32 = D3D12_BARRIER_ACCESS_COPY_DEST.0 | D3D12_BARRIER_ACCESS_COPY_SOURCE.0;
+
+    const BUFFER_WRITE_MASK: i32 = D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0
+        | D3D12_BARRIER_ACCESS_STREAM_OUTPUT.0
+        | D3D12_BARRIER_ACCESS_COPY_DEST.0
+        | D3D12_BARRIER_ACCESS_RAYTRACING_ACCELERATION_STRUCTURE_WRITE.0;
+
+    fn allowed_access_for_sync(sync: i32, valid_access: i32) -> i32 {
+        if (sync & SYNC_ALL) != 0 {
+            return valid_access;
+        }
+        let mut out = 0i32;
+        let shader_rw = D3D12_BARRIER_ACCESS_CONSTANT_BUFFER.0
+            | D3D12_BARRIER_ACCESS_SHADER_RESOURCE.0
+            | D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0;
+        let rtas_read = D3D12_BARRIER_ACCESS_RAYTRACING_ACCELERATION_STRUCTURE_READ.0;
+        if (sync & D3D12_BARRIER_SYNC_DRAW.0) != 0 {
+            out |= D3D12_BARRIER_ACCESS_VERTEX_BUFFER.0
+                | D3D12_BARRIER_ACCESS_INDEX_BUFFER.0
+                | D3D12_BARRIER_ACCESS_RENDER_TARGET.0
+                | D3D12_BARRIER_ACCESS_DEPTH_STENCIL_READ.0
+                | D3D12_BARRIER_ACCESS_DEPTH_STENCIL_WRITE.0
+                | D3D12_BARRIER_ACCESS_STREAM_OUTPUT.0
+                | D3D12_BARRIER_ACCESS_SHADING_RATE_SOURCE.0
+                | shader_rw
+                | rtas_read;
+        }
+        if (sync & D3D12_BARRIER_SYNC_INDEX_INPUT.0) != 0 {
+            out |= D3D12_BARRIER_ACCESS_INDEX_BUFFER.0;
+        }
+        if (sync & D3D12_BARRIER_SYNC_VERTEX_SHADING.0) != 0 {
+            out |= D3D12_BARRIER_ACCESS_VERTEX_BUFFER.0 | shader_rw | rtas_read;
+        }
+        if (sync & D3D12_BARRIER_SYNC_PIXEL_SHADING.0) != 0 {
+            out |= shader_rw | D3D12_BARRIER_ACCESS_SHADING_RATE_SOURCE.0 | rtas_read;
+        }
+        if (sync & D3D12_BARRIER_SYNC_DEPTH_STENCIL.0) != 0 {
+            out |= D3D12_BARRIER_ACCESS_DEPTH_STENCIL_READ.0 | D3D12_BARRIER_ACCESS_DEPTH_STENCIL_WRITE.0;
+        }
+        if (sync & D3D12_BARRIER_SYNC_RENDER_TARGET.0) != 0 {
+            out |= D3D12_BARRIER_ACCESS_RENDER_TARGET.0;
+        }
+        if (sync & (D3D12_BARRIER_SYNC_COMPUTE_SHADING.0 | D3D12_BARRIER_SYNC_RAYTRACING.0)) != 0 {
+            out |= shader_rw | rtas_read;
+        }
+        if (sync & D3D12_BARRIER_SYNC_COPY.0) != 0 {
+            out |= D3D12_BARRIER_ACCESS_COPY_DEST.0 | D3D12_BARRIER_ACCESS_COPY_SOURCE.0;
+        }
+        if (sync & D3D12_BARRIER_SYNC_RESOLVE.0) != 0 {
+            out |= D3D12_BARRIER_ACCESS_RESOLVE_DEST.0 | D3D12_BARRIER_ACCESS_RESOLVE_SOURCE.0;
+        }
+        if (sync & D3D12_BARRIER_SYNC_EXECUTE_INDIRECT.0) != 0 {
+            out |= D3D12_BARRIER_ACCESS_INDIRECT_ARGUMENT.0;
+        }
+        if (sync & D3D12_BARRIER_SYNC_ALL_SHADING.0) != 0 {
+            out |= D3D12_BARRIER_ACCESS_VERTEX_BUFFER.0
+                | D3D12_BARRIER_ACCESS_SHADING_RATE_SOURCE.0
+                | shader_rw
+                | rtas_read;
+        }
+        if (sync & D3D12_BARRIER_SYNC_NON_PIXEL_SHADING.0) != 0 {
+            out |= D3D12_BARRIER_ACCESS_VERTEX_BUFFER.0 | shader_rw | rtas_read;
+        }
+        if (sync
+            & (D3D12_BARRIER_SYNC_CLEAR_UNORDERED_ACCESS_VIEW.0
+                | D3D12_BARRIER_SYNC_EMIT_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO.0))
+            != 0
+        {
+            out |= D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0;
+        }
+        if (sync & D3D12_BARRIER_SYNC_BUILD_RAYTRACING_ACCELERATION_STRUCTURE.0) != 0 {
+            out |= D3D12_BARRIER_ACCESS_RAYTRACING_ACCELERATION_STRUCTURE_READ.0
+                | D3D12_BARRIER_ACCESS_RAYTRACING_ACCELERATION_STRUCTURE_WRITE.0
+                | D3D12_BARRIER_ACCESS_SHADER_RESOURCE.0
+                | D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0;
+        }
+        if (sync & D3D12_BARRIER_SYNC_COPY_RAYTRACING_ACCELERATION_STRUCTURE.0) != 0 {
+            out |= D3D12_BARRIER_ACCESS_RAYTRACING_ACCELERATION_STRUCTURE_READ.0
+                | D3D12_BARRIER_ACCESS_RAYTRACING_ACCELERATION_STRUCTURE_WRITE.0;
+        }
+        out & valid_access
+    }
+
+    fn covering_sync_for_access(missing: i32, sync_mask: i32) -> i32 {
+        let mut add = 0i32;
+        if (missing & D3D12_BARRIER_ACCESS_INDEX_BUFFER.0) != 0 {
+            add |= D3D12_BARRIER_SYNC_INDEX_INPUT.0;
+        }
+        if (missing & D3D12_BARRIER_ACCESS_VERTEX_BUFFER.0) != 0 {
+            add |= D3D12_BARRIER_SYNC_VERTEX_SHADING.0;
+        }
+        if (missing
+            & (D3D12_BARRIER_ACCESS_CONSTANT_BUFFER.0
+                | D3D12_BARRIER_ACCESS_SHADER_RESOURCE.0
+                | D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0))
+            != 0
+        {
+            add |= if (sync_mask & D3D12_BARRIER_SYNC_ALL_SHADING.0) != 0 {
+                D3D12_BARRIER_SYNC_ALL_SHADING.0
+            } else {
+                D3D12_BARRIER_SYNC_COMPUTE_SHADING.0
+            };
+        }
+        if (missing & (D3D12_BARRIER_ACCESS_COPY_DEST.0 | D3D12_BARRIER_ACCESS_COPY_SOURCE.0)) != 0 {
+            add |= D3D12_BARRIER_SYNC_COPY.0;
+        }
+        if (missing & D3D12_BARRIER_ACCESS_INDIRECT_ARGUMENT.0) != 0 {
+            add |= D3D12_BARRIER_SYNC_EXECUTE_INDIRECT.0;
+        }
+        if (missing & D3D12_BARRIER_ACCESS_RENDER_TARGET.0) != 0 {
+            add |= D3D12_BARRIER_SYNC_RENDER_TARGET.0;
+        }
+        if (missing & (D3D12_BARRIER_ACCESS_DEPTH_STENCIL_READ.0 | D3D12_BARRIER_ACCESS_DEPTH_STENCIL_WRITE.0)) != 0 {
+            add |= D3D12_BARRIER_SYNC_DEPTH_STENCIL.0;
+        }
+        if (missing & (D3D12_BARRIER_ACCESS_RESOLVE_DEST.0 | D3D12_BARRIER_ACCESS_RESOLVE_SOURCE.0)) != 0 {
+            add |= D3D12_BARRIER_SYNC_RESOLVE.0;
+        }
+        if (missing & D3D12_BARRIER_ACCESS_STREAM_OUTPUT.0) != 0 {
+            add |= D3D12_BARRIER_SYNC_DRAW.0;
+        }
+        if (missing & D3D12_BARRIER_ACCESS_SHADING_RATE_SOURCE.0) != 0 {
+            add |= D3D12_BARRIER_SYNC_PIXEL_SHADING.0;
+        }
+        if (missing & D3D12_BARRIER_ACCESS_RAYTRACING_ACCELERATION_STRUCTURE_READ.0) != 0 {
+            add |= D3D12_BARRIER_SYNC_COMPUTE_SHADING.0;
+        }
+        if (missing & D3D12_BARRIER_ACCESS_RAYTRACING_ACCELERATION_STRUCTURE_WRITE.0) != 0 {
+            add |= D3D12_BARRIER_SYNC_BUILD_RAYTRACING_ACCELERATION_STRUCTURE.0;
+        }
+        add & sync_mask
+    }
+
+    fn sanitize_side(
+        raw_sync: i32,
+        raw_access: i32,
+        sync_mask: i32,
+        valid_access: i32,
+    ) -> (D3D12_BARRIER_SYNC, D3D12_BARRIER_ACCESS) {
+        let mut sync = raw_sync & sync_mask;
+        if raw_sync != 0 && sync == 0 {
+            sync = SYNC_ALL;
+        }
+        if sync == 0 {
+            return (D3D12_BARRIER_SYNC_NONE, D3D12_BARRIER_ACCESS_NO_ACCESS);
+        }
+        if (raw_access & ACCESS_NO_ACCESS) != 0 {
+            if (sync & SYNC_ALL) != 0 {
+                sync = SYNC_ALL;
+            }
+            return (D3D12_BARRIER_SYNC(sync), D3D12_BARRIER_ACCESS_NO_ACCESS);
+        }
+        let mut access = raw_access & valid_access;
+        if (sync & SYNC_ALL) != 0 {
+            return (D3D12_BARRIER_SYNC_ALL, D3D12_BARRIER_ACCESS(access));
+        }
+        let allowed = allowed_access_for_sync(sync, valid_access);
+        if access == 0 {
+            if raw_access == 0 {
+                // `ACCESS_COMMON` is only valid with `SYNC_ALL`; narrow to the stage's legal accesses.
+                return if allowed != 0 {
+                    (D3D12_BARRIER_SYNC(sync), D3D12_BARRIER_ACCESS(allowed))
+                } else {
+                    (D3D12_BARRIER_SYNC_NONE, D3D12_BARRIER_ACCESS_NO_ACCESS)
+                };
+            }
+            // All raw access bits were stripped (e.g., texture-only bits on a buffer barrier).
+            return (D3D12_BARRIER_SYNC_NONE, D3D12_BARRIER_ACCESS_NO_ACCESS);
+        }
+        let missing = access & !allowed;
+        if missing != 0 {
+            sync |= covering_sync_for_access(missing, sync_mask);
+            let widened = allowed_access_for_sync(sync, valid_access);
+            if (access & !widened) != 0 {
+                return (D3D12_BARRIER_SYNC_ALL, D3D12_BARRIER_ACCESS(access));
+            }
+            access &= widened;
+        }
+        if (sync & SYNC_ALL) != 0 {
+            return (D3D12_BARRIER_SYNC_ALL, D3D12_BARRIER_ACCESS(access));
+        }
+        // D3D12 Enhanced Barriers validation requires every set `Sync` bit to
+        // support at least one set `Access` bit (e.g., `VERTEX_SHADING` is
+        // rejected if `Access` is solely `INDEX_BUFFER`). Prune any `Sync`
+        // bit whose allowed accesses have zero overlap with `access`.
+        let mut compatible_sync = 0i32;
+        let mut rem = sync as u32;
+        while rem != 0 {
+            let lsb = rem & rem.wrapping_neg();
+            rem &= rem - 1;
+            let bit = lsb as i32;
+            if (allowed_access_for_sync(bit, valid_access) & access) != 0 {
+                compatible_sync |= bit;
+            }
+        }
+        if compatible_sync == 0 {
+            return (D3D12_BARRIER_SYNC_ALL, D3D12_BARRIER_ACCESS(access));
+        }
+        (D3D12_BARRIER_SYNC(compatible_sync), D3D12_BARRIER_ACCESS(access))
+    }
+
+    /// Sanitizes raw title `(sync_before, sync_after, access_before, access_after)`
+    /// into a D3D12 Debug Layer-legal pair for `list_type`. Returns `None` when
+    /// the barrier is a no-op (`SYNC_NONE`, split-begin, or read-to-read buffer barrier).
+    pub(super) fn sanitize_pair(
+        raw_sync_before: u32,
+        raw_sync_after: u32,
+        raw_access_before: u32,
+        raw_access_after: u32,
+        list_type: D3D12_COMMAND_LIST_TYPE,
+        is_buffer: bool,
+    ) -> Option<(
+        D3D12_BARRIER_SYNC,
+        D3D12_BARRIER_SYNC,
+        D3D12_BARRIER_ACCESS,
+        D3D12_BARRIER_ACCESS,
+    )> {
+        let mut sync_before = raw_sync_before as i32;
+        let mut sync_after = raw_sync_after as i32;
+        if sync_after == SYNC_SPLIT {
+            return None;
+        }
+        if sync_before == SYNC_SPLIT {
+            sync_before = SYNC_ALL;
+        }
+        sync_before &= !SYNC_SPLIT;
+        sync_after &= !SYNC_SPLIT;
+        if sync_before == 0 && sync_after == 0 {
+            return None;
+        }
+        let (sync_mask, list_access_mask) = match list_type {
+            D3D12_COMMAND_LIST_TYPE_COMPUTE => (COMPUTE_SYNC_MASK, COMPUTE_ACCESS_MASK),
+            D3D12_COMMAND_LIST_TYPE_COPY => (COPY_SYNC_MASK, COPY_ACCESS_MASK),
+            _ => (DIRECT_SYNC_MASK, GLOBAL_ACCESS_MASK),
+        };
+        let valid_access = list_access_mask & if is_buffer { BUFFER_ACCESS_MASK } else { GLOBAL_ACCESS_MASK };
+        let (sb, ab) = sanitize_side(sync_before, raw_access_before as i32, sync_mask, valid_access);
+        let (sa, aa) = sanitize_side(sync_after, raw_access_after as i32, sync_mask, valid_access);
+        if sb.0 == 0 && sa.0 == 0 {
+            return None;
+        }
+        if is_buffer {
+            let before_write = ab.0 == 0 || (ab.0 & BUFFER_WRITE_MASK) != 0;
+            let after_write = aa.0 == 0 || (aa.0 & BUFFER_WRITE_MASK) != 0;
+            if !before_write && !after_write {
+                return None;
+            }
+        }
+        Some((sb, sa, ab, aa))
+    }
+}
+
+/// Emits pre-decoded enhanced barrier groups onto `this` (`list.rs` direct path
+/// and `list/thin.rs` replay path). Under `VICTORY_ENHANCED_BARRIERS` (default ON)
+/// on `OPTIONS12` hardware, translates buffer barriers into targeted
+/// `D3D12_BUFFER_BARRIER`s and global barriers into exact-scope
+/// `D3D12_GLOBAL_BARRIER`s via `ID3D12GraphicsCommandList7::Barrier`, skipping
+/// pure-texture groups, `SYNC_NONE` no-ops, and read-to-read buffer barriers.
+pub(super) fn emit_barrier_groups(
+    this: This,
+    orig_count: u32,
+    has_payload: bool,
+    globals: &[TitleGlobalBarrier],
+    buffers: &[DecodedBufferBarrier],
+) {
     #[cfg(windows)]
-    if count > 0
-        && let Some(list) = host_list(this)
     {
+        if orig_count == 0 {
+            return;
+        }
+        let Some(list) = host_list(this) else {
+            with_state(this, |_, state| state.synced());
+            return;
+        };
+        if enhanced_barriers_on() && has_payload {
+            if globals.is_empty() && buffers.is_empty() {
+                return;
+            }
+            if let Some(host) = crate::host::host()
+                && crate::host::enhanced_barriers(host)
+                && let Ok(list7) = windows::core::Interface::cast::<
+                    windows::Win32::Graphics::Direct3D12::ID3D12GraphicsCommandList7,
+                >(&list.list)
+            {
+                use windows::Win32::Graphics::Direct3D12::*;
+                // SAFETY: valid open command list.
+                let list_type = unsafe { list.list.GetType() };
+                let mut out_globals: Vec<D3D12_GLOBAL_BARRIER> = Vec::with_capacity(globals.len());
+                let mut out_buffers: Vec<D3D12_BUFFER_BARRIER> = Vec::with_capacity(buffers.len());
+                let mut kept: Vec<std::sync::Arc<crate::shadow::Shadow>> = Vec::with_capacity(buffers.len());
+
+                for &g in globals {
+                    if let Some((sb, sa, ab, aa)) = enhanced::sanitize_pair(
+                        g.sync_before,
+                        g.sync_after,
+                        g.access_before,
+                        g.access_after,
+                        list_type,
+                        false,
+                    ) {
+                        out_globals.push(D3D12_GLOBAL_BARRIER {
+                            SyncBefore: sb,
+                            SyncAfter: sa,
+                            AccessBefore: ab,
+                            AccessAfter: aa,
+                        });
+                    }
+                }
+
+                let dedup = crate::host::barrier_dedup();
+                let uav_was_dirty = list.uav_dirty();
+                for &b in buffers {
+                    let Some((sb, sa, ab, aa)) = enhanced::sanitize_pair(
+                        b.sync_before,
+                        b.sync_after,
+                        b.access_before,
+                        b.access_after,
+                        list_type,
+                        true,
+                    ) else {
+                        continue;
+                    };
+                    let shadow = (b.addr != 0 && b.len != 0)
+                        .then(|| crate::shadow::peek(b.addr, b.len))
+                        .flatten();
+                    if let Some(shadow) = shadow {
+                        out_buffers.push(D3D12_BUFFER_BARRIER {
+                            SyncBefore: sb,
+                            SyncAfter: sa,
+                            AccessBefore: ab,
+                            AccessAfter: aa,
+                            // SAFETY: borrowed pointer kept alive by `kept` across `list7.Barrier`.
+                            pResource: unsafe { std::mem::transmute_copy(&shadow.buffer) },
+                            Offset: 0,
+                            Size: u64::MAX,
+                        });
+                        kept.push(shadow);
+                    } else if !dedup || uav_was_dirty {
+                        // Narrow fallback when a buffer shadow was not yet created on the host:
+                        // emit a scoped global barrier rather than an unconditional full `UAV(NULL)`.
+                        out_globals.push(D3D12_GLOBAL_BARRIER {
+                            SyncBefore: sb,
+                            SyncAfter: sa,
+                            AccessBefore: ab,
+                            AccessAfter: aa,
+                        });
+                    }
+                }
+
+                if out_buffers.is_empty() && out_globals.is_empty() {
+                    return;
+                }
+                with_state(this, |_, state| state.synced());
+                #[cfg(feature = "diagnostics")]
+                {
+                    crate::copystat::add(crate::copystat::C::WaitsForGroups, 1);
+                    if crate::copystat::barrier_test() & 1 != 0 {
+                        return;
+                    }
+                }
+                let mut groups = [
+                    D3D12_BARRIER_GROUP::default(),
+                    D3D12_BARRIER_GROUP::default(),
+                ];
+                let mut n_groups = 0usize;
+                if !out_buffers.is_empty() {
+                    groups[n_groups] = D3D12_BARRIER_GROUP {
+                        Type: D3D12_BARRIER_TYPE_BUFFER,
+                        NumBarriers: out_buffers.len() as u32,
+                        Anonymous: D3D12_BARRIER_GROUP_0 {
+                            pBufferBarriers: out_buffers.as_ptr(),
+                        },
+                    };
+                    n_groups += 1;
+                }
+                if !out_globals.is_empty() {
+                    groups[n_groups] = D3D12_BARRIER_GROUP {
+                        Type: D3D12_BARRIER_TYPE_GLOBAL,
+                        NumBarriers: out_globals.len() as u32,
+                        Anonymous: D3D12_BARRIER_GROUP_0 {
+                            pGlobalBarriers: out_globals.as_ptr(),
+                        },
+                    };
+                    n_groups += 1;
+                }
+                // SAFETY: open command list; `out_buffers`, `out_globals`, and `kept` stay alive across `Barrier`.
+                unsafe { list7.Barrier(&groups[..n_groups]) };
+                drop(kept);
+                if !out_globals.is_empty() {
+                    list.clear_uav_dirty();
+                }
+                return;
+            }
+        }
+        // Legacy fallback (`VICTORY_ENHANCED_BARRIERS=0`, null group payload, or pre-OPTIONS12 GPU).
+        with_state(this, |_, state| state.synced());
         if crate::host::barrier_dedup() && !list.take_uav_dirty() {
             return;
         }
-        // Diagnostics: counted, and left out under `VICTORY_BARRIER_TEST=groups`.
         #[cfg(feature = "diagnostics")]
         {
             crate::copystat::add(crate::copystat::C::WaitsForGroups, 1);
@@ -2339,7 +2941,21 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
         list.clear_uav_dirty();
     }
     #[cfg(not(windows))]
-    let _ = (this, count);
+    let _ = (this, orig_count, has_payload, globals, buffers);
+}
+
+/// The enhanced barriers `(group count, groups)`: buffer, texture and
+/// global barriers with layouts instead of states.
+extern "system" fn barrier_groups(this: This, count: u32, groups: *const u8) {
+    if count == 0 {
+        return;
+    }
+    if groups.is_null() {
+        emit_barrier_groups(this, count, false, &[], &[]);
+        return;
+    }
+    let (globals, buffers) = decode_barrier_groups(count, groups);
+    emit_barrier_groups(this, count, true, &globals, &buffers);
 }
 
 /// The bottom-of-pipe value writes `(address, value, flush, flags)`, 32 and
@@ -2755,5 +3371,326 @@ mod tests {
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn enhanced_barriers_filter_and_sanitize_correctly() {
+        use windows::Win32::Graphics::Direct3D12::*;
+
+        assert!(resolve_enhanced_barriers(None));
+        assert!(resolve_enhanced_barriers(Some("1")));
+        assert!(!resolve_enhanced_barriers(Some("0")));
+        assert!(!resolve_enhanced_barriers(Some(" 0 ")));
+
+        // Pure-texture group is dropped at decode time.
+        let dummy_tex = [0u8; 64];
+        let tex_group = TitleBarrierGroup {
+            kind: BARRIER_TYPE_TEXTURE,
+            count: 2,
+            ptr: dummy_tex.as_ptr(),
+        };
+        let (g, b) = decode_barrier_groups(1, (&raw const tex_group).cast());
+        assert!(g.is_empty() && b.is_empty(), "pure texture groups must be skipped");
+
+        // SYNC_NONE, split-begin, and read-to-read buffer barriers are dropped; UAV->SRV & global kept.
+        let buf_barriers = [
+            // SYNC_NONE no-op -> dropped
+            TitleBufferBarrier {
+                sync_before: 0,
+                sync_after: 0,
+                access_before: D3D12_BARRIER_ACCESS_NO_ACCESS.0 as u32,
+                access_after: D3D12_BARRIER_ACCESS_NO_ACCESS.0 as u32,
+                resource: std::ptr::null(),
+                offset: 0,
+                size: u64::MAX,
+            },
+            // Read-to-read SRV -> VERTEX_BUFFER -> dropped
+            TitleBufferBarrier {
+                sync_before: D3D12_BARRIER_SYNC_COMPUTE_SHADING.0 as u32,
+                sync_after: D3D12_BARRIER_SYNC_VERTEX_SHADING.0 as u32,
+                access_before: D3D12_BARRIER_ACCESS_SHADER_RESOURCE.0 as u32,
+                access_after: D3D12_BARRIER_ACCESS_VERTEX_BUFFER.0 as u32,
+                resource: std::ptr::null(),
+                offset: 0,
+                size: u64::MAX,
+            },
+            // UAV -> SRV -> kept
+            TitleBufferBarrier {
+                sync_before: D3D12_BARRIER_SYNC_COMPUTE_SHADING.0 as u32,
+                sync_after: D3D12_BARRIER_SYNC_PIXEL_SHADING.0 as u32,
+                access_before: D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0 as u32,
+                access_after: D3D12_BARRIER_ACCESS_SHADER_RESOURCE.0 as u32,
+                resource: std::ptr::null(),
+                offset: 0,
+                size: u64::MAX,
+            },
+        ];
+        let glob_barriers = [
+            // Split-begin -> dropped
+            TitleGlobalBarrier {
+                sync_before: D3D12_BARRIER_SYNC_COMPUTE_SHADING.0 as u32,
+                sync_after: D3D12_BARRIER_SYNC_SPLIT.0 as u32,
+                access_before: D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0 as u32,
+                access_after: D3D12_BARRIER_ACCESS_SHADER_RESOURCE.0 as u32,
+            },
+            // Valid compute UAV -> compute SRV -> kept
+            TitleGlobalBarrier {
+                sync_before: D3D12_BARRIER_SYNC_COMPUTE_SHADING.0 as u32,
+                sync_after: D3D12_BARRIER_SYNC_COMPUTE_SHADING.0 as u32,
+                access_before: D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0 as u32,
+                access_after: D3D12_BARRIER_ACCESS_SHADER_RESOURCE.0 as u32,
+            },
+        ];
+        let groups = [
+            tex_group,
+            TitleBarrierGroup {
+                kind: BARRIER_TYPE_BUFFER,
+                count: buf_barriers.len() as u32,
+                ptr: buf_barriers.as_ptr().cast(),
+            },
+            TitleBarrierGroup {
+                kind: BARRIER_TYPE_GLOBAL,
+                count: glob_barriers.len() as u32,
+                ptr: glob_barriers.as_ptr().cast(),
+            },
+        ];
+        let (g, b) = decode_barrier_groups(groups.len() as u32, groups.as_ptr().cast());
+        assert_eq!(g.len(), 1);
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].sync_before, D3D12_BARRIER_SYNC_COMPUTE_SHADING.0 as u32);
+        assert_eq!(b[0].sync_after, D3D12_BARRIER_SYNC_PIXEL_SHADING.0 as u32);
+
+        // Sanitizer: ACCESS_COMMON with specific sync narrows to stage-legal accesses (not invalid COMMON).
+        let (sb, sa, ab, aa) = enhanced::sanitize_pair(
+            D3D12_BARRIER_SYNC_COMPUTE_SHADING.0 as u32,
+            D3D12_BARRIER_SYNC_COMPUTE_SHADING.0 as u32,
+            D3D12_BARRIER_ACCESS_COMMON.0 as u32,
+            D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0 as u32,
+            D3D12_COMMAND_LIST_TYPE_DIRECT,
+            true,
+        )
+        .expect("compute COMMON -> UAV must sanitize cleanly");
+        assert_eq!(sb, D3D12_BARRIER_SYNC_COMPUTE_SHADING);
+        assert_eq!(sa, D3D12_BARRIER_SYNC_COMPUTE_SHADING);
+        assert_ne!(ab, D3D12_BARRIER_ACCESS_COMMON);
+        assert_eq!(aa, D3D12_BARRIER_ACCESS_UNORDERED_ACCESS);
+
+        // Sanitizer: SYNC_NONE forces ACCESS_NO_ACCESS.
+        let (sb, sa, ab, aa) = enhanced::sanitize_pair(
+            D3D12_BARRIER_SYNC_COMPUTE_SHADING.0 as u32,
+            D3D12_BARRIER_SYNC_NONE.0 as u32,
+            D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0 as u32,
+            D3D12_BARRIER_ACCESS_SHADER_RESOURCE.0 as u32,
+            D3D12_COMMAND_LIST_TYPE_DIRECT,
+            true,
+        )
+        .expect("flush barrier with SYNC_NONE after must sanitize");
+        assert_eq!(sb, D3D12_BARRIER_SYNC_COMPUTE_SHADING);
+        assert_eq!(sa, D3D12_BARRIER_SYNC_NONE);
+        assert_eq!(ab, D3D12_BARRIER_ACCESS_UNORDERED_ACCESS);
+        assert_eq!(aa, D3D12_BARRIER_ACCESS_NO_ACCESS);
+
+        // Sanitizer: mismatched VERTEX_SHADING + INDEX_BUFFER widens sync to cover INDEX_INPUT.
+        let (sb, sa, ab, aa) = enhanced::sanitize_pair(
+            D3D12_BARRIER_SYNC_COMPUTE_SHADING.0 as u32,
+            D3D12_BARRIER_SYNC_VERTEX_SHADING.0 as u32,
+            D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0 as u32,
+            D3D12_BARRIER_ACCESS_INDEX_BUFFER.0 as u32,
+            D3D12_COMMAND_LIST_TYPE_DIRECT,
+            true,
+        )
+        .expect("mismatched sync/access must widen cleanly");
+        assert_eq!(sb, D3D12_BARRIER_SYNC_COMPUTE_SHADING);
+        assert_ne!(sa.0 & D3D12_BARRIER_SYNC_INDEX_INPUT.0, 0);
+        assert_eq!(ab, D3D12_BARRIER_ACCESS_UNORDERED_ACCESS);
+        assert_eq!(aa, D3D12_BARRIER_ACCESS_INDEX_BUFFER);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "enables D3D12 Debug Layer (must run alone, not alongside shared host::host() tests)"]
+    fn live_rtx3090_enhanced_barrier_groups_debug_layer() {
+        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+        use windows::core::Interface;
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+
+        // SAFETY: isolated process Debug Layer test enabling validation before creating `Host`.
+        unsafe {
+            let mut debug: Option<ID3D12Debug> = None;
+            D3D12GetDebugInterface(&mut debug).expect("D3D12 Debug Layer must be available");
+            debug.unwrap().EnableDebugLayer();
+        }
+        let host = crate::host::host().expect("hardware Host with D3D12 Debug Layer");
+        assert!(
+            crate::host::enhanced_barriers(host),
+            "RTX 3090 must support D3D12 OPTIONS12 Enhanced Barriers"
+        );
+        let info_queue: ID3D12InfoQueue = host.device.cast().expect("ID3D12InfoQueue");
+        // SAFETY: clear startup messages before exercising enhanced barriers.
+        unsafe { info_queue.ClearStoredMessages() };
+
+        // Allocate a 64 KiB title buffer and materialize its host `Shadow` so `shadow::peek` resolves it.
+        const BUF_LEN: usize = 64 << 10;
+        // SAFETY: fresh committed allocation freed before return.
+        let mem = unsafe { VirtualAlloc(std::ptr::null(), BUF_LEN, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+        assert!(!mem.is_null(), "VirtualAlloc failed");
+        struct MemGuard(*mut std::ffi::c_void);
+        impl Drop for MemGuard {
+            fn drop(&mut self) {
+                // SAFETY: owned VirtualAlloc region.
+                unsafe { VirtualFree(self.0, 0, MEM_RELEASE) };
+            }
+        }
+        let _mem_guard = MemGuard(mem);
+        const FAKE_RES: usize = 0x7E57_BA22;
+        crate::shadow::register(FAKE_RES, mem as u64, BUF_LEN as u64);
+        let shadow = crate::shadow::find(mem as u64, BUF_LEN as u64).expect("host shadow for test buffer");
+        assert!(crate::shadow::peek(mem as u64, BUF_LEN as u64).is_some());
+
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
+        let mut list = null;
+        assert_eq!(create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list), S_OK);
+        let hl = host_list(list).expect("host list");
+        hl.mark_uav_write();
+        // Record a real 256-byte buffer copy into `shadow.buffer` so the command list
+        // contains actual GPU work to synchronize against (0 Debug Layer errors/warnings).
+        let (src_buf, _) = host.shared_buffer(256).expect("shared upload source buffer");
+        // SAFETY: open command list; live 256-byte upload source into 64 KiB `shadow.buffer`.
+        unsafe { hl.list.CopyBufferRegion(&shadow.buffer, 0, &src_buf, 0, 256) };
+
+        // 1. Pure-texture group -> 0 GPU barriers, `uav_dirty` untouched.
+        let dummy_tex = [0u8; 64];
+        let tex_group = TitleBarrierGroup {
+            kind: BARRIER_TYPE_TEXTURE,
+            count: 2,
+            ptr: dummy_tex.as_ptr(),
+        };
+        barrier_groups(list, 1, (&raw const tex_group).cast());
+        assert!(hl.uav_dirty(), "pure-texture group must not emit barrier or clear uav_dirty");
+
+        // 2. Targeted `D3D12_BUFFER_BARRIER`s on live `shadow.buffer` (incl. COMMON-on-COMPUTE sanitizer).
+        let buf_barriers = [
+            DecodedBufferBarrier {
+                sync_before: D3D12_BARRIER_SYNC_COMPUTE_SHADING.0 as u32,
+                sync_after: D3D12_BARRIER_SYNC_PIXEL_SHADING.0 as u32,
+                access_before: D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0 as u32,
+                access_after: D3D12_BARRIER_ACCESS_SHADER_RESOURCE.0 as u32,
+                addr: mem as u64,
+                len: BUF_LEN as u64,
+            },
+            DecodedBufferBarrier {
+                sync_before: D3D12_BARRIER_SYNC_COPY.0 as u32,
+                sync_after: D3D12_BARRIER_SYNC_ALL_SHADING.0 as u32,
+                access_before: D3D12_BARRIER_ACCESS_COPY_DEST.0 as u32,
+                access_after: (D3D12_BARRIER_ACCESS_SHADER_RESOURCE.0 | D3D12_BARRIER_ACCESS_VERTEX_BUFFER.0) as u32,
+                addr: mem as u64,
+                len: BUF_LEN as u64,
+            },
+            DecodedBufferBarrier {
+                sync_before: D3D12_BARRIER_SYNC_COMPUTE_SHADING.0 as u32,
+                sync_after: D3D12_BARRIER_SYNC_VERTEX_SHADING.0 as u32,
+                access_before: D3D12_BARRIER_ACCESS_COMMON.0 as u32,
+                access_after: D3D12_BARRIER_ACCESS_INDEX_BUFFER.0 as u32,
+                addr: mem as u64,
+                len: BUF_LEN as u64,
+            },
+        ];
+        emit_barrier_groups(list, 1, true, &[], &buf_barriers);
+        assert!(
+            hl.uav_dirty(),
+            "targeted buffer barriers alone must not clear uav_dirty for unrelated buffers"
+        );
+
+        // 3. `D3D12_GLOBAL_BARRIER`s (exact scope, ALL/COMMON, SYNC_NONE flush) -> clears `uav_dirty`.
+        let glob_barriers = [
+            TitleGlobalBarrier {
+                sync_before: D3D12_BARRIER_SYNC_COMPUTE_SHADING.0 as u32,
+                sync_after: D3D12_BARRIER_SYNC_COMPUTE_SHADING.0 as u32,
+                access_before: D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0 as u32,
+                access_after: D3D12_BARRIER_ACCESS_SHADER_RESOURCE.0 as u32,
+            },
+            TitleGlobalBarrier {
+                sync_before: D3D12_BARRIER_SYNC_ALL.0 as u32,
+                sync_after: D3D12_BARRIER_SYNC_ALL.0 as u32,
+                access_before: D3D12_BARRIER_ACCESS_COMMON.0 as u32,
+                access_after: D3D12_BARRIER_ACCESS_COMMON.0 as u32,
+            },
+            TitleGlobalBarrier {
+                sync_before: D3D12_BARRIER_SYNC_COMPUTE_SHADING.0 as u32,
+                sync_after: D3D12_BARRIER_SYNC_NONE.0 as u32,
+                access_before: D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0 as u32,
+                access_after: D3D12_BARRIER_ACCESS_NO_ACCESS.0 as u32,
+            },
+        ];
+        emit_barrier_groups(list, 1, true, &glob_barriers, &[]);
+        assert!(!hl.uav_dirty(), "global barrier must clear uav_dirty");
+
+        // Close and execute on a live Direct queue to force full GPU + Debug Layer validation.
+        close(list);
+        let cmd: ID3D12CommandList = hl.list.cast().expect("ID3D12CommandList");
+        // SAFETY: live device, closed command list, synchronous fence wait.
+        unsafe {
+            let queue: ID3D12CommandQueue = host
+                .device
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    ..Default::default()
+                })
+                .expect("direct command queue");
+            let fence: ID3D12Fence = host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
+            let event = CreateEventW(None, false, false, None).expect("event");
+            queue.ExecuteCommandLists(&[Some(cmd)]);
+            queue.Signal(&fence, 1).expect("signal");
+            fence.SetEventOnCompletion(1, event).expect("event on completion");
+            WaitForSingleObject(event, INFINITE);
+            let _ = CloseHandle(event);
+        }
+        drop(shadow);
+        crate::shadow::unregister(FAKE_RES, mem as u64);
+
+        // Verify 0 Debug Layer errors/corruptions/warnings.
+        // SAFETY: querying `ID3D12InfoQueue` stored messages.
+        let count = unsafe { info_queue.GetNumStoredMessages() };
+        let mut problems = Vec::new();
+        for i in 0..count {
+            let mut len = 0usize;
+            // SAFETY: two-call D3D12 `GetMessage` pattern.
+            unsafe {
+                let _ = info_queue.GetMessage(i, None, &mut len);
+                if len == 0 {
+                    continue;
+                }
+                let mut buf = vec![0u8; len];
+                let msg = buf.as_mut_ptr().cast::<D3D12_MESSAGE>();
+                if info_queue.GetMessage(i, Some(msg), &mut len).is_ok() {
+                    let sev = (*msg).Severity;
+                    if sev == D3D12_MESSAGE_SEVERITY_CORRUPTION
+                        || sev == D3D12_MESSAGE_SEVERITY_ERROR
+                        || sev == D3D12_MESSAGE_SEVERITY_WARNING
+                    {
+                        let text = std::ffi::CStr::from_ptr((*msg).pDescription.cast())
+                            .to_string_lossy()
+                            .into_owned();
+                        problems.push(format!("[sev={}] {text}", sev.0));
+                    }
+                }
+            }
+        }
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
+        assert!(
+            problems.is_empty(),
+            "D3D12 Debug Layer reported {} Enhanced Barrier issues:\n{}",
+            problems.len(),
+            problems.join("\n")
+        );
     }
 }

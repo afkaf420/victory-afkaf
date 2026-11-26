@@ -78,6 +78,9 @@ pub(crate) struct Lowered {
     /// Number of `dx.op.barrier` calls emitted before optimisation.
     #[cfg(test)]
     pub barriers: u32,
+    /// Write/read masks of emitted `dx.op.rawBufferLoad.*` calls before optimisation.
+    #[cfg(test)]
+    pub raw_load_masks: Vec<u8>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -894,7 +897,11 @@ impl<'a> Lower<'a> {
                             if crosses || (split_lds && group > 64 && !x.st.wide.is_empty()) {
                                 let (ex, dwords) = make_exchange(group, all);
                                 exchange = Some(ex);
-                                exchange_dwords = dwords;
+                                // `with_local_waves` runs each host 32-lane wave on its own
+                                // and never touches the cross-half TGSM exchange bank.
+                                if !LOCAL_WAVES.get() {
+                                    exchange_dwords = dwords;
+                                }
                             }
                         }
                     }
@@ -940,7 +947,21 @@ impl<'a> Lower<'a> {
                     eprintln!("WAVE64-WHY group={group} lds={} [{}]", raw_lds_dwords > 0, why.join(", "));
                 }
             }
-            let halves_needed = wave == 32 && x.native.wave64;
+            let local_waves = exchange.is_some() && LOCAL_WAVES.get();
+            // Intra-half layout operations (`ds_swizzle`, DPP, `v_permlane*`,
+            // lane-constant masks) require `wave_base` relabelling so host
+            // lanes hold consecutive console thread IDs; `wave_local` shaders
+            // without them can use hardware `SV_GroupThreadID` and
+            // `waveGetLaneIndex` directly with zero TGSM and zero entry barrier.
+            let in_half_layout = p.blocks.iter().any(|blk| {
+                blk.insts.iter().any(|inst| {
+                    let n = inst.name();
+                    n.starts_with("ds_swizzle")
+                        || n.starts_with("v_permlane")
+                        || matches!(&inst.fields, Fields::Valu(v) if v.dpp.is_some())
+                })
+            }) || lane_constant_masks(x.st);
+            let halves_needed = wave == 32 && x.native.wave64 && (!local_waves || in_half_layout);
             let reserved_dwords = u32::from(halves_needed) + exchange_dwords;
             let max_console = MAX_LDS_DWORDS.saturating_sub(reserved_dwords);
             console_lds_dwords = raw_lds_dwords.min(max_console);
@@ -1852,6 +1873,8 @@ impl<'a> Lower<'a> {
             atomic_rmws: self.s.m.atomic_rmw_count(),
             #[cfg(test)]
             barriers: self.s.m.barrier_count(),
+            #[cfg(test)]
+            raw_load_masks: self.s.m.raw_load_masks(),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -2448,15 +2471,15 @@ impl<'a> Lower<'a> {
     /// raw UAV handle `globallycoherent` (`0x4000`) so non-builder readers keep
     /// full L1 caching. Fault reporting to `SLOT_FAULTS` is guarded on `missing`
     /// so resident accesses perform zero global sink stores.
-    fn memory(&mut self, lo: V, hi: V, guard: Option<V>) -> (V, V) {
+    fn memory(&mut self, lo: V, hi: V, guard: Option<V>, coherent_access: bool) -> (V, V) {
         use super::shader::{
             MEMORY_FAULTS, MEMORY_PAGES, SLOT_FAULTS, SLOT_MEMORY, USER_MEMORY_APERTURE_HI,
             USER_MEMORY_BASE,
         };
-        // Only the ray-tracing structure builder (`is_spilled`) needs
-        // `globallycoherent` (`0x4000`) across workgroups; non-builder readers
-        // keep full L1 cache hits.
-        let coherent = if crate::spill::is_spilled(self.x.native) {
+        // Only the ray-tracing structure builder (`is_spilled`) or explicit
+        // `glc`/`slc`/`dlc` accesses need `globallycoherent` (`0x4000`) across
+        // workgroups; ordinary non-GLC reads keep full L1 cache hits.
+        let coherent = if crate::spill::is_spilled(self.x.native) || coherent_access {
             0x4000
         } else {
             0
@@ -2596,12 +2619,13 @@ impl<'a> Lower<'a> {
             "dwordx4" => Ok(4),
             _ => Err(name),
         };
+        let coherent = cache.glc || cache.slc;
         if let Some(rest) = name.strip_prefix("global_load_") {
             let n = count(rest)?;
             let Some(Operand::Vector { reg, .. }) = *dst else {
                 return Err("a global load result");
             };
-            let (h, byte) = self.memory(lo, hi, guard);
+            let (h, byte) = self.memory(lo, hi, guard, coherent);
             let c = self.cur;
             let mask = self.s.m.i8((1u8 << n) - 1);
             let r = self.s.op(
@@ -2623,7 +2647,7 @@ impl<'a> Lower<'a> {
             let n = count(rest)?;
             let d = data.as_ref().ok_or("global store data")?;
             let vals = self.vgprs(inst, d, n)?;
-            let (h, byte) = self.memory(lo, hi, guard);
+            let (h, byte) = self.memory(lo, hi, guard, coherent);
             let mut args = vec![h, byte, iu];
             args.extend(&vals);
             args.resize(3 + 4, iu);
@@ -2650,7 +2674,7 @@ impl<'a> Lower<'a> {
             Some(x) => self.i32_of(x)?,
             None => self.s.m.i32(0),
         };
-        let (h, byte) = self.memory(lo, hi, guard);
+        let (h, byte) = self.memory(lo, hi, guard, coherent);
         let c = self.cur;
         // DXIL's atomic operations: add 0, and 1, or 2, xor 3, signed
         // minimum 4 and maximum 5, unsigned 6 and 7, exchange 8.
@@ -2804,10 +2828,11 @@ impl<'a> Lower<'a> {
         }
         let (iu, align) = (self.s.m.undef(i32t), self.s.m.i32(4));
         let mut loaded = Vec::with_capacity(usize::from(count));
+        let coherent = cache.glc || cache.dlc;
         for first in (0..count).step_by(4) {
             let n = (count - first).min(4);
             let (lo, hi) = self.address_plus(lo, hi, offset + 4 * i32::from(first));
-            let (h, byte) = self.memory(lo, hi, None);
+            let (h, byte) = self.memory(lo, hi, None, coherent);
             let c = self.cur;
             let mask = self.s.m.i8((1u8 << n) - 1);
             let r = self.s.op(
@@ -3454,11 +3479,12 @@ impl<'a> Lower<'a> {
         let ptr = self.s.m.element(e, lds, k);
         let zero = self.s.m.i32(0);
         self.s.m.store(e, ptr, zero);
-        if let Some((ex_slot, stride, hdr_dwords, total_hdr)) = self
-            .exchange
-            .as_ref()
-            .filter(|ex| ex.paired())
-            .map(|ex| (ex.slot, ex.stride, ex.hdr_dwords, ex.console_waves * ex.hdr_dwords))
+        if !self.local
+            && let Some((ex_slot, stride, hdr_dwords, total_hdr)) = self
+                .exchange
+                .as_ref()
+                .filter(|ex| ex.paired())
+                .map(|ex| (ex.slot, ex.stride, ex.hdr_dwords, ex.console_waves * ex.hdr_dwords))
         {
             // Branch-free zeroing of all per-console-wave control headers
             // (Mode A: `[parity0, parity1]`; Mode B: `[cnt0, cnt1, dead]`)
@@ -3528,7 +3554,7 @@ impl<'a> Lower<'a> {
     /// This thread's console lane (0..63): its relabelled thread index (`thread_id`), whose host
     /// wave holds a 32-aligned run of console lanes. Without `exchange`: the host lane.
     fn console_lane(&mut self) -> V {
-        if self.exchange.is_none() {
+        if self.exchange.is_none() || (self.local && self.halves.is_none()) {
             return self.lane_index();
         }
         if let Some(v) = self.clane {
@@ -4292,7 +4318,7 @@ impl<'a> Lower<'a> {
     /// plus the lane index. (A bijection while each host wave holds a
     /// wave-aligned run of flat ids, as the console's waves do.)
     fn thread_id(&mut self, c: u8) -> Val {
-        if !self.console_lanes {
+        if !self.console_lanes || (self.local && self.halves.is_none()) {
             return self.compute_id("threadIdInGroup.i32", 95, c);
         }
         let [x, y, _] = self.s.threads.expect("compute");
@@ -5825,13 +5851,19 @@ impl<'a> Lower<'a> {
             let is_buffer = self.s.m.cmp(self.cur, pred::NE, stride, zero);
             let at = self.begin_guarded(Some(is_buffer));
             let h = self.handle(site, src, false, (11, 0))?;
-            let mut raw = Vec::new();
-            for k in 0..count {
+            let mut raw = Vec::with_capacity(count as usize);
+            let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
+            let mut k = 0u32;
+            while k < count {
                 let b = self.cur;
-                let off = self.s.m.i32(4 * k);
-                let a = self.s.m.bin(b, Bin::Add, addr, off);
-                let mask = self.s.m.i8(1);
-                let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
+                let chunk = (count - k).min(4);
+                let a = if k == 0 {
+                    addr
+                } else {
+                    let off = self.s.m.i32(4 * k);
+                    self.s.m.bin(b, Bin::Add, addr, off)
+                };
+                let mask = self.s.m.i8((1u8 << chunk) - 1);
                 let r = self.s.op(
                     b,
                     "rawBufferLoad.f32",
@@ -5840,8 +5872,11 @@ impl<'a> Lower<'a> {
                     139,
                     &[h, a, u, mask, al],
                 );
-                let x = self.s.m.extract(b, r, 0);
-                raw.push((self.as_int(x), zero));
+                for ch in 0..chunk {
+                    let x = self.s.m.extract(b, r, ch);
+                    raw.push((self.as_int(x), zero));
+                }
+                k += chunk;
             }
             let raw = self.end_guarded(at, &raw);
             let is_cb = self.s.m.cmp(self.cur, pred::EQ, stride, zero);
@@ -5862,11 +5897,17 @@ impl<'a> Lower<'a> {
         if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
             let h = self.handle(site, src, false, (11, 0))?;
             let mut loaded = Vec::with_capacity(count as usize);
-            for k in 0..count {
-                let off = self.s.m.i32(4 * k);
-                let a = self.s.m.bin(c, Bin::Add, addr, off);
-                let mask = self.s.m.i8(1);
-                let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
+            let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
+            let mut k = 0u32;
+            while k < count {
+                let chunk = (count - k).min(4);
+                let a = if k == 0 {
+                    addr
+                } else {
+                    let off = self.s.m.i32(4 * k);
+                    self.s.m.bin(c, Bin::Add, addr, off)
+                };
+                let mask = self.s.m.i8((1u8 << chunk) - 1);
                 let r = self.s.op(
                     c,
                     "rawBufferLoad.f32",
@@ -5875,8 +5916,11 @@ impl<'a> Lower<'a> {
                     139,
                     &[h, a, u, mask, al],
                 );
-                let x = self.s.m.extract(c, r, 0);
-                loaded.push(self.as_int(x));
+                for ch in 0..chunk {
+                    let x = self.s.m.extract(c, r, ch);
+                    loaded.push(self.as_int(x));
+                }
+                k += chunk;
             }
             self.write_smem_words(inst, code, loaded, coherent);
             return Ok(());
@@ -10315,6 +10359,60 @@ mod tests {
             v.validate(&mut lowered.dxil)
                 .expect("guarded memory() DXIL validation failed");
         }
+        // An explicit `glc=1` global load (word0 bit 16 = `0xDC31_8000`) MUST
+        // preserve `globallycoherent` (`0x4000`) even in non-spilled shaders.
+        let mut glc_words = words.to_vec();
+        glc_words[5] = 0xDC31_8000;
+        let mut glc_native = native.clone();
+        glc_native.code = glc_words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let gp = crate::ir::build(&glc_native.code, glc_native.wave64, glc_native.vgprs).expect("ir");
+        let gst = crate::structure::structure(&gp).expect("structure");
+        let gres = crate::resource::track(&gp, &glc_native.layout, glc_native.stage, Some(&gst))
+            .expect("track");
+        let gio = crate::io::raise(&gp, &glc_native).expect("io");
+        let gparts = Parts {
+            native: &glc_native,
+            p: &gp,
+            st: &gst,
+            io: &gio,
+            res: &gres,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        };
+        let mut gl = Lower::new(&gparts, &bad);
+        let was_uma = TEST_SPARSE_UMA.replace(Some(false));
+        gl.s.threads = Some([32, 1, 1]);
+        let gres_run = (|| -> Result<(), Stop> {
+            let p = gl.x.p;
+            let order = crate::ir::reverse_postorder(&p.blocks);
+            for (n, &b) in order.iter().enumerate() {
+                gl.rpo[b] = n;
+                gl.block[b] = Some(if n == 0 { gl.s.entry } else { gl.s.m.new_block() });
+            }
+            gl.cur = gl.s.entry;
+            gl.inputs()?;
+            gl.entry_tail = gl.cur;
+            gl.block[order[0]] = Some(gl.cur);
+            for &b in &order {
+                gl.cur = gl.block[b].expect("reachable");
+                gl.cur_ir = b;
+                for i in 0..p.blocks[b].insts.len() {
+                    gl.inst(b, i)?;
+                }
+                gl.exit(b)?;
+                gl.tail[b] = Some(gl.cur);
+            }
+            Ok(())
+        })();
+        TEST_SPARSE_UMA.set(was_uma);
+        assert!(gres_run.is_ok(), "lower glc=1 global_load failed");
+        let (glc_gc, _, _, _) = gl.s.m.memory_stats();
+        assert_eq!(
+            glc_gc, 1,
+            "explicit glc=1 global_load must preserve globallycoherent (0x4000)"
+        );
     }
 
     #[test]

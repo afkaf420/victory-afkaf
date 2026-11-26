@@ -33,6 +33,71 @@ pub(crate) struct Pending {
     /// whether a draw or dispatch has requested it yet.
     key: String,
     used: AtomicBool,
+    /// A pass over the screen ([`GraphicsState::screen_pass`]) or a confirmed
+    /// opening-scene / bake producer that must never sit behind cold shaders.
+    screen: bool,
+    /// Confirmed first-scene / bake producer prepared early even on a cold cache.
+    scene_input: bool,
+    /// Why this pipeline is intentionally skipped (e.g. RT resolve without BVH).
+    left_out: Option<&'static str>,
+}
+
+fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
+    shaders
+        .iter()
+        .any(|s| s.stage == "compute" && s.container.windows(name.len()).any(|w| w == name))
+}
+
+fn resolve_skip_flags(
+    bvh_builder: bool,
+    rt_resolve_env: Option<&str>,
+    activate_rays_env: Option<&str>,
+) -> (bool, bool) {
+    let skip_rt = !bvh_builder && rt_resolve_env.is_none_or(|v| v.trim() == "0");
+    let skip_activate = if bvh_builder {
+        activate_rays_env.is_some_and(|v| v.trim() == "0")
+    } else {
+        activate_rays_env.is_none_or(|v| v.trim() == "0")
+    };
+    (skip_rt, skip_activate)
+}
+
+fn left_out_with(shaders: &[Arc<Shader>], skip_rt: bool, skip_activate: bool) -> Option<&'static str> {
+    if skip_rt && named(shaders, b"CS_RaytracingResolve") {
+        return Some("shades ray-tracing hits without BVH, left out");
+    }
+    if skip_activate && named(shaders, b"CS_ScreenProbes_ActivateRays") {
+        return Some("ray activation shader without BVH, left out");
+    }
+    None
+}
+
+fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
+    static SKIP_FLAGS: OnceLock<(bool, bool)> = OnceLock::new();
+    let &(skip_rt, skip_activate) = SKIP_FLAGS.get_or_init(|| {
+        let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
+        let rt_env = std::env::var("VICTORY_RT_RESOLVE").ok();
+        let act_env = std::env::var("VICTORY_ACTIVATE_RAYS").ok();
+        resolve_skip_flags(builder, rt_env.as_deref(), act_env.as_deref())
+    });
+    left_out_with(shaders, skip_rt, skip_activate)
+}
+
+/// Confirmed first-scene producers. Prepare these at creation even on a cold
+/// launch so opening-scene lighting, tiling, and decoration bakes never miss
+/// their first frame.
+fn scene_input(shaders: &[Arc<Shader>]) -> bool {
+    shaders.iter().any(|s| {
+        matches!(
+            s.hash.as_str(),
+            "970c4fbb3b017c0e"
+                | "068c90badc86f1fd"
+                | "e4a7e088c7780ce8"
+                | "ebe4e53f031f5249"
+                | "2cc4c197ee29e291"
+                | "369cbe906ea72764"
+        ) || crate::draw::BAKE_PIXEL_SHADERS.contains(&s.hash.as_str())
+    })
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -49,6 +114,11 @@ impl Pending {
             key.update(s.hash.as_bytes());
         }
         key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
+        let scene_input = scene_input(&shaders);
+        let screen = (graphics.as_ref().is_some_and(|g| g.screen_pass())
+            && shaders.iter().all(|s| s.stage != "mesh"))
+            || scene_input;
+        let left_out = left_out(&shaders);
         Pending {
             shaders,
             graphics,
@@ -56,6 +126,9 @@ impl Pending {
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            screen,
+            scene_input,
+            left_out,
         }
     }
 
@@ -72,6 +145,9 @@ impl Pending {
 /// not translate, else "refused" or "being made"; `None` if it has one.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn missing(p: &Pending) -> Option<String> {
+    if let Some(why) = p.left_out {
+        return Some(why.into());
+    }
     match p.made.get() {
         Some(Some(_)) => None,
         None => Some("being made".into()),
@@ -107,6 +183,24 @@ fn wait_budget() -> Duration {
     })
 }
 
+/// As [`wait_budget`], for passes over the screen and confirmed scene inputs
+/// (`VICTORY_SCREEN_WAIT_MS`, 10 s; 0: like the others).
+fn screen_budget() -> Duration {
+    static BUDGET: OnceLock<Duration> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        let millis = std::env::var("VICTORY_SCREEN_WAIT_MS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(10_000);
+        Duration::from_millis(millis)
+    })
+}
+
+/// Whether passes over the screen go before the others.
+fn screens_first() -> bool {
+    !screen_budget().is_zero()
+}
+
 /// Pipelines queued and not made yet.
 static WAITING: AtomicU64 = AtomicU64::new(0);
 
@@ -118,6 +212,9 @@ pub(crate) fn waiting() -> u64 {
 /// The host pipeline if it is made (or is made within the frame's budget);
 /// queues it on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
+    if p.left_out.is_some() {
+        return None;
+    }
     // A still-pending pipeline was requested by the title too. Prewarm it
     // on the next launch, even if this run never got to use it.
     if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
@@ -133,16 +230,23 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
 /// that is making it); whether it has a host pipeline.
 pub(crate) fn now(p: &Arc<Pending>) -> bool {
+    if p.left_out.is_some() {
+        return false;
+    }
     p.make();
     p.made.get().is_some_and(|made| made.is_some())
 }
 
 /// At the title's creation of a pipeline: starts it at once if an earlier
-/// run drew with it (during loading, so the world's first frames find it).
+/// run drew with it (during loading, so the world's first frames find it),
+/// or if it is a confirmed opening-scene / bake producer.
 pub(crate) fn early(p: &Arc<Pending>) {
-    if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
+    if p.left_out.is_some() {
+        return;
+    }
+    if !p.shaders.is_empty() && (p.scene_input || super::library::wanted_early(&p.key)) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
-        start(p, EARLY);
+        start(p, if p.scene_input { REQUESTED } else { EARLY });
     }
 }
 
@@ -161,16 +265,18 @@ fn shared_budget() -> bool {
 
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
-    let budget = wait_budget();
+    let screen = p.screen && screens_first();
+    let budget = if screen { screen_budget() } else { wait_budget() };
     if budget.is_zero() {
         return;
     }
     // The frame the budget belongs to, and what was waited of it (or is
-    // taken by a thread waiting now).
-    static SPENT: Mutex<(u64, Duration)> = Mutex::new((u64::MAX, Duration::ZERO));
+    // taken by a thread waiting now); separate bucket for screen passes.
+    static SPENT: [Mutex<(u64, Duration)>; 2] = [const { Mutex::new((u64::MAX, Duration::ZERO)) }; 2];
+    let spent_of = &SPENT[usize::from(screen)];
     let shared = shared_budget();
     let left = {
-        let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
+        let mut spent = spent_of.lock().unwrap_or_else(|e| e.into_inner());
         if spent.0 != frame {
             *spent = (frame, Duration::ZERO);
         }
@@ -196,7 +302,7 @@ fn wait(p: &Pending, frame: u64) {
     drop(held);
     let waited = started.elapsed().min(left);
     {
-        let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
+        let mut spent = spent_of.lock().unwrap_or_else(|e| e.into_inner());
         // A frame that began meanwhile has its own budget.
         if spent.0 == frame {
             if shared {
@@ -219,6 +325,9 @@ const REQUESTED: u8 = 2;
 const MAKING: u8 = 3;
 
 struct Queue {
+    /// Requested passes over the screen and confirmed first-scene inputs:
+    /// before all others, and the only ones [`SCREEN_WORKERS`] take.
+    screen: VecDeque<Arc<Pending>>,
     early: VecDeque<Arc<Pending>>,
     requested: VecDeque<Arc<Pending>>,
 }
@@ -226,6 +335,7 @@ struct Queue {
 impl Queue {
     const fn new() -> Self {
         Self {
+            screen: VecDeque::new(),
             early: VecDeque::new(),
             requested: VecDeque::new(),
         }
@@ -239,7 +349,9 @@ impl Queue {
             return None;
         }
         p.queue_state.store(priority, Ordering::Relaxed);
-        if priority == REQUESTED {
+        if priority == REQUESTED && p.screen && screens_first() {
+            self.screen.push_back(p.clone());
+        } else if priority == REQUESTED {
             self.requested.push_back(p.clone());
         } else {
             self.early.push_back(p.clone());
@@ -247,12 +359,16 @@ impl Queue {
         Some(prev == NOT_QUEUED)
     }
 
-    fn pop(&mut self) -> Option<Arc<Pending>> {
-        let p = self.requested.pop_front().or_else(|| {
-            // An early entry can have been promoted and claimed already.
-            std::iter::from_fn(|| self.early.pop_front())
-                .find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
-        })?;
+    fn pop(&mut self, screens_only: bool) -> Option<Arc<Pending>> {
+        let mut p = self.screen.pop_front();
+        if p.is_none() && !screens_only {
+            p = self.requested.pop_front().or_else(|| {
+                // An early entry can have been promoted and claimed already.
+                std::iter::from_fn(|| self.early.pop_front())
+                    .find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
+            });
+        }
+        let p = p?;
         p.queue_state.store(MAKING, Ordering::Relaxed);
         Some(p)
     }
@@ -278,30 +394,36 @@ fn start(p: &Arc<Pending>, priority: u8) {
         if new {
             PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
         }
-        AVAILABLE.notify_one();
+        AVAILABLE.notify_all();
     }
 }
 
-fn next() -> Arc<Pending> {
+/// Dedicated workers reserved for screen passes and confirmed scene inputs.
+const SCREEN_WORKERS: usize = 2;
+
+fn next(screens_only: bool) -> Arc<Pending> {
     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
     loop {
-        if let Some(p) = queue.pop() {
+        if let Some(p) = queue.pop(screens_only) {
             return p;
         }
         queue = AVAILABLE.wait(queue).unwrap_or_else(|e| e.into_inner());
     }
 }
 
-/// Starts the workers (half the logical processors, 2 to 8) on first use.
+/// Starts the workers (half the logical processors, 2 to 8, plus dedicated
+/// screen workers) on first use.
 fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
         let mut running = false;
         let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
-        for i in 0..workers {
+        let screens = if screens_first() { SCREEN_WORKERS } else { 0 };
+        for i in 0..workers + screens {
+            let screens_only = i >= workers;
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
-                .spawn(|| {
+                .spawn(move || {
                     // Below the title's own threads (loading, recording).
                     // SAFETY: a plain call on our own thread.
                     unsafe {
@@ -309,7 +431,7 @@ fn workers() -> bool {
                         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
                     }
                     loop {
-                        next().make();
+                        next(screens_only).make();
                         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
                             drained();
                         } else {
@@ -390,10 +512,80 @@ mod tests {
         assert_eq!(queue.push(&promoted, REQUESTED), Some(false));
         assert_eq!(queue.push(&promoted, REQUESTED), None);
 
-        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &requested));
-        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &promoted));
+        assert!(Arc::ptr_eq(&queue.pop(false).unwrap(), &requested));
+        assert!(Arc::ptr_eq(&queue.pop(false).unwrap(), &promoted));
         assert_eq!(queue.push(&promoted, REQUESTED), None);
-        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &earlier));
-        assert!(queue.pop().is_none());
+        assert!(Arc::ptr_eq(&queue.pop(false).unwrap(), &earlier));
+        assert!(queue.pop(false).is_none());
+    }
+
+    fn fake_shader(stage: &'static str, hash: &str, tag: &[u8]) -> Arc<Shader> {
+        Arc::new(Shader {
+            stage,
+            hash: hash.to_owned(),
+            container: tag.to_vec(),
+            #[cfg(windows)]
+            translated: OnceLock::new(),
+            #[cfg(windows)]
+            ambient: None,
+        })
+    }
+
+    #[test]
+    fn left_out_skips_dead_rt_shaders_without_bvh_and_respects_overrides() {
+        let rt_resolve = vec![fake_shader("compute", "1111111111111111", b"hdr_CS_RaytracingResolve_x")];
+        let activate = vec![fake_shader("compute", "2222222222222222", b"hdr_CS_ScreenProbes_ActivateRays_x")];
+        let normal = vec![fake_shader("compute", "3333333333333333", b"hdr_CS_LightGrid_x")];
+        let check = |shaders: &[Arc<Shader>], bvh, rt, act| {
+            let (sr, sa) = resolve_skip_flags(bvh, rt, act);
+            left_out_with(shaders, sr, sa)
+        };
+
+        // Default (BVH=0): both dead RT shaders are skipped; normal shaders are not.
+        assert!(check(&rt_resolve, false, None, None).is_some());
+        assert!(check(&activate, false, None, None).is_some());
+        assert!(check(&normal, false, None, None).is_none());
+
+        // Explicit overrides re-enable them.
+        assert!(check(&rt_resolve, false, Some("1"), None).is_none());
+        assert!(check(&activate, false, None, Some("1")).is_none());
+
+        // With BVH=1: both enabled by default, unless VICTORY_ACTIVATE_RAYS=0.
+        assert!(check(&rt_resolve, true, None, None).is_none());
+        assert!(check(&activate, true, None, None).is_none());
+        assert!(check(&activate, true, None, Some("0")).is_some());
+
+        // Pending::new marks left_out and short-circuits ready()/now()/early() without queuing.
+        let p = Arc::new(Pending::new(rt_resolve, None));
+        assert!(p.left_out.is_some());
+        assert!(ready(&p).is_none());
+        assert!(!now(&p));
+        early(&p);
+        assert_eq!(p.queue_state.load(Ordering::Relaxed), NOT_QUEUED);
+    }
+
+    #[test]
+    fn scene_input_and_screen_passes_go_first() {
+        let bake = Pending::new(
+            vec![fake_shader("pixel", crate::draw::BAKE_PIXEL_SHADERS[0], b"bake")],
+            None,
+        );
+        assert!(bake.scene_input);
+        assert!(bake.screen);
+
+        let lighting = Pending::new(vec![fake_shader("compute", "970c4fbb3b017c0e", b"light")], None);
+        assert!(lighting.scene_input);
+        assert!(lighting.screen);
+
+        let world = Arc::new(Pending::new(Vec::new(), None));
+        let mut screen = Pending::new(Vec::new(), None);
+        screen.screen = true;
+        let screen = Arc::new(screen);
+        let mut queue = Queue::new();
+        assert_eq!(queue.push(&world, REQUESTED), Some(true));
+        assert_eq!(queue.push(&screen, REQUESTED), Some(true));
+        assert!(Arc::ptr_eq(&queue.pop(true).unwrap(), &screen));
+        assert!(queue.pop(true).is_none());
+        assert!(Arc::ptr_eq(&queue.pop(false).unwrap(), &world));
     }
 }

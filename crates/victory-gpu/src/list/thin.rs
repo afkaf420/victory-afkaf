@@ -570,8 +570,29 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
     }
     0
 }
-extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
-    front(this).put(BARRIER_GROUPS, &[u64::from(count)]);
+extern "system" fn barrier_groups(this: This, count: u32, groups: *const u8) {
+    if count == 0 {
+        return;
+    }
+    if groups.is_null() {
+        front(this).put(BARRIER_GROUPS, &[u64::from(count), u64::MAX]);
+        return;
+    }
+    let (globals, buffers) = super::decode_barrier_groups(count, groups);
+    if super::enhanced_barriers_on() && globals.is_empty() && buffers.is_empty() {
+        // Pure-texture, SYNC_NONE, or read-to-read buffer barrier groups require
+        // no host barrier under Enhanced Barriers; drop before entering the stream.
+        return;
+    }
+    let header = u64::from(globals.len() as u32) | (u64::from(buffers.len() as u32) << 32);
+    front(this).put_with(
+        BARRIER_GROUPS,
+        &[u64::from(count), header],
+        &[
+            bytes_of(globals.as_ptr(), globals.len()),
+            bytes_of(buffers.as_ptr(), buffers.len()),
+        ],
+    );
 }
 extern "system" fn viewports(this: This, count: u32, items: *const D3D12_VIEWPORT) {
     let count = if items.is_null() { 0 } else { count };
@@ -817,7 +838,38 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
             BARRIER => {
                 super::barrier(list, n as u32, at_or(w, 1));
             }
-            BARRIER_GROUPS => super::barrier_groups(list, n as u32, std::ptr::null()),
+            BARRIER_GROUPS => {
+                if w.len() < 2 || w[1] == u64::MAX {
+                    super::barrier_groups(list, n as u32, std::ptr::null());
+                } else {
+                    let g_count = w[1] as u32 as usize;
+                    let b_count = (w[1] >> 32) as u32 as usize;
+                    let g_words = (g_count * size_of::<super::TitleGlobalBarrier>()).div_ceil(8);
+                    let globals = if g_count > 0 {
+                        // SAFETY: serialized by `barrier_groups` from `TitleGlobalBarrier` slice.
+                        unsafe {
+                            std::slice::from_raw_parts(
+                                w[2..].as_ptr().cast::<super::TitleGlobalBarrier>(),
+                                g_count,
+                            )
+                        }
+                    } else {
+                        &[]
+                    };
+                    let buffers = if b_count > 0 {
+                        // SAFETY: serialized by `barrier_groups` right after `globals`.
+                        unsafe {
+                            std::slice::from_raw_parts(
+                                w[2 + g_words..].as_ptr().cast::<super::DecodedBufferBarrier>(),
+                                b_count,
+                            )
+                        }
+                    } else {
+                        &[]
+                    };
+                    super::emit_barrier_groups(list, n as u32, true, globals, buffers);
+                }
+            }
             VIEWPORTS => state::viewports(list, n as u32, at(w, 1, n)),
             SCISSORS => state::scissors(list, n as u32, at(w, 1, n)),
             BLEND_FACTOR => state::blend_factor(list, at(w, 1, n)),

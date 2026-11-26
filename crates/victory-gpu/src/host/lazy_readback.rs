@@ -36,6 +36,10 @@ use crate::watch::ConsoleMemClass;
 /// D3D12/console allocation granularity).
 pub(crate) const BLOCK: usize = 64 << 10;
 
+/// Maximum number of virtual alias views (`inplace::pages_of`) supported for a
+/// single `GpuResident` 64 KiB physical block (`1..=4`).
+const MAX_ALIASES: usize = 4;
+
 /// Number of CPU faults/materializations after which a 64 KiB block is
 /// permanently demoted to `CpuHot` until unmapped/remapped.
 const DEMOTE_THRESHOLD: u8 = 2;
@@ -280,14 +284,15 @@ fn try_alias_writer(block_va: usize, data: &[u8; BLOCK]) -> bool {
 /// `[7]` `evict_range` drops (0 readback),
 /// `[8]` `flush_shadow` flushes,
 /// `[9]` blocks demoted to `CpuHot`,
-/// `[10]` fetch microseconds total.
-static STATS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+/// `[10]` fetch microseconds total,
+/// `[11]` multi-view aliased (`2..=4` VAs) promotions.
+static STATS: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
 /// Per-interval `plan_gpu_resident` rejection counters:
 /// `[0]` out-of-shadow-span, `[1]` class ineligible (e.g. `0x2004` in mode 1),
-/// `[2]` multi-view aliased (`inplace::pages_of.len() >= 2`),
+/// `[2]` multi-view aliased (`> 4` VAs or intra-shadow self-alias),
 /// `[3]` `CpuHot` / `Fetching`, `[4]` `!is_committable_block`.
 static REJ: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
-/// Currently active `GpuResident` block count.
+/// Currently active `GpuResident` physical 64 KiB block count.
 static LIVE_BLOCKS: AtomicU64 = AtomicU64::new(0);
 /// Cumulative blocks demoted to `CpuHot`.
 static TOTAL_DEMOTED: AtomicU64 = AtomicU64::new(0);
@@ -302,11 +307,76 @@ fn rej(idx: usize) {
     REJ[idx].fetch_add(1, Ordering::Relaxed);
 }
 
+/// Sorted, deduplicated set of `1..=MAX_ALIASES` 64 KiB block indices
+/// (`va / BLOCK`) that all map to the same physical 64 KiB page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AliasSet {
+    blocks: [usize; MAX_ALIASES],
+    len: u8,
+}
+
+impl AliasSet {
+    /// Builds a sorted, deduplicated `AliasSet` from `primary_block` and the
+    /// raw VA list returned by `crate::inplace::pages_of(primary_block * BLOCK)`.
+    /// Returns `None` if there are `> MAX_ALIASES` distinct alias VAs or any
+    /// VA is not 64 KiB aligned.
+    fn from_pages(primary_block: usize, page_vas: &[usize]) -> Option<Self> {
+        let mut blocks = [0usize; MAX_ALIASES];
+        let mut len = 0usize;
+        let mut push_unique = |blk: usize| -> bool {
+            if blocks[..len].contains(&blk) {
+                return true;
+            }
+            if len >= MAX_ALIASES {
+                return false;
+            }
+            blocks[len] = blk;
+            len += 1;
+            true
+        };
+        if !push_unique(primary_block) {
+            return None;
+        }
+        for &va in page_vas {
+            if !va.is_multiple_of(BLOCK) {
+                return None;
+            }
+            if !push_unique(va / BLOCK) {
+                return None;
+            }
+        }
+        blocks[..len].sort_unstable();
+        Some(Self {
+            blocks,
+            len: len as u8,
+        })
+    }
+
+    #[inline]
+    fn as_slice(&self) -> &[usize] {
+        &self.blocks[..self.len as usize]
+    }
+
+    /// Deterministic canonical primary key in `State::blocks` (minimum block index).
+    #[inline]
+    fn canonical(&self) -> usize {
+        self.blocks[0]
+    }
+
+    #[inline]
+    fn contains(&self, block: usize) -> bool {
+        self.as_slice().contains(&block)
+    }
+}
+
 struct ResidentInfo {
+    /// Block index (`va / BLOCK`) inside `shadow`'s span matching `gpu_offset`.
+    owner_block: usize,
     shadow_id: u64,
     shadow: Option<Weak<Shadow>>,
     gpu_offset: u64,
     last_fence: u64,
+    aliases: AliasSet,
 }
 
 enum BlockState {
@@ -315,8 +385,12 @@ enum BlockState {
         shadow_id: u64,
         any_write: bool,
         epoch: u64,
+        aliases: AliasSet,
     },
-    CpuHot,
+    /// Secondary alias block pointing to the canonical primary key in
+    /// `State::blocks` (which holds `GpuResident` or `Fetching`).
+    AliasOf(usize),
+    CpuHot(AliasSet),
 }
 
 struct State {
@@ -326,6 +400,14 @@ struct State {
 }
 
 impl State {
+    #[inline]
+    fn resolve_canonical(&self, block: usize) -> usize {
+        match self.blocks.get(&block) {
+            Some(&BlockState::AliasOf(primary)) => primary,
+            _ => block,
+        }
+    }
+
     fn sync_tracked(&self) {
         TRACKED_COUNT.store(self.blocks.len() + self.fault_counts.len(), Ordering::Relaxed);
     }
@@ -641,6 +723,24 @@ fn is_committable_block(block_va: usize) -> bool {
         && matches!(info.Protect, PAGE_READWRITE | PAGE_READONLY)
 }
 
+/// Checks (read-only) whether `[block_va, block_va + BLOCK)` is currently
+/// committed `PAGE_READWRITE` (used to resolve a tight VEH race where another
+/// thread finished restoring the page right before we acquired `STATE`).
+fn is_readwrite_block(block_va: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualQuery,
+    };
+    // SAFETY: plain out struct for `VirtualQuery`.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: valid pointer and struct size.
+    let n = unsafe { VirtualQuery(block_va as *const _, &mut info, size_of_val(&info)) };
+    if n == 0 || info.State != MEM_COMMIT {
+        return false;
+    }
+    let region_end = (info.BaseAddress as usize).saturating_add(info.RegionSize);
+    region_end >= block_va.saturating_add(BLOCK) && info.Protect == PAGE_READWRITE
+}
+
 /// Checks whether `[block_va, block_va + BLOCK)` is a committed read-write or
 /// read-only title page (not uncommitted/free/noaccess) and flips it to
 /// `PAGE_NOACCESS`. Returns `true` on success.
@@ -661,6 +761,38 @@ fn protect_readwrite(block_va: usize) -> bool {
     unsafe { VirtualProtect(block_va as *const _, BLOCK, PAGE_READWRITE, &mut old) != 0 }
 }
 
+/// Releases `watch` guards, sets `RESIDENT`, and applies `PAGE_NOACCESS` to
+/// every block in `aliases` not already covered by `already_armed`. Rolls back
+/// all newly armed blocks to `PAGE_READWRITE` + `RESIDENT.clear` if any
+/// `VirtualProtect` fails, guaranteeing an atomic all-or-nothing transition.
+fn arm_aliases_noaccess(aliases: &AliasSet, already_armed: Option<&AliasSet>) -> bool {
+    let mut armed = [0usize; MAX_ALIASES];
+    let mut n_armed = 0usize;
+    for &a in aliases.as_slice() {
+        if already_armed.is_some_and(|prev| prev.contains(a)) {
+            continue;
+        }
+        // Release any `watch` read-only guard before setting `PAGE_NOACCESS`
+        // (strict lock order: `STATE -> GUARDS` never reverses).
+        crate::watch::release_guard_for_lazy(a);
+        // Mark `RESIDENT` BEFORE `VirtualProtect(PAGE_NOACCESS)` so any racing
+        // VEH fault on another thread sees `RESIDENT == 1`.
+        RESIDENT.set(a);
+        if protect_noaccess(a * BLOCK) {
+            armed[n_armed] = a;
+            n_armed += 1;
+        } else {
+            RESIDENT.clear(a);
+            for &prev in &armed[..n_armed] {
+                protect_readwrite(prev * BLOCK);
+                RESIDENT.clear(prev);
+            }
+            return false;
+        }
+    }
+    true
+}
+
 /// A 64 KiB block validated in Phase 1 ([`plan_gpu_resident`], inside
 /// `Host::card_before`) and ready to be armed/updated in Phase 2
 /// ([`commit_gpu_resident`]) once `Host::queue.Signal(&Host::fence, F)` has
@@ -669,18 +801,17 @@ pub(crate) struct PendingClaim {
     pub(crate) block: usize,
     pub(crate) shadow: Arc<Shadow>,
     pub(crate) gpu_offset: u64,
+    aliases: AliasSet,
 }
 
 /// **Phase 1 (plan)** of 2-phase lazy readback claiming, called inside
 /// `Host::card_before()` BEFORE `card_dirty()` / `copy_dirty_to_ring()` and
 /// BEFORE `Host::queue.Signal(&Host::fence, F)`.
 ///
-/// Validates every 64 KiB block in `ranges` against all safety filters and
-/// returns `(pending_claims, remaining_ranges)` WITHOUT mutating `RESIDENT`,
-/// WITHOUT calling `VirtualProtect(PAGE_NOACCESS)`, and WITHOUT storing an
-/// unsignaled future fence in `last_fence` — eliminating any possibility of
-/// self-deadlock when `card_dirty` uploads pending CPU bytes of the same block
-/// in the same submission.
+/// Validates every 64 KiB block in `ranges` (including multi-view aliases with
+/// `1..=4` virtual addresses) against all safety filters and returns
+/// `(pending_claims, remaining_ranges)` WITHOUT arming `PAGE_NOACCESS` and
+/// WITHOUT storing an unsignaled future fence in `last_fence`.
 pub(crate) fn plan_gpu_resident(
     shadow: &Arc<Shadow>,
     ranges: &[(usize, usize)],
@@ -735,43 +866,96 @@ pub(crate) fn plan_gpu_resident(
                 push_rem(&mut remaining, sub_lo, sub_hi);
                 continue;
             }
-            // Skip multi-view aliased blocks so CPU access via another alias
-            // VA can never bypass `PAGE_NOACCESS`.
-            if crate::inplace::pages_of(b_lo).len() >= 2 {
+            // Support 1..=4 virtual alias views of the same 64 KiB physical
+            // page by arming `PAGE_NOACCESS` across all aliases together.
+            let page_vas = crate::inplace::pages_of(b_lo);
+            let Some(aliases) = AliasSet::from_pages(block, &page_vas) else {
+                if RESIDENT.contains(block) {
+                    materialize_block(block, false, false, false, None);
+                }
+                rej(2);
+                push_rem(&mut remaining, sub_lo, sub_hi);
+                continue;
+            };
+            // Reject intra-shadow self-aliasing where two distinct alias VAs
+            // lie inside the same `Shadow::span()` (writes at one `gpu_offset`
+            // would not be mirrored to the second offset inside that buffer).
+            if aliases.len > 1
+                && aliases.as_slice().iter().any(|&a| {
+                    if a == block {
+                        return false;
+                    }
+                    let a_lo = a * BLOCK;
+                    a_lo >= span_start && a_lo < span_end
+                })
+            {
+                if RESIDENT.contains(block) {
+                    materialize_block(block, false, false, false, None);
+                }
                 rej(2);
                 push_rem(&mut remaining, sub_lo, sub_hi);
                 continue;
             }
+
             let gpu_offset = (b_lo - span_start) as u64;
-            let eligible = {
+            let mut need_commit_check = [0usize; MAX_ALIASES];
+            let mut n_check = 0usize;
+            let state_ok = {
                 let mut s = lock.lock().unwrap_or_else(|e| e.into_inner());
-                match s.blocks.get(&block) {
-                    Some(BlockState::GpuResident(_)) => Some(true),
-                    Some(BlockState::CpuHot) | Some(BlockState::Fetching { .. }) => {
-                        rej(3);
-                        Some(false)
-                    }
-                    None => {
-                        if s.fault_counts.get(&block).copied().unwrap_or(0) >= DEMOTE_THRESHOLD {
-                            s.blocks.insert(block, BlockState::CpuHot);
-                            s.sync_tracked();
+                let mut existing_primary: Option<usize> = None;
+                let mut ok = true;
+                for &a in aliases.as_slice() {
+                    let p = s.resolve_canonical(a);
+                    match s.blocks.get(&p) {
+                        Some(BlockState::GpuResident(_)) => {
+                            if let Some(ep) = existing_primary {
+                                if ep != p {
+                                    rej(2);
+                                    ok = false;
+                                    break;
+                                }
+                            } else {
+                                existing_primary = Some(p);
+                            }
+                        }
+                        Some(BlockState::CpuHot(_)) | Some(BlockState::Fetching { .. }) => {
                             rej(3);
-                            Some(false)
-                        } else {
-                            None
+                            ok = false;
+                            break;
+                        }
+                        Some(BlockState::AliasOf(_)) => {
+                            rej(2);
+                            ok = false;
+                            break;
+                        }
+                        None => {
+                            if s.fault_counts.get(&a).copied().unwrap_or(0) >= DEMOTE_THRESHOLD {
+                                s.blocks.insert(a, BlockState::CpuHot(aliases));
+                                s.sync_tracked();
+                                rej(3);
+                                ok = false;
+                                break;
+                            }
+                            need_commit_check[n_check] = a;
+                            n_check += 1;
                         }
                     }
                 }
+                ok
             };
-            let take = match eligible {
-                Some(v) => v,
-                None => {
-                    let ok = is_committable_block(b_lo);
-                    if !ok {
-                        rej(4);
-                    }
-                    ok
+            let take = if !state_ok {
+                false
+            } else if n_check == 0 {
+                // Fast path: all aliases are already armed in one `GpuResident` group.
+                true
+            } else {
+                let all_ok = need_commit_check[..n_check]
+                    .iter()
+                    .all(|&a| is_committable_block(a * BLOCK));
+                if !all_ok {
+                    rej(4);
                 }
+                all_ok
             };
             if take {
                 if pending.last().is_none_or(|c| c.block != block) {
@@ -779,9 +963,13 @@ pub(crate) fn plan_gpu_resident(
                         block,
                         shadow: shadow.clone(),
                         gpu_offset,
+                        aliases,
                     });
                 }
             } else {
+                if RESIDENT.contains(block) {
+                    materialize_block(block, false, false, false, None);
+                }
                 push_rem(&mut remaining, sub_lo, sub_hi);
             }
         }
@@ -789,11 +977,148 @@ pub(crate) fn plan_gpu_resident(
     (pending, remaining)
 }
 
+/// Core Phase-2 commit routine for one physical 64 KiB page and its `1..=4`
+/// virtual alias blocks. Shared by [`commit_gpu_resident`] and unit tests.
+fn commit_claim_entry(
+    owner_block: usize,
+    aliases: AliasSet,
+    shadow_id: u64,
+    shadow: Option<Weak<Shadow>>,
+    gpu_offset: u64,
+    signaled_fence: u64,
+    committed: &mut Vec<(usize, u64)>,
+) -> bool {
+    let (lock, _cv) = state();
+    let mut s = lock.lock().unwrap_or_else(|e| e.into_inner());
+
+    // Validate every alias VA against concurrent faults, demotions, or collisions.
+    let mut existing_primary: Option<usize> = None;
+    for &a in aliases.as_slice() {
+        let p = s.resolve_canonical(a);
+        match s.blocks.get(&p) {
+            Some(BlockState::CpuHot(_)) | Some(BlockState::Fetching { .. }) => {
+                return false;
+            }
+            Some(BlockState::GpuResident(_)) => {
+                if let Some(ep) = existing_primary {
+                    if ep != p {
+                        return false;
+                    }
+                } else {
+                    existing_primary = Some(p);
+                }
+            }
+            Some(BlockState::AliasOf(_)) => return false,
+            None => {
+                if s.fault_counts.get(&a).copied().unwrap_or(0) >= DEMOTE_THRESHOLD {
+                    s.blocks.insert(a, BlockState::CpuHot(aliases));
+                    s.sync_tracked();
+                    return false;
+                }
+            }
+        }
+    }
+
+    if let Some(old_primary) = existing_primary {
+        let old_aliases = match s.blocks.get(&old_primary) {
+            Some(BlockState::GpuResident(info)) => info.aliases,
+            _ => return false,
+        };
+        if old_aliases == aliases {
+            // O(1) steady-state fast path: 0 `VirtualProtect` syscalls!
+            if let Some(BlockState::GpuResident(info)) = s.blocks.get_mut(&old_primary) {
+                info.owner_block = owner_block;
+                info.shadow_id = shadow_id;
+                info.shadow = shadow;
+                info.gpu_offset = gpu_offset;
+                info.last_fence = info.last_fence.max(signaled_fence);
+            }
+            stat(1, 1);
+            for &a in aliases.as_slice() {
+                committed.push((a, shadow_id));
+            }
+            return true;
+        }
+        // Alias set grew or changed while already `GpuResident`: arm any newly
+        // added alias VAs atomically before rewriting `State::blocks`.
+        if !arm_aliases_noaccess(&aliases, Some(&old_aliases)) {
+            return false;
+        }
+        let prev_fence = match s.blocks.remove(&old_primary) {
+            Some(BlockState::GpuResident(info)) => info.last_fence,
+            _ => 0,
+        };
+        for &oa in old_aliases.as_slice() {
+            s.blocks.remove(&oa);
+            if !aliases.contains(oa) {
+                protect_readwrite(oa * BLOCK);
+                RESIDENT.clear(oa);
+            }
+        }
+        let new_primary = aliases.canonical();
+        s.blocks.insert(
+            new_primary,
+            BlockState::GpuResident(ResidentInfo {
+                owner_block,
+                shadow_id,
+                shadow,
+                gpu_offset,
+                last_fence: prev_fence.max(signaled_fence),
+                aliases,
+            }),
+        );
+        for &a in aliases.as_slice() {
+            if a != new_primary {
+                s.blocks.insert(a, BlockState::AliasOf(new_primary));
+            }
+        }
+        s.sync_tracked();
+        stat(1, 1);
+        for &a in aliases.as_slice() {
+            committed.push((a, shadow_id));
+        }
+        return true;
+    }
+
+    // Fresh promotion (`CpuResident -> GpuResident`): atomically arm all 1..=4 aliases.
+    if !arm_aliases_noaccess(&aliases, None) {
+        return false;
+    }
+    let primary = aliases.canonical();
+    s.blocks.insert(
+        primary,
+        BlockState::GpuResident(ResidentInfo {
+            owner_block,
+            shadow_id,
+            shadow,
+            gpu_offset,
+            last_fence: signaled_fence,
+            aliases,
+        }),
+    );
+    for &a in aliases.as_slice() {
+        if a != primary {
+            s.blocks.insert(a, BlockState::AliasOf(primary));
+        }
+    }
+    s.sync_tracked();
+    LIVE_BLOCKS.fetch_add(1, Ordering::Relaxed);
+    stat(0, 1);
+    if aliases.len > 1 {
+        stat(11, 1);
+    }
+    for &a in aliases.as_slice() {
+        committed.push((a, shadow_id));
+    }
+    true
+}
+
 /// **Phase 2 (commit)** of 2-phase lazy readback claiming, called IMMEDIATELY
 /// AFTER `Host::queue.Signal(&Host::fence, signaled_fence)` succeeds (and after
-/// [`note_signaled_fence`]). Arms `PAGE_NOACCESS` / `RESIDENT` on newly
-/// promoted blocks and advances `last_fence` in O(1) on already-`GpuResident`
-/// blocks. Returns `(block, shadow_id)` for every committed block.
+/// [`note_signaled_fence`]). Arms `PAGE_NOACCESS` / `RESIDENT` across all
+/// `1..=4` alias VAs on newly promoted blocks and advances `last_fence` in O(1)
+/// on already-`GpuResident` blocks. Returns `(block, shadow_id)` for every
+/// committed alias block.
 pub(crate) fn commit_gpu_resident(
     claims: Vec<PendingClaim>,
     signaled_fence: u64,
@@ -804,62 +1129,50 @@ pub(crate) fn commit_gpu_resident(
     // Ensure `watch::on_write` VEH is installed ahead of any `PAGE_NOACCESS`.
     crate::watch::install();
 
-    let (lock, _cv) = state();
     let mut committed = Vec::with_capacity(claims.len());
     for claim in claims {
         let PendingClaim {
             block,
             shadow,
             gpu_offset,
+            aliases: planned_aliases,
         } = claim;
-        let shadow_id = shadow.id();
         let b_lo = block * BLOCK;
-        let mut s = lock.lock().unwrap_or_else(|e| e.into_inner());
-        match s.blocks.get_mut(&block) {
-            Some(BlockState::GpuResident(info)) => {
-                // O(1) steady-state fast path: 0 `VirtualProtect` syscalls!
-                info.shadow_id = shadow_id;
-                info.shadow = Some(Arc::downgrade(&shadow));
-                info.gpu_offset = gpu_offset;
-                info.last_fence = info.last_fence.max(signaled_fence);
-                stat(1, 1);
-                committed.push((block, shadow_id));
-            }
-            Some(BlockState::CpuHot) | Some(BlockState::Fetching { .. }) => {
-                // Racing thread faulted/demoted between plan and commit; leave intact.
-            }
-            None => {
-                if s.fault_counts.get(&block).copied().unwrap_or(0) >= DEMOTE_THRESHOLD {
-                    s.blocks.insert(block, BlockState::CpuHot);
-                    s.sync_tracked();
-                    continue;
+        // Re-check `inplace::pages_of` so any alias mapped between Phase 1 and
+        // Phase 2 is also armed (or skipped if the physical page grew > 4 aliases
+        // or gained an intra-shadow self-alias).
+        let page_vas = crate::inplace::pages_of(b_lo);
+        let aliases = if page_vas.is_empty() {
+            planned_aliases
+        } else {
+            let Some(fresh) = AliasSet::from_pages(block, &page_vas) else {
+                continue;
+            };
+            fresh
+        };
+        if aliases.len > 1 {
+            let (span_start_u64, span_len_u64) = shadow.span();
+            let span_start = span_start_u64 as usize;
+            let span_end = span_start.saturating_add(span_len_u64 as usize);
+            if aliases.as_slice().iter().any(|&a| {
+                a != block && {
+                    let a_lo = a * BLOCK;
+                    a_lo >= span_start && a_lo < span_end
                 }
-                // Release any `watch` read-only guard on `block` before
-                // setting `PAGE_NOACCESS` (strict lock order: `STATE -> GUARDS`
-                // never reverses because `GUARDS` never locks `STATE`).
-                crate::watch::release_guard_for_lazy(block);
-                // Mark `RESIDENT` BEFORE `VirtualProtect(PAGE_NOACCESS)` so any
-                // racing VEH fault on another thread sees `RESIDENT == 1`.
-                RESIDENT.set(block);
-                if protect_noaccess(b_lo) {
-                    s.blocks.insert(
-                        block,
-                        BlockState::GpuResident(ResidentInfo {
-                            shadow_id,
-                            shadow: Some(Arc::downgrade(&shadow)),
-                            gpu_offset,
-                            last_fence: signaled_fence,
-                        }),
-                    );
-                    s.sync_tracked();
-                    LIVE_BLOCKS.fetch_add(1, Ordering::Relaxed);
-                    stat(0, 1);
-                    committed.push((block, shadow_id));
-                } else {
-                    RESIDENT.clear(block);
-                }
+            }) {
+                continue;
             }
         }
+        let shadow_id = shadow.id();
+        commit_claim_entry(
+            block,
+            aliases,
+            shadow_id,
+            Some(Arc::downgrade(&shadow)),
+            gpu_offset,
+            signaled_fence,
+            &mut committed,
+        );
     }
     committed
 }
@@ -876,98 +1189,156 @@ pub(crate) fn claim_gpu_resident(
     remaining
 }
 
-/// Writes 64 KiB `payload` back into title memory `[block_va, block_va + BLOCK)`,
-/// restoring `PAGE_READWRITE`, and resets `GetWriteWatch` on `MEM_PRIVATE` pure
-/// read faults so clean GPU bytes are not spuriously re-uploaded.
-fn restore_title_block(block_va: usize, payload: &[u8; BLOCK], any_write: bool) {
+/// Writes 64 KiB `payload` back into the physical page backing `aliases`,
+/// restoring `PAGE_READWRITE` across all alias VAs, and resets `GetWriteWatch`
+/// on single-view `MEM_PRIVATE` pure read faults so clean GPU bytes are not
+/// spuriously re-uploaded.
+fn restore_title_block(aliases: &AliasSet, payload: &[u8; BLOCK], any_write: bool) {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_MAPPED, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, ResetWriteWatch,
         VirtualQuery,
     };
-    // SAFETY: plain out struct.
-    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-    // SAFETY: valid pointer and struct size.
-    let n = unsafe { VirtualQuery(block_va as *const _, &mut info, size_of_val(&info)) };
-    if n == 0 || info.State != MEM_COMMIT {
+    let slice = aliases.as_slice();
+    let mut first_type = 0u32;
+    let mut first_committed_va = 0usize;
+    for &blk in slice {
+        let va = blk * BLOCK;
+        // SAFETY: plain out struct.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: valid pointer and struct size.
+        let n = unsafe { VirtualQuery(va as *const _, &mut info, size_of_val(&info)) };
+        if n != 0 && info.State == MEM_COMMIT {
+            first_type = info.Type;
+            first_committed_va = va;
+            if info.Type == MEM_MAPPED {
+                break;
+            }
+        }
+    }
+    if first_committed_va == 0 {
         return;
     }
 
-    if info.Type == MEM_MAPPED {
-        // Section-backed view: populate physical RAM while title VA is STILL
-        // `PAGE_NOACCESS` (zero torn-read window), then flip to `PAGE_READWRITE`.
+    if first_type == MEM_MAPPED || slice.len() > 1 {
+        // Section-backed view (1..=4 aliases): populate the shared physical
+        // page ONCE while ALL alias VAs are STILL `PAGE_NOACCESS` (zero
+        // torn-read window across every view), then flip every alias VA to
+        // `PAGE_READWRITE`.
         let mut wrote_beside = false;
         if let Some(_reading) = crate::watch::title_memory_reading_now() {
-            if let Some(alias_ptr) = crate::inplace::beside(block_va, BLOCK) {
-                if crate::safecopy::on() {
-                    // SAFETY: `payload` is valid 64 KiB; `safecopy` returns false
-                    // cleanly if the section page is uncommitted/stale.
-                    wrote_beside = unsafe {
-                        crate::safecopy::copy(alias_ptr as *mut u8, payload.as_ptr(), BLOCK)
-                    };
-                } else {
-                    // SAFETY: `alias_ptr` is a writable persistent view of the same
-                    // 64 KiB section pages held stable by `_reading`.
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(payload.as_ptr(), alias_ptr as *mut u8, BLOCK);
+            for &blk in slice {
+                if let Some(alias_ptr) = crate::inplace::beside(blk * BLOCK, BLOCK) {
+                    if crate::safecopy::on() {
+                        // SAFETY: `payload` is valid 64 KiB; `safecopy` returns false
+                        // cleanly if the section page is uncommitted/stale.
+                        wrote_beside = unsafe {
+                            crate::safecopy::copy(alias_ptr as *mut u8, payload.as_ptr(), BLOCK)
+                        };
+                    } else {
+                        // SAFETY: `alias_ptr` is a writable persistent view of the same
+                        // 64 KiB section pages held stable by `_reading`.
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                payload.as_ptr(),
+                                alias_ptr as *mut u8,
+                                BLOCK,
+                            );
+                        }
+                        wrote_beside = true;
                     }
-                    wrote_beside = true;
+                    if wrote_beside {
+                        break;
+                    }
                 }
             }
         }
         if !wrote_beside {
-            wrote_beside = try_alias_writer(block_va, payload);
+            for &blk in slice {
+                if try_alias_writer(blk * BLOCK, payload) {
+                    wrote_beside = true;
+                    break;
+                }
+            }
         }
         if wrote_beside {
-            protect_readwrite(block_va);
+            for &blk in slice {
+                protect_readwrite(blk * BLOCK);
+            }
             return;
         }
-        // Fallback if section cannot be aliased right now.
-        if protect_readwrite(block_va) {
+        // Fallback if section cannot be aliased right now: unprotect the first
+        // committed alias VA, write the shared physical page, then unprotect
+        // all remaining alias VAs.
+        if protect_readwrite(first_committed_va) {
             if crate::safecopy::on() {
                 // SAFETY: `payload` is valid 64 KiB; `safecopy` fails cleanly if unmapped.
                 unsafe {
-                    let _ = crate::safecopy::copy(block_va as *mut u8, payload.as_ptr(), BLOCK);
+                    let _ = crate::safecopy::copy(
+                        first_committed_va as *mut u8,
+                        payload.as_ptr(),
+                        BLOCK,
+                    );
                 }
             } else {
-                // SAFETY: `block_va` verified committed and switched to `PAGE_READWRITE`.
+                // SAFETY: `first_committed_va` verified committed and switched to `PAGE_READWRITE`.
                 unsafe {
-                    std::ptr::copy_nonoverlapping(payload.as_ptr(), block_va as *mut u8, BLOCK);
+                    std::ptr::copy_nonoverlapping(
+                        payload.as_ptr(),
+                        first_committed_va as *mut u8,
+                        BLOCK,
+                    );
                 }
+            }
+        }
+        for &blk in slice {
+            let va = blk * BLOCK;
+            if va != first_committed_va {
+                protect_readwrite(va);
             }
         }
         return;
     }
 
-    // `MEM_PRIVATE` (including `MEM_WRITE_WATCH`): flip `PAGE_READWRITE` and
-    // copy all 64 KiB.
-    if protect_readwrite(block_va) {
+    // Single-view `MEM_PRIVATE` (including `MEM_WRITE_WATCH`): flip
+    // `PAGE_READWRITE` and copy all 64 KiB.
+    if protect_readwrite(first_committed_va) {
         if crate::safecopy::on() {
             // SAFETY: `payload` is valid 64 KiB; `safecopy` fails cleanly if unmapped.
             unsafe {
-                let _ = crate::safecopy::copy(block_va as *mut u8, payload.as_ptr(), BLOCK);
+                let _ = crate::safecopy::copy(
+                    first_committed_va as *mut u8,
+                    payload.as_ptr(),
+                    BLOCK,
+                );
             }
         } else {
-            // SAFETY: `block_va` verified committed and switched to `PAGE_READWRITE`.
+            // SAFETY: `first_committed_va` verified committed and switched to `PAGE_READWRITE`.
             unsafe {
-                std::ptr::copy_nonoverlapping(payload.as_ptr(), block_va as *mut u8, BLOCK);
+                std::ptr::copy_nonoverlapping(
+                    payload.as_ptr(),
+                    first_committed_va as *mut u8,
+                    BLOCK,
+                );
             }
         }
-        if info.Type == MEM_PRIVATE && !any_write {
+        if first_type == MEM_PRIVATE && !any_write {
             // Clear dirty bits produced by our own restore copy on pure read
             // faults so `Shadow::update` does not re-upload unchanged GPU bytes.
             // On write faults (or any coalesced writer), skip `ResetWriteWatch`
             // so the retried store is guaranteed dirty.
             // SAFETY: valid committed `MEM_PRIVATE` range (harmless failure if not `MEM_WRITE_WATCH`).
             unsafe {
-                let _ = ResetWriteWatch(block_va as *mut _, BLOCK);
+                let _ = ResetWriteWatch(first_committed_va as *mut _, BLOCK);
             }
         }
     }
 }
 
-/// Core state-machine materialization of one 64 KiB block (`GpuResident -> CpuResident`
-/// or `CpuHot`). Returns `true` if `block` belonged to lazy readback (was
-/// `GpuResident` or `Fetching`) and is now restored to `PAGE_READWRITE`.
+/// Core state-machine materialization of one 64 KiB physical page (resolving
+/// any alias VA in `1..=4` to its shared canonical entry: `GpuResident ->
+/// CpuResident` or `CpuHot`). Returns `true` if `block` belonged to lazy
+/// readback (was `GpuResident` or `Fetching`) and all alias VAs are now
+/// restored to `PAGE_READWRITE`.
 fn materialize_block(
     block: usize,
     is_write: bool,
@@ -984,13 +1355,14 @@ fn materialize_block(
     loop {
         let work = {
             let mut s = lock.lock().unwrap_or_else(|e| e.into_inner());
-            match s.blocks.get_mut(&block) {
+            let primary = s.resolve_canonical(block);
+            match s.blocks.get_mut(&primary) {
                 Some(BlockState::Fetching { any_write, .. }) => {
                     if is_write {
                         *any_write = true;
                     }
                     stat(5, 1);
-                    while matches!(s.blocks.get(&block), Some(BlockState::Fetching { .. })) {
+                    while matches!(s.blocks.get(&primary), Some(BlockState::Fetching { .. })) {
                         s = cv.wait(s).unwrap_or_else(|e| e.into_inner());
                     }
                     return true;
@@ -1018,11 +1390,16 @@ fn materialize_block(
                                     continue;
                                 }
                                 // Safety fallback if shadow was dropped without flushing.
-                                s.blocks.remove(&block);
+                                let aliases = info.aliases;
+                                for &a in aliases.as_slice() {
+                                    s.blocks.remove(&a);
+                                }
                                 s.sync_tracked();
                                 LIVE_BLOCKS.fetch_sub(1, Ordering::Relaxed);
-                                protect_readwrite(block * BLOCK);
-                                RESIDENT.clear(block);
+                                for &a in aliases.as_slice() {
+                                    protect_readwrite(a * BLOCK);
+                                    RESIDENT.clear(a);
+                                }
                                 cv.notify_all();
                                 return true;
                             }
@@ -1031,29 +1408,47 @@ fn materialize_block(
                         // Test-mode entry without real D3D12 `Shadow`.
                         (None, None)
                     };
+                    let owner_block = info.owner_block;
                     let gpu_offset = info.gpu_offset;
                     let last_fence = info.last_fence;
                     let shadow_id = info.shadow_id;
+                    let aliases = info.aliases;
                     let epoch = s.next_gen;
                     s.next_gen = s.next_gen.wrapping_add(1).max(1);
                     s.blocks.insert(
-                        block,
+                        primary,
                         BlockState::Fetching {
                             shadow_id,
                             any_write: is_write,
                             epoch,
+                            aliases,
                         },
                     );
                     LIVE_BLOCKS.fetch_sub(1, Ordering::Relaxed);
-                    (shadow_arc, buffer_opt, gpu_offset, last_fence, epoch)
+                    (
+                        primary,
+                        owner_block,
+                        aliases,
+                        shadow_arc,
+                        buffer_opt,
+                        gpu_offset,
+                        last_fence,
+                        epoch,
+                    )
                 }
-                Some(BlockState::CpuHot) | None => return false,
+                Some(BlockState::CpuHot(_)) | Some(BlockState::AliasOf(_)) | None => {
+                    // If a VEH thread saw `RESIDENT == 1` just before another
+                    // thread finished restoring `block` to `PAGE_READWRITE`,
+                    // retry the faulting instruction cleanly.
+                    return from_veh && is_readwrite_block(block * BLOCK);
+                }
             }
         };
 
-        let (shadow_arc, buffer_opt, gpu_offset, last_fence, my_epoch) = work;
+        let (primary, owner_block, aliases, shadow_arc, buffer_opt, gpu_offset, last_fence, my_epoch) =
+            work;
         let started = Instant::now();
-        let fetched = fetch_from_gpu(block, buffer_opt, gpu_offset, last_fence);
+        let fetched = fetch_from_gpu(owner_block, buffer_opt, gpu_offset, last_fence);
         let us = started.elapsed().as_micros() as u64;
         stat(10, us);
         if from_veh {
@@ -1085,52 +1480,66 @@ fn materialize_block(
 
         // Verify this `Fetching` epoch was NOT evicted by `evict_range`
         // while the GPU readback was in flight, and read final `any_write`
-        // (which covers any coalesced writer currently blocked on `Fetching`).
+        // (which covers any coalesced writer across any alias VA).
         let still_ours = {
             let s = lock.lock().unwrap_or_else(|e| e.into_inner());
-            match s.blocks.get(&block) {
-                Some(&BlockState::Fetching { any_write, epoch, .. }) if epoch == my_epoch => {
-                    Some(any_write)
-                }
+            match s.blocks.get(&primary) {
+                Some(&BlockState::Fetching {
+                    any_write, epoch, ..
+                }) if epoch == my_epoch => Some(any_write),
                 _ => None,
             }
         };
         let Some(final_any_write) = still_ours else {
-            // `evict_range` already unmapped/remapped this VA: do NOT touch it.
+            // `evict_range` already unmapped/remapped this group: do NOT touch it.
             return true;
         };
 
-        let block_va = block * BLOCK;
         if let Some(payload) = fetched {
-            restore_title_block(block_va, &payload, final_any_write);
+            restore_title_block(&aliases, &payload, final_any_write);
         } else {
-            protect_readwrite(block_va);
+            for &a in aliases.as_slice() {
+                protect_readwrite(a * BLOCK);
+            }
         }
 
         // Complete transition under `STATE` lock and wake all coalesced waiters.
         {
             let mut s = lock.lock().unwrap_or_else(|e| e.into_inner());
             let still_current = matches!(
-                s.blocks.get(&block),
+                s.blocks.get(&primary),
                 Some(BlockState::Fetching { epoch, .. }) if *epoch == my_epoch
             );
             if still_current {
                 if count_fault {
-                    let count = s.fault_counts.entry(block).or_insert(0);
-                    *count = count.saturating_add(1);
-                    if *count >= DEMOTE_THRESHOLD {
-                        s.blocks.insert(block, BlockState::CpuHot);
+                    let mut max_count = 0u8;
+                    for &a in aliases.as_slice() {
+                        let count = s.fault_counts.entry(a).or_insert(0);
+                        *count = count.saturating_add(1);
+                        max_count = max_count.max(*count);
+                    }
+                    if max_count >= DEMOTE_THRESHOLD {
+                        for &a in aliases.as_slice() {
+                            s.fault_counts.insert(a, max_count);
+                            s.blocks.insert(a, BlockState::CpuHot(aliases));
+                        }
                         stat(9, 1);
                         TOTAL_DEMOTED.fetch_add(1, Ordering::Relaxed);
                     } else {
-                        s.blocks.remove(&block);
+                        for &a in aliases.as_slice() {
+                            s.blocks.remove(&a);
+                        }
                     }
                 } else {
-                    s.blocks.remove(&block);
+                    for &a in aliases.as_slice() {
+                        s.blocks.remove(&a);
+                    }
                 }
                 s.sync_tracked();
+                for &a in aliases.as_slice() {
+                    RESIDENT.clear(a);
+                }
             }
-            RESIDENT.clear(block);
             cv.notify_all();
         }
         return true;
@@ -1141,8 +1550,9 @@ fn materialize_block(
 /// `safecopy::failing_exit` for BOTH read (`info[0] == 0`) and write
 /// (`info[0] == 1`) access violations.
 ///
-/// Returns `true` if `addr` hit a `GpuResident` / `Fetching` block and has now
-/// been fetched and restored to `PAGE_READWRITE` (`EXCEPTION_CONTINUE_EXECUTION`).
+/// Returns `true` if `addr` hit a `GpuResident` / `Fetching` block (or any of
+/// its alias VAs) and has now been fetched and restored to `PAGE_READWRITE`
+/// (`EXCEPTION_CONTINUE_EXECUTION`).
 pub(crate) fn handle_fault(addr: usize, is_write: bool) -> bool {
     let block = addr / BLOCK;
     // Lock-free 1-ns fast reject for all non-`GpuResident` faults.
@@ -1170,7 +1580,8 @@ pub(crate) fn ensure_cpu_resident(at: usize, len: usize) {
 /// Prepares `[at, at + len)` for a CPU or kernel overwrite (`ReadFile`,
 /// DirectStorage, `xmem::write_physical`, `watch::writing`):
 /// - Full 64 KiB aligned blocks completely covered by `[at, at + len)` drop
-///   `GpuResident` and flip to `PAGE_READWRITE` with **zero GPU readback**.
+///   `GpuResident` across ALL alias VAs and flip them to `PAGE_READWRITE` with
+///   **zero GPU readback**.
 /// - Partial leading/trailing edge blocks fetch 64 KiB from GPU first so the
 ///   un-overwritten bytes of the block remain intact.
 ///
@@ -1197,24 +1608,31 @@ pub fn prepare_cpu_overwrite(at: usize, len: usize) {
             materialize_block(block, true, false, false, None);
             continue;
         }
-        // Full 64 KiB block overwrite: drop `GpuResident` with ZERO GPU readback!
+        // Full 64 KiB block overwrite: drop `GpuResident` across all alias VAs
+        // with ZERO GPU readback!
         let mut s = lock.lock().unwrap_or_else(|e| e.into_inner());
         loop {
-            match s.blocks.get(&block) {
+            let primary = s.resolve_canonical(block);
+            match s.blocks.get(&primary) {
                 Some(BlockState::Fetching { .. }) => {
                     s = cv.wait(s).unwrap_or_else(|e| e.into_inner());
                 }
-                Some(BlockState::GpuResident(_)) => {
-                    s.blocks.remove(&block);
+                Some(BlockState::GpuResident(info)) => {
+                    let aliases = info.aliases;
+                    for &a in aliases.as_slice() {
+                        s.blocks.remove(&a);
+                    }
                     s.sync_tracked();
                     LIVE_BLOCKS.fetch_sub(1, Ordering::Relaxed);
-                    protect_readwrite(b_lo);
-                    RESIDENT.clear(block);
+                    for &a in aliases.as_slice() {
+                        protect_readwrite(a * BLOCK);
+                        RESIDENT.clear(a);
+                    }
                     stat(6, 1);
                     cv.notify_all();
                     break;
                 }
-                Some(BlockState::CpuHot) | None => {
+                Some(BlockState::CpuHot(_)) | Some(BlockState::AliasOf(_)) | None => {
                     RESIDENT.clear(block);
                     break;
                 }
@@ -1224,8 +1642,11 @@ pub fn prepare_cpu_overwrite(at: usize, len: usize) {
 }
 
 /// Evicts all `GpuResident`, `Fetching`, `CpuHot`, and fault-count state in
-/// `[at, at + len)` with **zero GPU readback** and **zero blocking** (safe to
-/// call from `watch::title_memory_remapped` under `PHYSICAL -> MAPPING`).
+/// `[at, at + len)` (plus any linked multi-view aliases of those physical
+/// pages) with **zero GPU readback** and **zero blocking** (safe to call from
+/// `watch::title_memory_remapped` under `PHYSICAL -> MAPPING`). Restores
+/// `PAGE_READWRITE` on any still-mapped sibling alias outside `[at, at + len)`
+/// so no alias VA is ever left stranded at `PAGE_NOACCESS`.
 pub(crate) fn evict_range(at: usize, len: usize) {
     if len == 0 || TRACKED_COUNT.load(Ordering::Relaxed) == 0 {
         return;
@@ -1238,19 +1659,43 @@ pub(crate) fn evict_range(at: usize, len: usize) {
     let mut woke = false;
     for block in first..last {
         s.fault_counts.remove(&block);
-        if let Some(prev) = s.blocks.remove(&block) {
+        let primary = s.resolve_canonical(block);
+        if let Some(prev) = s.blocks.remove(&primary) {
             match prev {
-                BlockState::GpuResident(_) => {
+                BlockState::GpuResident(info) => {
+                    for &a in info.aliases.as_slice() {
+                        s.blocks.remove(&a);
+                        s.fault_counts.remove(&a);
+                        if a < first || a >= last {
+                            protect_readwrite(a * BLOCK);
+                        }
+                        RESIDENT.clear(a);
+                    }
                     LIVE_BLOCKS.fetch_sub(1, Ordering::Relaxed);
-                    RESIDENT.clear(block);
                     evicted += 1;
                 }
-                BlockState::Fetching { .. } => {
-                    RESIDENT.clear(block);
+                BlockState::Fetching { aliases, .. } => {
+                    for &a in aliases.as_slice() {
+                        s.blocks.remove(&a);
+                        s.fault_counts.remove(&a);
+                        if a < first || a >= last {
+                            protect_readwrite(a * BLOCK);
+                        }
+                        RESIDENT.clear(a);
+                    }
                     evicted += 1;
                     woke = true;
                 }
-                BlockState::CpuHot => {}
+                BlockState::CpuHot(aliases) => {
+                    for &a in aliases.as_slice() {
+                        s.blocks.remove(&a);
+                        s.fault_counts.remove(&a);
+                    }
+                }
+                BlockState::AliasOf(_) => {
+                    s.blocks.remove(&block);
+                    RESIDENT.clear(block);
+                }
             }
         }
     }
@@ -1314,7 +1759,7 @@ pub(crate) fn log_periodic() {
     if !on() {
         return;
     }
-    let p: [u64; 11] = std::array::from_fn(|i| STATS[i].swap(0, Ordering::Relaxed));
+    let p: [u64; 12] = std::array::from_fn(|i| STATS[i].swap(0, Ordering::Relaxed));
     let r: [u64; 5] = std::array::from_fn(|i| REJ[i].swap(0, Ordering::Relaxed));
     let live = LIVE_BLOCKS.load(Ordering::Relaxed);
     let total_demoted = TOTAL_DEMOTED.load(Ordering::Relaxed);
@@ -1324,7 +1769,8 @@ pub(crate) fn log_periodic() {
     let faults = p[2] + p[3];
     tracing::info!(
         "PC-native VRAM lazy readback (VICTORY_LAZY_READBACK={}): live {} blocks ({:.1} MiB), \
-         promoted {}, repeat-fence-updates {} (0 VirtualProtect), VEH faults {} (read {}, write {}, coalesced {}), \
+         promoted {} (aliased {}), repeat-fence-updates {} (0 VirtualProtect), \
+         VEH faults {} (read {}, write {}, coalesced {}), \
          internal fetches {}, overwrite-drops {} (0 readback), evicts {}, shadow-flushes {}, \
          demoted-CpuHot {} (cumulative {}), fetch {:.2} ms; \
          rejected [span={}, class={}, alias={}, cpuhot={}, uncommittable={}]",
@@ -1332,6 +1778,7 @@ pub(crate) fn log_periodic() {
         live,
         (live * BLOCK as u64) as f64 / (1024.0 * 1024.0),
         p[0],
+        p[11],
         p[1],
         faults,
         p[2],
@@ -1429,8 +1876,10 @@ mod tests {
         }
     }
 
-    /// Promotes a test block to `GpuResident` (`PAGE_NOACCESS`) with an injected
-    /// mock fetcher (returns `false` if block is `CpuHot`).
+    /// Promotes a test block (plus any `inplace::pages_of` aliases, `1..=4`) to
+    /// `GpuResident` (`PAGE_NOACCESS`) through the real [`commit_claim_entry`]
+    /// state machine with an injected mock fetcher (returns `false` if `CpuHot`
+    /// or `> 4` aliases).
     fn promote_test_block(
         block_va: usize,
         shadow_id: u64,
@@ -1440,43 +1889,29 @@ mod tests {
     ) -> bool {
         crate::watch::install();
         let block = block_va / BLOCK;
+        let Some(aliases) = AliasSet::from_pages(block, &crate::inplace::pages_of(block_va)) else {
+            return false;
+        };
         test_fetchers()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(block, fetcher);
-        let (lock, _) = state();
-        let mut s = lock.lock().unwrap_or_else(|e| e.into_inner());
-        match s.blocks.get(&block) {
-            Some(BlockState::CpuHot) => return false,
-            Some(BlockState::Fetching { .. }) => return false,
-            Some(BlockState::GpuResident(_)) => return true,
-            None => {}
-        }
-        if s.fault_counts.get(&block).copied().unwrap_or(0) >= DEMOTE_THRESHOLD {
-            s.blocks.insert(block, BlockState::CpuHot);
-            s.sync_tracked();
-            return false;
-        }
-        RESIDENT.set(block);
-        assert!(protect_noaccess(block_va));
-        s.blocks.insert(
+        let mut committed = Vec::new();
+        commit_claim_entry(
             block,
-            BlockState::GpuResident(ResidentInfo {
-                shadow_id,
-                shadow: None,
-                gpu_offset,
-                last_fence: fence,
-            }),
-        );
-        s.sync_tracked();
-        LIVE_BLOCKS.fetch_add(1, Ordering::Relaxed);
-        true
+            aliases,
+            shadow_id,
+            None,
+            gpu_offset,
+            fence,
+            &mut committed,
+        )
     }
 
     fn is_cpu_hot(block: usize) -> bool {
         let (lock, _) = state();
         let s = lock.lock().unwrap_or_else(|e| e.into_inner());
-        matches!(s.blocks.get(&block), Some(BlockState::CpuHot))
+        matches!(s.blocks.get(&block), Some(BlockState::CpuHot(_)))
     }
 
     #[test]
@@ -1832,6 +2267,232 @@ mod tests {
         // SAFETY: unmapping and closing our test section.
         unsafe {
             UnmapViewOfFile(view);
+            CloseHandle(sec);
+        }
+    }
+
+    #[test]
+    fn multi_alias_two_views_protect_fault_coalesce_and_evict_together() {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEM_MAPPED, MEMORY_BASIC_INFORMATION,
+            MapViewOfFile, PAGE_NOACCESS, SEC_COMMIT, UnmapViewOfFile, VirtualQuery,
+        };
+
+        // 0. Verify `AliasSet::from_pages` bounds (1..=4 accepted, >4 or unaligned rejected).
+        let a1 = AliasSet::from_pages(10, &[]).expect("empty pages_of -> single block");
+        assert_eq!(a1.as_slice(), &[10]);
+        let a4 = AliasSet::from_pages(20, &[40 * BLOCK, 10 * BLOCK, 30 * BLOCK, 20 * BLOCK])
+            .expect("4 unique aligned aliases accepted & sorted");
+        assert_eq!(a4.as_slice(), &[10, 20, 30, 40]);
+        assert_eq!(a4.canonical(), 10);
+        assert!(
+            AliasSet::from_pages(1, &[2 * BLOCK, 3 * BLOCK, 4 * BLOCK, 5 * BLOCK]).is_none(),
+            "5 distinct alias VAs must be rejected (> MAX_ALIASES)"
+        );
+        assert!(
+            AliasSet::from_pages(1, &[2 * BLOCK + 4096]).is_none(),
+            "unaligned alias VA must be rejected"
+        );
+
+        let query_prot = |va: usize| -> (u32, u32) {
+            // SAFETY: plain out struct for `VirtualQuery`.
+            let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: valid mapped VA.
+            assert_ne!(
+                unsafe { VirtualQuery(va as *const _, &mut mbi, size_of_val(&mbi)) },
+                0
+            );
+            (mbi.Type, mbi.Protect)
+        };
+
+        // 1. Real Windows 2-alias section (`CreateFileMappingW` + `MapViewOfFile` x 2).
+        // SAFETY: anonymous 64 KiB pagefile section cleaned up at end of test.
+        let sec = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE | SEC_COMMIT,
+                0,
+                BLOCK as u32,
+                std::ptr::null(),
+            )
+        };
+        assert!(!sec.is_null());
+        // SAFETY: mapping two distinct read-write views of the same 64 KiB section.
+        let view1 = unsafe { MapViewOfFile(sec, FILE_MAP_WRITE, 0, 0, BLOCK) };
+        let view2 = unsafe { MapViewOfFile(sec, FILE_MAP_WRITE, 0, 0, BLOCK) };
+        assert!(!view1.Value.is_null() && !view2.Value.is_null());
+        let va1 = view1.Value as usize;
+        let va2 = view2.Value as usize;
+        assert_ne!(va1, va2);
+        assert_eq!(va1 % BLOCK, 0);
+        assert_eq!(va2 % BLOCK, 0);
+        let blk1 = va1 / BLOCK;
+        let blk2 = va2 / BLOCK;
+
+        crate::inplace::title_memory_section(sec as usize, BLOCK as u64, true);
+        crate::inplace::title_memory_view(va1, BLOCK, sec as usize, 0);
+        crate::inplace::title_memory_view(va2, BLOCK, sec as usize, 0);
+        assert_eq!(crate::inplace::pages_of(va1).len(), 2);
+        assert!(crate::inplace::beside(va1, BLOCK).is_some());
+
+        // 2. Promoting `va1` arms `PAGE_NOACCESS` and `RESIDENT` on BOTH `va1` & `va2`.
+        let fetches = Arc::new(AtomicU64::new(0));
+        let f1 = fetches.clone();
+        let aliases = AliasSet::from_pages(blk1, &crate::inplace::pages_of(va1)).unwrap();
+        assert_eq!(aliases.len, 2);
+        test_fetchers()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                blk1,
+                Arc::new(move |_, _, _| {
+                    f1.fetch_add(1, Ordering::SeqCst);
+                    Some(Box::new([0xE7u8; BLOCK]))
+                }),
+            );
+        crate::watch::install();
+        let mut committed = Vec::new();
+        assert!(commit_claim_entry(
+            blk1,
+            aliases,
+            301,
+            None,
+            0,
+            1,
+            &mut committed
+        ));
+        assert!(committed.contains(&(blk1, 301)) && committed.contains(&(blk2, 301)));
+        assert!(is_gpu_resident(blk1) && is_gpu_resident(blk2));
+        assert_eq!(query_prot(va1), (MEM_MAPPED, PAGE_NOACCESS));
+        assert_eq!(query_prot(va2), (MEM_MAPPED, PAGE_NOACCESS));
+
+        // 3. Real CPU read fault on `va2` restores the physical page via `beside`
+        //    and unprotects BOTH `va1` & `va2`; subsequent read on `va1` sees
+        //    the exact GPU bytes with 0 second fault!
+        // SAFETY: `va2` is a committed 64 KiB `MEM_MAPPED` view armed by lazy_readback.
+        let got_va2 = unsafe {
+            let s = std::slice::from_raw_parts(va2 as *const u8, BLOCK);
+            (s[0], s[0x4321], s[BLOCK - 1])
+        };
+        assert_eq!(got_va2, (0xE7, 0xE7, 0xE7));
+        assert_eq!(fetches.load(Ordering::SeqCst), 1);
+        assert!(!is_gpu_resident(blk1) && !is_gpu_resident(blk2));
+        assert_eq!(query_prot(va1).1, PAGE_READWRITE);
+        assert_eq!(query_prot(va2).1, PAGE_READWRITE);
+        // SAFETY: `va1` is already `PAGE_READWRITE` and shares the restored physical page.
+        let got_va1 = unsafe {
+            let s = std::slice::from_raw_parts(va1 as *const u8, BLOCK);
+            (s[0], s[0x4321], s[BLOCK - 1])
+        };
+        assert_eq!(got_va1, (0xE7, 0xE7, 0xE7));
+        assert_eq!(
+            fetches.load(Ordering::SeqCst),
+            1,
+            "reading va1 after va2 fault must incur 0 second fault"
+        );
+
+        // 4. Re-promote & fault concurrently across `va1` (read) and `va2`
+        //    (4-byte partial write): must coalesce to 1 fetch and demote BOTH
+        //    `va1` and `va2` to `CpuHot`!
+        let f2 = fetches.clone();
+        assert!(promote_test_block(
+            va1,
+            301,
+            0,
+            2,
+            Arc::new(move |_, _, _| {
+                f2.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(20));
+                Some(Box::new([0x9Au8; BLOCK]))
+            }),
+        ));
+        assert_eq!(query_prot(va1).1, PAGE_NOACCESS);
+        assert_eq!(query_prot(va2).1, PAGE_NOACCESS);
+
+        let barrier = Arc::new(Barrier::new(2));
+        std::thread::scope(|sc| {
+            let b1 = barrier.clone();
+            sc.spawn(move || {
+                b1.wait();
+                // SAFETY: reading inside `va1`.
+                let v = unsafe { *((va1 + 0x100) as *const u8) };
+                assert_eq!(v, 0x9A);
+            });
+            let b2 = barrier.clone();
+            sc.spawn(move || {
+                b2.wait();
+                // SAFETY: partial 4-byte write inside `va2`.
+                unsafe { ((va2 + 0x2000) as *mut u32).write_volatile(0xDEAD_BEEF) };
+            });
+        });
+        assert_eq!(
+            fetches.load(Ordering::SeqCst),
+            2,
+            "concurrent faults on va1 and va2 must coalesce to 1 fetch"
+        );
+        // SAFETY: both views are now `PAGE_READWRITE` and coherent.
+        unsafe {
+            let s1 = std::slice::from_raw_parts(va1 as *const u8, BLOCK);
+            assert_eq!(&s1[0x2000..0x2004], &0xDEAD_BEEFu32.to_le_bytes());
+            assert!(s1[..0x2000].iter().all(|&b| b == 0x9A));
+            assert!(s1[0x2004..].iter().all(|&b| b == 0x9A));
+        }
+        assert!(
+            is_cpu_hot(blk1) && is_cpu_hot(blk2),
+            "2nd fault must demote BOTH alias VAs to CpuHot"
+        );
+        let noop_fetcher: TestFetcherFn = Arc::new(|_, _, _| Some(Box::new([0x11u8; BLOCK])));
+        assert!(!promote_test_block(va1, 301, 0, 3, noop_fetcher.clone()));
+        assert!(!promote_test_block(va2, 301, 0, 3, noop_fetcher.clone()));
+
+        // 5. `evict_range(va1)` clears `CpuHot` on BOTH `va1` and `va2`, and
+        //    when `GpuResident`, evicts & clears BOTH with 0 fetches while
+        //    restoring still-mapped sibling `va2` to `PAGE_READWRITE`.
+        evict_range(va1, BLOCK);
+        assert!(!is_cpu_hot(blk1) && !is_cpu_hot(blk2));
+
+        assert!(promote_test_block(va1, 302, 0, 4, noop_fetcher.clone()));
+        assert!(is_gpu_resident(blk1) && is_gpu_resident(blk2));
+        assert_eq!(query_prot(va1).1, PAGE_NOACCESS);
+        assert_eq!(query_prot(va2).1, PAGE_NOACCESS);
+
+        evict_range(va1, BLOCK);
+        assert_eq!(fetches.load(Ordering::SeqCst), 2, "evict_range must perform 0 GPU fetches");
+        assert!(!is_gpu_resident(blk1) && !is_gpu_resident(blk2));
+        assert_eq!(
+            query_prot(va2).1,
+            PAGE_READWRITE,
+            "evict_range(va1) must restore still-mapped sibling va2 to PAGE_READWRITE"
+        );
+        protect_readwrite(va1);
+
+        // 6. Full-block `prepare_cpu_overwrite(va2, BLOCK)` drops BOTH `va1`
+        //    and `va2` with 0 fetches and restores BOTH to `PAGE_READWRITE`.
+        assert!(promote_test_block(va1, 303, 0, 5, noop_fetcher));
+        assert_eq!(query_prot(va1).1, PAGE_NOACCESS);
+        assert_eq!(query_prot(va2).1, PAGE_NOACCESS);
+        prepare_cpu_overwrite(va2, BLOCK);
+        assert_eq!(fetches.load(Ordering::SeqCst), 2);
+        assert!(!is_gpu_resident(blk1) && !is_gpu_resident(blk2));
+        assert_eq!(query_prot(va1).1, PAGE_READWRITE);
+        assert_eq!(query_prot(va2).1, PAGE_READWRITE);
+
+        // Clean up `lazy_readback`, `inplace`, and Win32 handles.
+        evict_range(va1, BLOCK);
+        evict_range(va2, BLOCK);
+        let mut tf = test_fetchers().lock().unwrap_or_else(|e| e.into_inner());
+        tf.remove(&blk1);
+        tf.remove(&blk2);
+        drop(tf);
+        crate::inplace::views_gone(va1, BLOCK);
+        crate::inplace::views_gone(va2, BLOCK);
+        crate::inplace::title_memory_section_gone(sec as usize);
+        // SAFETY: unmapping both views and closing section handle.
+        unsafe {
+            UnmapViewOfFile(view1);
+            UnmapViewOfFile(view2);
             CloseHandle(sec);
         }
     }

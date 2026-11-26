@@ -1488,3 +1488,486 @@ fn all_group_128_thread_uses_mode_a_barrier_and_divergent_uses_mode_b() {
         }
     }
 }
+
+/// Phase 9A P0a live RTX 3090 test: `s_buffer_load_dwordx4`/`x8`/`x16` on a raw
+/// SRV vectorizes into 128-bit `mask=15` `rawBufferLoad`s (7 loads instead of 28
+/// scalar loads) AND preserves exact per-component partial-OOB zero-fill at the
+/// end of a 5-dword (20-byte) buffer.
+#[test]
+fn smem_raw_srv_loads_vectorize_and_zero_fill_partial_oob() {
+    use super::host::Stride;
+    let mut words = vec![
+        0xBE85_0380, // s_mov_b32 s5, 0
+        // UAV descriptor s[8:11] at table offset 0
+        (0x3D << 26) | (0x02 << 18) | (8 << 6) | 2,
+        125 << 25,
+        // SRV descriptor s[12:15] at table offset 32 bytes (slot 1 in heap)
+        (0x3D << 26) | (0x02 << 18) | (12 << 6) | 2,
+        (125 << 25) | 32,
+        // s_buffer_load_dwordx4 s[16:19], s[12:15], s0
+        (0x3D << 26) | (0x0A << 18) | (16 << 6) | (12 >> 1),
+        0,
+        // s_buffer_load_dwordx8 s[20:27], s[12:15], s0
+        (0x3D << 26) | (0x0B << 18) | (20 << 6) | (12 >> 1),
+        0,
+        // s_buffer_load_dwordx16 s[32:47], s[12:15], s0
+        (0x3D << 26) | (0x0C << 18) | (32 << 6) | (12 >> 1),
+        0,
+        // Only thread 0 stores all 28 loaded dwords into UAV[0..28]
+        0x7DA4_0080, // v_cmpx_eq_u32 exec, 0, v0
+    ];
+    let regs: Vec<u32> = (16..20).chain(20..28).chain(32..48).collect();
+    for (idx, reg) in regs.into_iter().enumerate() {
+        words.push(0x7E02_0200 | reg); // v_mov_b32 v1, s<reg>
+        let byte_off = (idx as u32) * 4;
+        words.push((0x38 << 26) | (0x1C << 18) | (byte_off & 0xFFF));
+        words.push((128 << 24) | (2 << 16) | (1 << 8)); // buffer_store_dword v1, off, s[8:11], 0 offset:byte_off
+    }
+    words.push(S_ENDPGM);
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 8,
+        layout: vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 4,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 1,
+            },
+        ],
+        used: vec![
+            UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 4,
+                slot: 1,
+            },
+            UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Table,
+                table_offset_dwords: 8,
+                lower_bound: 1,
+                stride: 0,
+                dwords: 4,
+                user_data: 4,
+                slot: 1,
+            },
+        ],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 5 << 1,
+            threads: [32, 1, 1],
+        }),
+        code,
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let mut l = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    })
+    .expect("lower vectorized smem");
+    assert_eq!(
+        l.raw_load_masks,
+        vec![15; 7],
+        "s_buffer_load_dwordx4/x8/x16 must emit 7x 128-bit mask=15 rawBufferLoad instead of 28 scalar loads"
+    );
+    if let Ok(mut v) =
+        validator::Validator::load(validator::Validator::default_path().as_deref())
+    {
+        v.validate(&mut l.dxil)
+            .expect("vectorized smem DXIL validation failed");
+    }
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: l.dxil,
+        user_data: l.user_data,
+        samplers: l.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: l.root_cbvs,
+        root_srvs: l.root_srvs,
+        root_uavs: l.root_uavs,
+        root_indexed_views: res.root_indexed_views,
+    };
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else { return };
+    let (root, pso) = host.compute_pipeline(&shader).expect("compute_pipeline");
+    let srv_data = [
+        0x1111_0001u32,
+        0x2222_0002,
+        0x3333_0003,
+        0x4444_0004,
+        0x5555_0005,
+    ];
+    for byte_off in [0u32, 8u32] {
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        ud[0] = byte_off;
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[
+                        View::RawUav(28),
+                        View::Buffer {
+                            data: &srv_data,
+                            stride: Stride::Raw,
+                        },
+                    ],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .expect("dispatch vectorized smem");
+        let start = (byte_off / 4) as usize;
+        let want_word = |k: usize| srv_data.get(start + k).copied().unwrap_or(0);
+        for k in 0..4 {
+            assert_eq!(out[0][k], want_word(k), "x4 off={byte_off} k={k}");
+        }
+        for k in 0..8 {
+            assert_eq!(out[0][4 + k], want_word(k), "x8 off={byte_off} k={k}");
+        }
+        for k in 0..16 {
+            assert_eq!(out[0][12 + k], want_word(k), "x16 off={byte_off} k={k}");
+        }
+    }
+}
+
+/// Phase 9A P2a live RTX 3090 test (`thr=(8, 16, 1)` = 128 threads):
+/// - Uniform `s_buffer_load_dwordx2` CBV branch + uniform counted loop (`for i in 0..N`)
+///   containing cross-half `v_readlane_b32` lowers 100% to Mode A `BAR.SYNC`
+///   (`atomic_rmws == 1`, zero Mode B spin loops!).
+/// - Adding a divergent per-wave early `break` (`v_readfirstlane_b32(tid) >= 64`)
+///   taints the loop header PHI and falls back to Mode B (`atomic_rmws > 1`) with
+///   zero deadlock and bit-exact results for all 128 lanes.
+#[test]
+fn uniform_cbv_branch_and_counted_loop_use_mode_a_barrier_in_128_thread_wave64() {
+    use super::host::Stride;
+    let build = |with_div_break: bool| {
+        let mut w = vec![
+            0xBE85_0380, // s_mov_b32 s5, 0
+            // UAV s[8:11] at table offset 0, SRV/CBV s[12:15] at table offset 32
+            (0x3D << 26) | (0x02 << 18) | (8 << 6) | 2,
+            125 << 25,
+            (0x3D << 26) | (0x02 << 18) | (12 << 6) | 2,
+            (125 << 25) | 32,
+            // Non-GLC `s_buffer_load_dwordx2 s[16:17], s[12:15], 0` (s16 = enable, s17 = iters)
+            (0x3D << 26) | (0x09 << 18) | (16 << 6) | (12 >> 1),
+            125 << 25,
+            // v3 = (v1 << 3) + v0  (flat tid 0..127); v5 = v3 + 1
+            0x3406_0283,
+            0x4A06_0103,
+            0x4A0A_0681, // v_add_nc_u32 v5, 1, v3
+            0xBE92_0380, // s_mov_b32 s18, 0 (accumulator)
+            0xBE93_0380, // s_mov_b32 s19, 0 (loop counter)
+            // Uniform CBV branch: if (s16 == 0) goto done
+            0xBF06_8010, // s_cmp_eq_u32 s16, 0
+            0xBF85_0000, // s_cbranch_scc1 done (patched)
+        ];
+        let br_enable = w.len() - 1;
+        let loop_hdr = w.len();
+        w.push(0xBF0A_1113); // s_cmp_lt_u32 s19, s17
+        w.push(0xBF84_0000); // s_cbranch_scc0 done (patched)
+        let br_loop_exit = w.len() - 1;
+        let mut br_div_break = None;
+        if with_div_break {
+            w.push(0x7E2A_0503); // v_readfirstlane_b32 s21, v3 (0 in Wave 0, 64 in Wave 1)
+            w.push(0xBF09_C015); // s_cmp_ge_u32 s21, 64
+            w.push(0xBF85_0000); // s_cbranch_scc1 done (patched)
+            br_div_break = Some(w.len() - 1);
+        }
+        // Cross-half exchange inside the counted loop: s20 = v_readlane_b32(v5, 35)
+        w.push(0xD760_0014);
+        w.push((163 << 9) | (256 + 5));
+        w.push(0x8012_1412); // s_add_u32 s18, s18, s20
+        w.push(0x8013_8113); // s_add_u32 s19, s19, 1
+        let back_idx = w.len();
+        let back_rel = (loop_hdr as isize - back_idx as isize - 1) as i16 as u16 as u32;
+        w.push(0xBF82_0000 | back_rel); // s_branch loop_hdr
+        let done = w.len();
+        let patch = |w: &mut [u32], idx: usize, dst: usize| {
+            let rel = (dst as isize - idx as isize - 1) as i16 as u16 as u32;
+            w[idx] = (w[idx] & 0xFFFF_0000) | rel;
+        };
+        patch(&mut w, br_enable, done);
+        patch(&mut w, br_loop_exit, done);
+        if let Some(b) = br_div_break {
+            patch(&mut w, b, done);
+        }
+        // UAV[v3] = s18 + v3
+        w.push(0x4A0C_0612); // v_add_nc_u32 v6, s18, v3
+        w.push(0x3404_0682); // v_lshlrev_b32 v2, 2, v3
+        w.push((0x38 << 26) | (0x1C << 18) | (1 << 12));
+        w.push((128 << 24) | (2 << 16) | (6 << 8) | 2);
+        w.push(S_ENDPGM);
+        let code: Vec<u8> = w.iter().flat_map(|x| x.to_le_bytes()).collect();
+        NativeProgram {
+            stage: HwStage::Cs,
+            wave64: true,
+            vgprs: 16,
+            layout: vec![
+                RootParam {
+                    root: RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 4,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            used: vec![
+                UsedResource {
+                    kind: ResourceType::Uav,
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride: 0,
+                    dwords: 4,
+                    user_data: 4,
+                    slot: 1,
+                },
+                UsedResource {
+                    kind: ResourceType::Srv,
+                    root: RootType::Table,
+                    table_offset_dwords: 8,
+                    lower_bound: 1,
+                    stride: 0,
+                    dwords: 4,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: (5 << 1) | (1 << 11),
+                threads: [8, 16, 1],
+            }),
+            code,
+        }
+    };
+    let lower_prog = |native: &NativeProgram| {
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let st = structure::structure(&p).expect("structure");
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+        let io = io::raise(&p, native).expect("io::raise");
+        let was_w = lower::TEST_HOST_WAVE.replace(Some(32));
+        let was_f = lower::TEST_ALL_GROUP_BARRIER.replace(Some(true));
+        let mut l = lower::lower(&lower::Parts {
+            native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        })
+        .expect("lower uniform/divergent loop");
+        lower::TEST_ALL_GROUP_BARRIER.set(was_f);
+        lower::TEST_HOST_WAVE.set(was_w);
+        if let Ok(mut v) =
+            validator::Validator::load(validator::Validator::default_path().as_deref())
+        {
+            v.validate(&mut l.dxil).expect("DXIL validation failed");
+        }
+        let shader = HostShader {
+            stage: HwStage::Cs,
+            dxil: l.dxil.clone(),
+            user_data: l.user_data.clone(),
+            samplers: l.samplers.clone(),
+            static_samplers: Vec::new(),
+            root_cbvs: l.root_cbvs.clone(),
+            root_srvs: l.root_srvs.clone(),
+            root_uavs: l.root_uavs.clone(),
+            root_indexed_views: res.root_indexed_views,
+        };
+        (l, shader)
+    };
+
+    let (l_unif, sh_unif) = lower_prog(&build(false));
+    let (l_div, sh_div) = lower_prog(&build(true));
+    // Uniform CBV branch + counted loop emits 0 Mode B spin-loop atomics
+    // (1 entry `wave_base` + 1 cold loop-limit TDR fuse `xchg` = 2; a Mode B
+    // exchange adds 5 atomics!).
+    assert_eq!(
+        l_unif.atomic_rmws, 2,
+        "uniform CBV branch + counted loop must emit 0 Mode B spin atomics"
+    );
+    assert!(
+        l_unif.barriers >= 2,
+        "uniform loop exchange must emit Mode A hardware BAR.SYNC"
+    );
+    assert!(
+        l_div.atomic_rmws >= 7,
+        "divergent early-break loop must taint header PHI and stay on Mode B (got {} atomics)",
+        l_div.atomic_rmws
+    );
+
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else { return };
+    let cb = [1u32, 3, 0, 0];
+    for (label, shader, div_break) in [
+        ("uniform CBV + counted loop (Mode A)", &sh_unif, false),
+        ("divergent early-break loop (Mode B)", &sh_div, true),
+    ] {
+        let (root, pso) = host.compute_pipeline(shader).expect("compute_pipeline");
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[
+                        View::RawUav(128),
+                        View::Buffer {
+                            data: &cb,
+                            stride: Stride::Raw,
+                        },
+                    ],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        for t in 0..128u32 {
+            let wave_base = t & !63;
+            let acc = if div_break && t >= 64 {
+                0
+            } else {
+                3 * (wave_base + 36)
+            };
+            assert_eq!(out[0][t as usize], acc + t, "{label}: lane {t}");
+        }
+    }
+}
+
+/// Phase 9A P2b live RTX 3090 test: `with_local_waves` on a `thr=(8, 16, 1)`
+/// Wave64 shader without intra-half layout ops drops the dead `[23 x i32]` LDS
+/// allocation, entry `barrier(9)`, and `wave_base` atomic completely (`lds=0`,
+/// `barriers=0`, `atomic_rmws=0`) and executes cleanly across all 128 lanes.
+#[test]
+fn wave_local_drops_unused_exchange_lds_and_entry_barrier() {
+    let words = [
+        // v3 = (v1 << 3) + v0 (flat tid 0..127)
+        0x3406_0283,
+        0x4A06_0103,
+        // v4 = v_mbcnt_lo_u32_b32(-1, 0) + v_mbcnt_hi_u32_b32(-1, v4)
+        0xD765_0004,
+        (128 << 9) | 0xC1, // v_mbcnt_lo_u32_b32 v4, -1, 0
+        0xD766_0004,
+        (260 << 9) | 0xC1, // v_mbcnt_hi_u32_b32 v4, -1, v4
+        // v6 = (v3 << 8) | v4
+        0x340C_0688, // v_lshlrev_b32 v6, 8, v3
+        0x380C_0906, // v_or_b32 v6, v6, v4 (src0 = 256+6 = 0x106, vsrc1 = 4)
+        // UAV[v3] = v6
+        0x3404_0682,
+        (0x38 << 26) | (0x1C << 18) | (1 << 12),
+        (128 << 24) | (2 << 16) | (6 << 8) | 2,
+    ];
+    let mut native = native_of(&words, true, 128);
+    if let StageIo::Cs(ref mut cs) = native.io {
+        cs.threads = [8, 16, 1];
+        cs.rsrc2 = (5 << 1) | (1 << 11);
+    }
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let was_w = lower::TEST_HOST_WAVE.replace(Some(32));
+    let mut l = lower::with_local_waves(|| {
+        lower::lower(&lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        })
+    })
+    .expect("lower local_waves");
+    lower::TEST_HOST_WAVE.set(was_w);
+    assert_eq!(l.lds_dwords, 0, "wave_local without layout ops must allocate 0 LDS dwords");
+    assert_eq!(l.barriers, 0, "wave_local without layout ops must emit 0 entry barriers");
+    assert_eq!(l.atomic_rmws, 0, "wave_local without layout ops must emit 0 entry atomics");
+    if let Ok(mut v) =
+        validator::Validator::load(validator::Validator::default_path().as_deref())
+    {
+        v.validate(&mut l.dxil)
+            .expect("wave_local zero-LDS DXIL validation failed");
+    }
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: l.dxil,
+        user_data: l.user_data,
+        samplers: l.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: l.root_cbvs,
+        root_srvs: l.root_srvs,
+        root_uavs: l.root_uavs,
+        root_indexed_views: res.root_indexed_views,
+    };
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else { return };
+    let (root, pso) = host.compute_pipeline(&shader).expect("compute_pipeline");
+    let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &[View::RawUav(128)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .expect("dispatch wave_local");
+    for t in 0..128u32 {
+        let got = out[0][t as usize];
+        assert_eq!(got >> 8, t, "flat tid mismatch for lane {t}");
+        assert!((got & 0xFF) < 32, "local lane must be in 0..32 for lane {t}, got {}", got & 0xFF);
+    }
+}

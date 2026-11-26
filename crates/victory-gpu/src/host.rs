@@ -12,6 +12,11 @@ pub(crate) mod native_vram;
 mod place;
 mod torn;
 
+/// Whether the host device supports D3D12 Enhanced Barriers (`OPTIONS12`).
+pub(crate) fn enhanced_barriers(host: &Host) -> bool {
+    place::enhanced_barriers(host)
+}
+
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -3645,14 +3650,14 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
 
 /// Resolves `VICTORY_MERGE_RUNS`: maximum changed byte runs merged into
 /// card-backed copies under in-flight shader writes per submission before
-/// falling back to a full pipeline settle (default 8,192; clamped 64..=65,536).
+/// falling back to a full pipeline settle (default 32,768; clamped 64..=65,536).
 ///
-/// The old hardcoded cap of 512 overflowed on half of all submissions when
-/// ~800 tiny changed runs (~90 KiB/frame) arrived per submission, triggering
-/// 125 ms full settles (`WHY_STALE`: 62.4 ms/frame) for a few KiB of edits.
+/// Paired with sub-16-byte run coalescing in `Shadow::merge_page_under_writes`,
+/// even heavy dynamic submissions stay well within budget without tripping
+/// full pipeline settles (`WHY_STALE`).
 fn resolve_merge_runs_limit(env: Option<&str>) -> usize {
     env.and_then(|v| v.trim().parse::<usize>().ok())
-        .map_or(8192, |n| n.clamp(64, 65_536))
+        .map_or(32_768, |n| n.clamp(64, 65_536))
 }
 
 fn merge_runs_limit() -> usize {
@@ -7350,9 +7355,10 @@ impl HostList {
         self.sparse_uma_wrote.store(true, Ordering::Relaxed);
     }
 
-    /// Whether this list has recorded a Stage M3 sparse GDDR6X window UAV write.
-    pub(crate) fn sparse_uma_wrote(&self) -> bool {
-        self.sparse_uma_wrote.load(Ordering::Relaxed)
+    /// Consumes and clears whether this list recorded a Stage M3 sparse GDDR6X
+    /// window UAV write so subsequent draws do not re-emit redundant global UAV barriers.
+    pub(crate) fn take_sparse_uma_wrote(&self) -> bool {
+        self.sparse_uma_wrote.swap(false, Ordering::Relaxed)
     }
 
     /// Increments and returns the count of high-level GPU commands recorded on
@@ -7370,6 +7376,12 @@ impl HostList {
     /// UAV/buffer memory, so the next consumer or barrier emits a `UAV(NULL)`.
     pub(crate) fn mark_uav_write(&self) {
         self.uav_dirty.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether a global `UAV(NULL)` barrier is currently pending on this list
+    /// (read-only query; does not clear the flag).
+    pub(crate) fn uav_dirty(&self) -> bool {
+        self.uav_dirty.load(Ordering::Relaxed)
     }
 
     /// Consumes and returns whether a global `UAV(NULL)` barrier is currently
@@ -7402,7 +7414,7 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
-        if self.sparse_uma_wrote.load(Ordering::Relaxed) {
+        if self.take_sparse_uma_wrote() {
             self.uav_barrier_all();
         }
         // Return the indirect scratch buffer to COMMON once at list close
@@ -10377,11 +10389,11 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert!(!resolve_default_on(Some("0")));
         assert!(!resolve_default_on(Some(" 0 ")));
 
-        assert_eq!(resolve_merge_runs_limit(None), 8192);
+        assert_eq!(resolve_merge_runs_limit(None), 32_768);
         assert_eq!(resolve_merge_runs_limit(Some("2048")), 2048);
         assert_eq!(resolve_merge_runs_limit(Some("10")), 64);
         assert_eq!(resolve_merge_runs_limit(Some("999999")), 65_536);
-        assert_eq!(resolve_merge_runs_limit(Some("bogus")), 8192);
+        assert_eq!(resolve_merge_runs_limit(Some("bogus")), 32_768);
     }
 
     #[test]

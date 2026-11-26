@@ -65,75 +65,186 @@ pub(super) fn all_group_blocks(st: &Structured) -> Option<Vec<bool>> {
 /// compute workgroup (CTA) — safe for hardware `BAR.SYNC` (`barrier(1 | 8)`)
 /// in multi-wave (`group > 64`) Wave64-on-Wave32 shaders.
 ///
-/// Stricter than [`all_group_blocks`]: in addition to excluding per-lane and
-/// wave-wide (`st.wide`) branch regions, this also excludes any `Atom::Uniform`
-/// (scalar `s_cbranch_scc*`) branch whose condition is NOT provably derived
-/// solely from workgroup-uniform scalar inputs (e.g. branches depending on
-/// `v_readfirstlane_b32`, `v_readlane_b32`, `s_get_waveid*`, wave masks, LDS,
-/// or UAVs, which can diverge between console wave 0 and console wave 1).
+/// Uses an optimistic divergence-propagation fixed point:
+/// - Entry scalar inputs (`c < 106`), pure `SOP` ops (excluding waveid/time/getreg),
+///   and non-GLC/non-DLC `s_load_*` / `s_buffer_load_*` scalar loads stay
+///   workgroup-uniform unless fed by a divergent operand.
+/// - Uniform loop-header and `if-else` join PHIs stay workgroup-uniform whenever
+///   all incoming values are uniform AND no predecessor block/branch can diverge
+///   across console waves (so counted uniform loops and CBV branches use hardware
+///   Mode A `BAR.SYNC`, while early-break/divergent loops and `v_readfirstlane`
+///   branches are tainted divergent and stay on Mode B).
 pub(super) fn all_group_barrier_blocks(p: &Program, st: &Structured) -> Option<Vec<bool>> {
     let n = st.exits.len();
-    // Conservative forward fixed point of workgroup-uniform SSA scalar values.
-    // A value is group-uniform iff it comes from entry scalar inputs (user data
-    // / group IDs) or pure SOP / non-GLC SMEM load instructions whose inputs
-    // are all group-uniform and whose defining block is not inside any
-    // non-group-uniform branch region.
     let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
-    let mut uniform: HashSet<Value> = p
-        .inputs
-        .iter()
-        .filter_map(|&(reg, v)| matches!(reg, Reg::S(c) if c < 106).then_some(v))
+    let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (b, e) in st.exits.iter().enumerate() {
+        match *e {
+            LaneExit::Jump(t) => succ[b].push(t),
+            LaneExit::Branch { taken, not_taken, .. } => {
+                succ[b].push(taken);
+                succ[b].push(not_taken);
+            }
+            LaneExit::End => {}
+            LaneExit::Indirect => return None,
+        }
+    }
+    // Post-dominators (virtual exit after every `End`).
+    let words = n.div_ceil(64);
+    let full = vec![u64::MAX; words];
+    let mut pdom: Vec<Vec<u64>> = (0..n)
+        .map(|b| {
+            if succ[b].is_empty() {
+                let mut v = vec![0; words];
+                v[b / 64] |= 1 << (b % 64);
+                v
+            } else {
+                full.clone()
+            }
+        })
         .collect();
-    let mut all = vec![true; n];
+    let mut pdom_changed = true;
+    while pdom_changed {
+        pdom_changed = false;
+        for b in (0..n).rev() {
+            if succ[b].is_empty() {
+                continue;
+            }
+            let mut v = full.clone();
+            for &t in &succ[b] {
+                for w in 0..words {
+                    v[w] &= pdom[t][w];
+                }
+            }
+            v[b / 64] |= 1 << (b % 64);
+            if v != pdom[b] {
+                pdom[b] = v;
+                pdom_changed = true;
+            }
+        }
+    }
+    // Precompute the non-postdominated region of every branch block `d`.
+    let mut branch_regions: Vec<(usize, Bool, Vec<usize>)> = Vec::new();
+    for (d, e) in st.exits.iter().enumerate() {
+        let LaneExit::Branch { when, .. } = *e else {
+            continue;
+        };
+        let mut seen = vec![false; n];
+        let mut stack: Vec<usize> = succ[d].clone();
+        while let Some(b) = stack.pop() {
+            if b == d {
+                seen[d] = true;
+                continue;
+            }
+            if seen[b] || pdom[d][b / 64] >> (b % 64) & 1 == 1 {
+                continue;
+            }
+            seen[b] = true;
+            stack.extend(succ[b].iter().copied());
+        }
+        let blks: Vec<usize> = (0..n).filter(|&b| seen[b]).collect();
+        branch_regions.push((d, when, blks));
+    }
+
+    let mut div_val: HashSet<Value> = HashSet::new();
+    let mut div_blk = vec![false; n];
+
+    // Seed entry inputs: only non-mask scalar inputs `c < 106` are workgroup-uniform.
+    for &(reg, v) in &p.inputs {
+        if !matches!(reg, Reg::S(c) if c < 106) || is_mask(v) {
+            div_val.insert(v);
+        }
+    }
+    // Seed any PHI or instruction write whose op/register cannot be workgroup-uniform.
+    for block in &p.blocks {
+        for phi in &block.phis {
+            if !(matches!(phi.reg, Reg::S(c) if c < 106) || matches!(phi.reg, Reg::Scc))
+                || is_mask(phi.value)
+            {
+                div_val.insert(phi.value);
+            }
+        }
+        for inst in &block.insts {
+            let name = inst.name();
+            let pure_uniform_op = match &inst.fields {
+                Fields::Sop { .. } => {
+                    !name.contains("waveid")
+                        && !name.contains("memtime")
+                        && !name.contains("memrealtime")
+                        && !name.contains("getreg")
+                }
+                Fields::Smem { cache, .. } => {
+                    (name.starts_with("s_load_") || name.starts_with("s_buffer_load_"))
+                        && !cache.glc
+                        && !cache.dlc
+                }
+                _ => false,
+            };
+            for &(reg, w) in &inst.writes {
+                if !pure_uniform_op
+                    || !(matches!(reg, Reg::S(c) if c < 106) || matches!(reg, Reg::Scc))
+                    || is_mask(w)
+                {
+                    div_val.insert(w);
+                }
+            }
+        }
+    }
+
     let rpo = crate::ir::reverse_postorder(&p.blocks);
-    // Start by computing regions under the current `uniform` set; refine until
-    // `all` converges (monotonically shrinking `all` / growing `uniform` is
-    // bounded; we do one conservative pass without phis across non-uniform
-    // joins, so iterate `uniform` inside currently-`all` blocks? Even simpler:
-    // compute `uniform` WITHOUT trusting any phi at a multi-pred block first,
-    // which is 100% monotone and needs zero cyclic reasoning!).
+    let is_uniform_branch = |d: usize, when: Bool, div_blk: &[bool], div_val: &HashSet<Value>| {
+        !div_blk[d]
+            && !st.wide.contains(&d)
+            && st.bools.support(when).iter().all(|a| match *a {
+                Atom::Uniform(v) => !div_val.contains(&v),
+                _ => false,
+            })
+    };
     let mut changed = true;
     while changed {
         changed = false;
-        for &b in &rpo {
-            let block = &p.blocks[b];
-            for phi in &block.phis {
-                if matches!(phi.reg, Reg::S(c) if c < 106) || matches!(phi.reg, Reg::Scc) {
-                    if !is_mask(phi.value)
-                        && !phi.args.is_empty()
-                        && phi.args.iter().all(|a| *a == phi.value || uniform.contains(a))
-                        && block.preds.len() <= 1
-                        && uniform.insert(phi.value)
-                    {
+        for &(d, when, ref blks) in &branch_regions {
+            if !is_uniform_branch(d, when, &div_blk, &div_val) {
+                for &b in blks {
+                    if !div_blk[b] {
+                        div_blk[b] = true;
                         changed = true;
                     }
                 }
             }
-            for inst in &block.insts {
-                let name = inst.name();
-                let pure_uniform_op = match &inst.fields {
-                    Fields::Sop { .. } => {
-                        !name.contains("waveid")
-                            && !name.contains("memtime")
-                            && !name.contains("memrealtime")
-                            && !name.contains("getreg")
-                    }
-                    Fields::Smem { cache, .. } => {
-                        name.starts_with("s_load_") && !cache.glc && !cache.dlc
-                    }
-                    _ => false,
-                };
-                if !pure_uniform_op {
+        }
+        for &b in &rpo {
+            let block = &p.blocks[b];
+            // A multi-predecessor PHI is sync-divergent if any predecessor block
+            // is divergent or terminates in a divergent branch.
+            let pred_div = block.preds.len() > 1
+                && block.preds.iter().any(|&q| {
+                    div_blk[q]
+                        || matches!(
+                            st.exits.get(q),
+                            Some(LaneExit::Branch { when, .. })
+                                if !is_uniform_branch(q, *when, &div_blk, &div_val)
+                        )
+                });
+            for phi in &block.phis {
+                if div_val.contains(&phi.value) {
                     continue;
                 }
-                if inst.reads.iter().all(|&(reg, v)| {
-                    !matches!(reg, Reg::V(_)) && !is_mask(v) && uniform.contains(&v)
-                }) {
-                    for &(reg, w) in &inst.writes {
-                        if (matches!(reg, Reg::S(c) if c < 106) || matches!(reg, Reg::Scc))
-                            && !is_mask(w)
-                            && uniform.insert(w)
-                        {
+                if pred_div || phi.args.iter().any(|a| div_val.contains(a)) {
+                    div_val.insert(phi.value);
+                    changed = true;
+                }
+            }
+            for inst in &block.insts {
+                if inst.writes.iter().all(|(_, w)| div_val.contains(w)) {
+                    continue;
+                }
+                let reads_div = inst.reads.iter().any(|&(reg, v)| {
+                    matches!(reg, Reg::V(_)) || is_mask(v) || div_val.contains(&v)
+                });
+                if reads_div {
+                    for &(_, w) in &inst.writes {
+                        if div_val.insert(w) {
                             changed = true;
                         }
                     }
@@ -141,12 +252,7 @@ pub(super) fn all_group_barrier_blocks(p: &Program, st: &Structured) -> Option<V
             }
         }
     }
-    for (_, region) in lane_regions_with_uniform(st, false, Some(&uniform))? {
-        for b in (0..n).filter(|&b| region[b]) {
-            all[b] = false;
-        }
-    }
-    Some(all)
+    Some(div_blk.into_iter().map(|d| !d).collect())
 }
 
 fn all_blocks_inner(st: &Structured, include_wide: bool) -> Option<Vec<bool>> {
@@ -168,14 +274,6 @@ pub(super) fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
 }
 
 fn lane_regions_inner(st: &Structured, include_wide: bool) -> Option<Vec<(usize, Vec<bool>)>> {
-    lane_regions_with_uniform(st, include_wide, None)
-}
-
-fn lane_regions_with_uniform(
-    st: &Structured,
-    include_wide: bool,
-    group_uniform: Option<&HashSet<Value>>,
-) -> Option<Vec<(usize, Vec<bool>)>> {
     let n = st.exits.len();
     let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
     for (b, e) in st.exits.iter().enumerate() {
@@ -228,10 +326,11 @@ fn lane_regions_with_uniform(
         let LaneExit::Branch { when, .. } = *e else {
             continue;
         };
-        let uniform_branch = st.bools.support(when).iter().all(|a| match *a {
-            Atom::Uniform(v) => group_uniform.is_none_or(|gu| gu.contains(&v)),
-            _ => false,
-        });
+        let uniform_branch = st
+            .bools
+            .support(when)
+            .iter()
+            .all(|a| matches!(*a, Atom::Uniform(_)));
         if (include_wide && st.wide.contains(&d)) || uniform_branch {
             continue; // a wave-wide or uniform branch: all lanes go the same way
         }

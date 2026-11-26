@@ -201,11 +201,20 @@ enum Blob {
 }
 
 impl Blob {
-    /// The library file in `dir`: a library a save left beside it
-    /// ([`NEXT_FILE`]) takes its place first.
+    /// The library file in `dir` for the active shader translation fingerprint.
     fn of(dir: &std::path::Path) -> Blob {
-        let path = dir.join(LIBRARY_FILE);
-        let next = dir.join(NEXT_FILE);
+        Blob::of_for(dir, current_tag())
+    }
+
+    /// The library file in `dir` for translator fingerprint `tag`: prunes stale
+    /// legacy or older-fingerprint library files so obsolete DXIL revisions do
+    /// not accumulate (> 1 GB), then promotes any pending `.next` file.
+    fn of_for(dir: &std::path::Path, tag: &str) -> Blob {
+        let file_name = library_file_name(tag);
+        let next_name = next_file_name(tag);
+        prune_stale_libraries(dir, &file_name, &next_name);
+        let path = dir.join(&file_name);
+        let next = dir.join(&next_name);
         if next.exists() && std::fs::rename(&next, &path).is_err() {
             tracing::warn!("the host pipeline library saved last could not take the old one's place");
         }
@@ -428,14 +437,70 @@ fn one_call() -> Option<MutexGuard<'static, ()>> {
         .then(|| CALLING.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
-const LIBRARY_FILE: &str = "host-pipelines.bin";
-/// A saved library that could not replace [`LIBRARY_FILE`] while this run
-/// had it mapped (a system that refuses to replace a mapped file): the next
-/// start renames it over the library first ([`Blob::of`]).
-const NEXT_FILE: &str = "host-pipelines.next";
+const LIBRARY_FILE_PREFIX: &str = "host-pipelines-";
+const LEGACY_LIBRARY_FILES: [&str; 3] = ["host-pipelines.bin", "host-pipelines.next", "host-pipelines.tmp"];
 const EARLY_FILE: &str = "early-pipelines.txt";
 /// Title pipelines listed for an early start, at most.
 const EARLY_MAX: usize = 8192;
+
+/// Short 16-hex-char tag for `fp` (the shader translator fingerprint).
+fn fingerprint_tag(fp: &[u8]) -> String {
+    blake3::hash(fp).to_hex()[..16].to_owned()
+}
+
+/// Active translator fingerprint tag for keying the on-disk pipeline library.
+fn current_tag() -> &'static str {
+    static TAG: OnceLock<String> = OnceLock::new();
+    TAG.get_or_init(|| fingerprint_tag(&victory_shader::emit::translation_fingerprint()))
+}
+
+fn library_file_name(tag: &str) -> String {
+    format!("{LIBRARY_FILE_PREFIX}{tag}.bin")
+}
+
+/// A saved library that could not replace the active library file while this
+/// run had it mapped: the next start renames it over the library first.
+fn next_file_name(tag: &str) -> String {
+    format!("{LIBRARY_FILE_PREFIX}{tag}.next")
+}
+
+/// Best-effort removal of unversioned legacy (`host-pipelines.bin`) or older
+/// translator-revision library files in `dir`, keeping only `keep_bin` and
+/// `keep_next` (never touching `early-pipelines.txt` or unrelated files).
+fn prune_stale_libraries(dir: &std::path::Path, keep_bin: &str, keep_next: &str) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut removed = 0u64;
+    let mut freed = 0u64;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name == keep_bin || name == keep_next {
+            continue;
+        }
+        let is_legacy = LEGACY_LIBRARY_FILES.contains(&name);
+        let is_old_versioned = name.starts_with(LIBRARY_FILE_PREFIX)
+            && (name.ends_with(".bin") || name.ends_with(".next") || name.ends_with(".tmp"));
+        if is_legacy || is_old_versioned {
+            let bytes = entry.metadata().map_or(0, |m| m.len());
+            if std::fs::remove_file(entry.path()).is_ok() {
+                removed += 1;
+                freed = freed.saturating_add(bytes);
+            }
+        }
+    }
+    if removed > 0 {
+        tracing::info!(
+            removed,
+            freed_mb = freed >> 20,
+            active = keep_bin,
+            "compacted host pipeline library cache by pruning stale translator revisions"
+        );
+    }
+}
 
 fn library() -> Option<&'static Library> {
     static LIBRARY: OnceLock<Option<Library>> = OnceLock::new();
@@ -581,7 +646,8 @@ pub(crate) fn save(now: bool) {
         tracing::warn!(error = %e, "host pipeline library not saved");
         return;
     }
-    let tmp = dir.join(LIBRARY_FILE).with_extension("tmp");
+    let tag = current_tag();
+    let tmp = dir.join(library_file_name(tag)).with_extension("tmp");
     // The bytes of the library written to `tmp`; 0 when no pipeline was
     // added: the library on disk is then what it was, and only the early
     // list is written (a title pipeline first drawn with wrote all 1,352 MB
@@ -611,10 +677,10 @@ pub(crate) fn save(now: bool) {
         }
     };
     let used: Vec<String> = USED.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().cloned().collect();
-    let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
+    let library_written = if bytes > 0 { replace_library_for(dir, &tmp, tag) } else { Ok(()) };
     if bytes > 0 && library_written.is_ok() {
         // In place unless the system refused and the new one waits beside it.
-        let in_place = !dir.join(NEXT_FILE).exists();
+        let in_place = !dir.join(next_file_name(tag)).exists();
         if in_place && VIEW[0].load(Ordering::Relaxed) != 0 {
             REPLACED[1].store(crate::host::now_ms(), Ordering::Relaxed);
             REPLACED[0].fetch_add(1, Ordering::Relaxed);
@@ -666,8 +732,14 @@ fn serialise(library: &ID3D12PipelineLibrary1, tmp: &std::path::Path, size: usiz
 /// is open ([`holds`]; with none, only the pages in memory at that moment
 /// stay: the rest read as zeros). Where a system refuses, the new library
 /// is left beside it as [`NEXT_FILE`] for the next start.
+#[cfg(test)]
 fn replace_library(dir: &std::path::Path, tmp: &std::path::Path) -> std::io::Result<()> {
-    std::fs::rename(tmp, dir.join(LIBRARY_FILE)).or_else(|_| std::fs::rename(tmp, dir.join(NEXT_FILE)))
+    replace_library_for(dir, tmp, current_tag())
+}
+
+fn replace_library_for(dir: &std::path::Path, tmp: &std::path::Path, tag: &str) -> std::io::Result<()> {
+    std::fs::rename(tmp, dir.join(library_file_name(tag)))
+        .or_else(|_| std::fs::rename(tmp, dir.join(next_file_name(tag))))
 }
 
 /// Writes `bytes` to a temporary file beside `path`, then renames it over
@@ -743,7 +815,7 @@ mod tests {
     #[test]
     fn the_library_file_is_mapped_and_replaced() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(LIBRARY_FILE);
+        let path = dir.path().join(library_file_name(current_tag()));
         assert!(matches!(Blob::of(dir.path()), Blob::None), "no file yet");
         std::fs::write(&path, b"").unwrap();
         assert!(matches!(Blob::of(dir.path()), Blob::None), "an empty file");
@@ -767,7 +839,42 @@ mod tests {
         drop(blob);
         // The next start reads the new one, wherever the save left it.
         assert_eq!(Blob::of(dir.path()).bytes(), &new[..]);
-        assert!(!dir.path().join(NEXT_FILE).exists());
+        assert!(!dir.path().join(next_file_name(current_tag())).exists());
+    }
+
+    #[test]
+    fn fingerprint_change_compacts_library_and_prunes_stale_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("host-pipelines.bin");
+        let old_bin = dir.path().join(library_file_name("0123456789abcdef"));
+        let old_next = dir.path().join(next_file_name("0123456789abcdef"));
+        let early = dir.path().join(EARLY_FILE);
+        let unrelated = dir.path().join("keep-me.dat");
+        std::fs::write(&legacy, vec![1u8; 4096]).unwrap();
+        std::fs::write(&old_bin, vec![2u8; 4096]).unwrap();
+        std::fs::write(&old_next, vec![3u8; 4096]).unwrap();
+        std::fs::write(&early, b"abc\n").unwrap();
+        std::fs::write(&unrelated, b"keep").unwrap();
+
+        let tag_a = fingerprint_tag(b"translator-rev-a");
+        let tag_b = fingerprint_tag(b"translator-rev-b");
+        assert_eq!(tag_a.len(), 16);
+        assert_ne!(tag_a, tag_b);
+
+        // New translator revision starts empty (compacted) and deletes legacy + older revision blobs.
+        assert!(matches!(Blob::of_for(dir.path(), &tag_a), Blob::None));
+        assert!(!legacy.exists(), "legacy unversioned library must be pruned");
+        assert!(!old_bin.exists(), "older fingerprint .bin must be pruned");
+        assert!(!old_next.exists(), "older fingerprint .next must be pruned");
+        assert!(early.exists(), "early-pipelines.txt must be preserved");
+        assert!(unrelated.exists(), "unrelated files must be preserved");
+
+        // Saving under `tag_a` loads cleanly on restart with `tag_a`, then compacts again on `tag_b`.
+        let active_path = dir.path().join(library_file_name(&tag_a));
+        std::fs::write(&active_path, b"compacted-library-payload").unwrap();
+        assert_eq!(Blob::of_for(dir.path(), &tag_a).bytes(), b"compacted-library-payload");
+        assert!(matches!(Blob::of_for(dir.path(), &tag_b), Blob::None));
+        assert!(!active_path.exists(), "previous revision must be pruned when fingerprint advances");
     }
 
     /// The bytes at `at` of the pattern the test below writes.
@@ -819,7 +926,7 @@ mod tests {
     fn a_replaced_library_file_still_reads_from_the_disk() {
         const LEN: usize = 8 << 20;
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(LIBRARY_FILE);
+        let path = dir.path().join(library_file_name(current_tag()));
         if !write_uncached(&path, LEN) {
             return; // no uncached writes here: nothing to show
         }

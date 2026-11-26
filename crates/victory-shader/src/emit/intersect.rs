@@ -252,7 +252,7 @@ impl<'a> Lower<'a> {
             let at = self.s.m.select(c, inside, at, outside);
             return (handle, at, inside);
         }
-        let (handle, byte) = self.memory(low, high, guard);
+        let (handle, byte) = self.memory(low, high, guard, false);
         let mapped = self.page_there.expect("memory says");
         (handle, byte, mapped)
     }

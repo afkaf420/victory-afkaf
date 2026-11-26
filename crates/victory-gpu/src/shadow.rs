@@ -280,9 +280,10 @@ fn resolve_card_buffers_bytes(env: Option<&str>, high_vram: bool) -> u64 {
 
 /// Resolves the minimum title buffer size (in bytes) promoted to card VRAM:
 /// explicit `VICTORY_CARD_BUFFERS_MIN_KB` wins, else explicit
-/// `VICTORY_CARD_BUFFERS_MIN_MB`, else 16 KiB on high-VRAM GPUs (>= 16 GiB)
-/// so hot small atomic/counter/indirect/light-tile buffers stay in GDDR6X
-/// VRAM instead of PCIe system RAM, or 1 MiB on smaller GPUs.
+/// `VICTORY_CARD_BUFFERS_MIN_MB`, else 64 KiB on high-VRAM GPUs (>= 16 GiB)
+/// so genuinely card-worthy buffers stay in GDDR6X VRAM without promoting
+/// thousands of tiny (< 64 KiB) dynamic CPU-written buffers into GPU hash/compare
+/// and `WHY_STALE` settle churn, or 1 MiB on smaller GPUs.
 fn resolve_card_buffers_min_bytes(min_kb_env: Option<&str>, min_mb_env: Option<&str>, high_vram: bool) -> u64 {
     if let Some(kb) = min_kb_env.and_then(|v| v.trim().parse::<u64>().ok())
         && kb > 0
@@ -294,13 +295,13 @@ fn resolve_card_buffers_min_bytes(min_kb_env: Option<&str>, min_mb_env: Option<&
     {
         return mb << 20;
     }
-    if high_vram { 16 << 10 } else { 1 << 20 }
+    if high_vram { 64 << 10 } else { 1 << 20 }
 }
 
 /// The smallest title buffer whose copy goes to the card's memory, and the
 /// most bytes of such copies (their "before" twins not counted: a copy
 /// shaders write takes its size twice), both in bytes:
-/// `VICTORY_CARD_BUFFERS_MIN_KB` (default 16 on >= 16 GiB GPUs),
+/// `VICTORY_CARD_BUFFERS_MIN_KB` (default 64 on >= 16 GiB GPUs),
 /// `VICTORY_CARD_BUFFERS_MIN_MB` (default 1 on smaller GPUs), and
 /// `VICTORY_CARD_BUFFERS_MB` (default 1024, or 4096 on >= 16 GiB GPUs).
 fn card_limits() -> (u64, u64) {
@@ -467,16 +468,24 @@ pub(crate) fn card_hash_bytes(size: u64) -> u64 {
     (size / PIECE as u64 + 2) * 16
 }
 
+/// Whether a buffer of title length `len` (host allocation `size`) meets the
+/// card-VRAM promotion bounds (`[least, 1 GiB)`). Checks title `len`, not
+/// 64 KiB-rounded `size`, so `VICTORY_CARD_BUFFERS_MIN_KB=64` genuinely keeps
+/// sub-64 KiB dynamic buffers out of VRAM.
+fn card_size_eligible(len: u64, size: u64, least: u64) -> bool {
+    len >= least && size < 1 << 30
+}
+
 /// A buffer of `size` bytes in the card's memory for a title buffer's
-/// copy, if the copy is to be there: [`cards`] is on, the size is within
-/// [`card_limits`] and below 1 GiB (the compare counts in 32 bits), and the
-/// host has what it takes (`Host::card_ready`).
-fn card_for(size: u64) -> Option<ID3D12Resource> {
+/// copy, if the copy is to be there: [`cards`] is on, title length `len` and
+/// allocation `size` are within [`card_limits`] and below 1 GiB (the compare
+/// counts in 32 bits), and the host has what it takes (`Host::card_ready`).
+fn card_for(len: u64, size: u64) -> Option<ID3D12Resource> {
     if !cards() {
         return None;
     }
     let (least, most) = card_limits();
-    if size < least || size >= 1 << 30 {
+    if !card_size_eligible(len, size, least) {
         return None;
     }
     let host = host()?;
@@ -1969,6 +1978,33 @@ fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
     runs
 }
 
+/// Maximum unchanged gap (in bytes) bridged when coalescing dirty runs for
+/// carded buffers in [`Shadow::merge_page_under_writes`]: strictly below a
+/// 16-byte `float4` / GPU cache-subline boundary so independent 16-byte GPU
+/// slots are never clobbered while byte/word/dword fragmentation collapses
+/// cleanly (guaranteeing a 64 KiB region produces at most `<= 3,856` runs
+/// instead of `32,768`).
+const CARD_MERGE_COALESCE_GAP: usize = 15;
+
+/// Merges adjacent `(offset, len)` dirty runs separated by `<= max_gap` bytes.
+fn coalesce_changed_runs(runs: Vec<(usize, usize)>, max_gap: usize) -> Vec<(usize, usize)> {
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(runs.len().min(64));
+    for (at, len) in runs {
+        if len == 0 {
+            continue;
+        }
+        if let Some(last) = out.last_mut() {
+            let end = last.0 + last.1;
+            if at <= end.saturating_add(max_gap) {
+                last.1 = (at + len).saturating_sub(last.0);
+                continue;
+            }
+        }
+        out.push((at, len));
+    }
+    out
+}
+
 /// Whether what shaders wrote goes into title memory run by run
 /// ([`put_changed`]; on by default, `VICTORY_EXACT_BACK=0` writes the whole
 /// stretch from the first changed byte to the last, as before).
@@ -3260,6 +3296,7 @@ impl Shadow {
             let held = unsafe { std::slice::from_raw_parts_mut(held.add(at), n) };
             let runs = changed_runs(title, held);
             if self.card.is_some() {
+                let runs = coalesce_changed_runs(runs, CARD_MERGE_COALESCE_GAP);
                 let copies = runs.len() as i64;
                 if copies > 0 && left.fetch_sub(copies, Ordering::Relaxed) < copies {
                     return Err(());
@@ -4254,7 +4291,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         // (`crate::inplace::place_for`): the buffer is the title's own
         // memory. Not the big ones `cards` puts in the card's memory: those
         // are read too often to stay in the PC's.
-        let big = cards() && size >= card_limits().0;
+        let big = cards() && len >= card_limits().0;
         if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
@@ -4263,7 +4300,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         // memory. With Move 3 Stage 3A (`VICTORY_REBAR_STREAM=1`), eligible
         // `GpuReadOnly` / `WriteCombinedGpuRw` buffers skip allocating a full
         // host RAM `Card::staging` mirror and stream directly into `UploadRing`!
-        let (buffer, data, card) = match card_for(size) {
+        let (buffer, data, card) = match card_for(len, size) {
             Some(on_card) => {
                 crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
                 if rebar_stream_eligible(key.0, len) {
@@ -4733,7 +4770,7 @@ mod window_tests {
 
         // Default >= 16 GiB (24 GB GPU smart defaults)
         assert_eq!(resolve_card_buffers_bytes(None, true), 4096 << 20);
-        assert_eq!(resolve_card_buffers_min_bytes(None, None, true), 16 << 10);
+        assert_eq!(resolve_card_buffers_min_bytes(None, None, true), 64 << 10);
         assert_eq!(resolve_card_windows_bytes(None, true), 4096 << 20);
         assert!(resolve_card_room_kept(None, true));
 
@@ -5028,6 +5065,95 @@ mod window_tests {
         // SAFETY: newly materialized `PAGE`-byte `shared_buffer`.
         let mirrored = unsafe { std::slice::from_raw_parts(ptr, PAGE) };
         assert_eq!(mirrored, expected);
+    }
+
+    #[test]
+    fn card_min_size_checks_title_len_and_checkerboard_64k_coalesces_under_writes() {
+        use std::sync::atomic::{AtomicI64, Ordering};
+        use super::{
+            CARD_MERGE_COALESCE_GAP, PAGE, card_size_eligible, changed_runs, coalesce_changed_runs,
+            test_card_shadow_at,
+        };
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+
+        // 1. Sub-64 KiB title buffers are NOT promoted even though allocation size rounds to 64 KiB.
+        assert!(!card_size_eligible(4 << 10, 64 << 10, 64 << 10));
+        assert!(!card_size_eligible(63 << 10, 64 << 10, 64 << 10));
+        assert!(card_size_eligible(64 << 10, 64 << 10, 64 << 10));
+        assert!(!card_size_eligible(1 << 30, 1 << 30, 64 << 10));
+
+        // 2. Worst-case 64 KiB checkerboard mutations coalesce cleanly below 4,096 runs
+        //    while preserving independent >= 16-byte unchanged gaps.
+        const LEN_64K: usize = 64 << 10;
+        let was = vec![0u8; LEN_64K];
+        let mut now_checker = vec![0u8; LEN_64K];
+        for i in (0..LEN_64K).step_by(2) {
+            now_checker[i] = 0x5A;
+        }
+        let raw = changed_runs(&now_checker, &was);
+        assert_eq!(raw.len(), LEN_64K / 2);
+        let coalesced = coalesce_changed_runs(raw, CARD_MERGE_COALESCE_GAP);
+        assert_eq!(coalesced, vec![(0, LEN_64K - 1)]);
+
+        // Every 17th byte mutated: maximum possible post-coalesce run count in 64 KiB is <= 4,096.
+        let mut now_sparse = vec![0u8; LEN_64K];
+        for i in (0..LEN_64K).step_by(CARD_MERGE_COALESCE_GAP + 2) {
+            now_sparse[i] = 0xCC;
+        }
+        let sparse_coalesced = coalesce_changed_runs(changed_runs(&now_sparse, &was), CARD_MERGE_COALESCE_GAP);
+        assert!(sparse_coalesced.len() <= 4096);
+        assert_eq!(sparse_coalesced.len(), LEN_64K.div_ceil(CARD_MERGE_COALESCE_GAP + 2));
+
+        // 16-byte untouched slot between two CPU writes stays untouched (not bridged).
+        let gap16 = coalesce_changed_runs(vec![(0, 16), (32, 16)], CARD_MERGE_COALESCE_GAP);
+        assert_eq!(gap16, vec![(0, 16), (32, 16)]);
+
+        // 3. Live `merge_page_under_writes` on a 64 KiB checkerboard-mutated carded shadow
+        //    (32,768 raw changed runs!) coalesces into 1 run per `PAGE` and never returns `Err(())`.
+        let Some(mem) = ({
+            // SAFETY: fresh 64 KiB allocation freed on drop.
+            let p = unsafe { VirtualAlloc(std::ptr::null(), LEN_64K, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+            (!p.is_null()).then_some(p as usize)
+        }) else {
+            return;
+        };
+        struct Guard(usize);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                // SAFETY: owned VirtualAlloc region.
+                unsafe { VirtualFree(self.0 as *mut _, 0, MEM_RELEASE) };
+            }
+        }
+        let _g = Guard(mem);
+        // SAFETY: committed 64 KiB region.
+        unsafe {
+            let slice = std::slice::from_raw_parts_mut(mem as *mut u8, LEN_64K);
+            for i in (0..LEN_64K).step_by(2) {
+                slice[i] = 0xA5;
+            }
+        }
+        let Some(shadow) = test_card_shadow_at(mem as u64, LEN_64K as u64) else {
+            return; // headless machine without D3D12
+        };
+        let (_, held_ptr) = shadow.ensure_card_staging().expect("card staging");
+        // SAFETY: committed 64 KiB staging buffer zeroed to simulate clean baseline.
+        unsafe { std::ptr::write_bytes(held_ptr, 0, LEN_64K) };
+        let left = AtomicI64::new(32);
+        let pages = LEN_64K / PAGE;
+        let mut total_runs = 0usize;
+        for page in 0..pages {
+            let lo = mem + page * PAGE;
+            // SAFETY: exclusive test access to `held_ptr` of `LEN_64K` bytes.
+            let runs = unsafe { shadow.merge_page_under_writes(lo, PAGE, held_ptr, &left) }
+                .expect("coalesced checkerboard page must not overflow run budget")
+                .expect("readable committed page");
+            assert_eq!(runs, vec![(0, PAGE - 1)]);
+            total_runs += runs.len();
+        }
+        assert_eq!(total_runs, pages);
+        assert_eq!(left.load(Ordering::Relaxed), 32 - pages as i64);
     }
 }
 

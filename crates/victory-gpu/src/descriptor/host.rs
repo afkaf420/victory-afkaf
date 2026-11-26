@@ -719,8 +719,8 @@ pub(crate) static PAGE_WRITES: [std::sync::atomic::AtomicU64; 4] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// Frames from the pass that takes a written range to the look at its
-/// slots: 0 means immediate re-upload when DirectStorage / page writes arrive.
-const PAGE_WRITE_AFTER: u64 = 0;
+/// slots: lets multi-frame DirectStorage / page writes finish before re-upload.
+const PAGE_WRITE_AFTER: u64 = 2;
 
 /// The bytes of a write the guards do not see are in title memory `[at,
 /// at + len)`: the placed textures there changed with no descriptor
@@ -821,7 +821,7 @@ const TABLED_FRAMES: u64 = 240;
 
 /// Frames a write of a table's slot waits in the queue for the draw that
 /// reads it, before the slot is taken for one shaders pick by index.
-const TABLED_GRACE: u64 = 2;
+const TABLED_GRACE: u64 = 8;
 
 /// In [`HostHeap::tabled`]: a draw read the slot in that frame.
 const TABLED_READ: u32 = 1 << 31;
@@ -4316,10 +4316,10 @@ mod tests {
         // Under it, counted only: it stays out of the queue.
         assert_eq!(heap.slots_written_under(&written, 60, false), [1, 1, 0]);
         assert_eq!(slots(u64::MAX), []);
-        // Under it, asked for: due `PAGE_WRITE_AFTER` frames on (immediately at 0), not before.
+        // Under it, asked for: due `PAGE_WRITE_AFTER` frames on, not before.
         assert_eq!(heap.slots_written_under(&written, 60, true), [1, 1, 1]);
-        assert_eq!(slots(59), []);
-        assert_eq!(slots(60 + super::PAGE_WRITE_AFTER), [1]);
+        assert_eq!(slots(61), []);
+        assert_eq!(slots(62), [1]);
     }
 
     /// `VICTORY_STALE_TEXTURES=0`: nothing is ever stale, and a view that

@@ -99,7 +99,7 @@ fn early_budgets() -> (u64, u64) {
 /// `PS_BakeDecorations_*`), by the first 16 hex digits of their hash as the
 /// frame listings print it. They draw into a 256x256 corner of 2048x2048
 /// targets and name no texture in a table.
-const BAKE_PIXEL_SHADERS: [&str; 4] =
+pub(crate) const BAKE_PIXEL_SHADERS: [&str; 4] =
     ["c0a7fe77b1862e10", "0d1575a396dfe513", "b7cfd8dda91ebb6b", "280967ad158cee0b"];
 
 /// Since the start: early runs of the texture pass, and those of them
@@ -472,7 +472,7 @@ pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 
 /// Frames after a whole upload of a texture picked by index at which its
 /// memory is looked at again, each counted from the look before.
-const RECHECK_FRAMES: [u64; 5] = [2, 6, 20, 60, 200];
+const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
 
 /// Looks at uploaded textures picked by index that found the memory as it
 /// was, and that found it changed (uploaded again), since the start.
@@ -1147,7 +1147,7 @@ impl State {
                 // Ensure visibility between consecutive sparse-UMA passes when
                 // an earlier dispatch on this list wrote through raw window UAVs
                 // (console PipelineSync is a no-op in `list.rs`).
-                if crate::sparse_uma::active() && list.sparse_uma_wrote() {
+                if crate::sparse_uma::active() && list.take_sparse_uma_wrote() {
                     list.uav_barrier_all();
                 }
                 let Some(ready) = self.memory_ready(list, compute, writes) else {
@@ -1955,13 +1955,17 @@ impl State {
         let (done_bytes, hit_cap) =
             self.heap_textures_chunked(list, heap, host, chunk_ops, chunk_bytes);
         PASS_BUDGET.set(None);
+        pass.uploaded_bytes = pass.uploaded_bytes.saturating_add(done_bytes);
+        let more = hit_cap
+            && pass.uploaded_bytes < pass.total_bytes
+            && (pass.started.elapsed().as_millis() as u64) < pass.total_ms;
         if pass.bake {
+            if !more {
+                self.flush_for_bake(list, host);
+            }
             crate::texture::BAKING.set(false);
         }
-        pass.uploaded_bytes = pass.uploaded_bytes.saturating_add(done_bytes);
-        hit_cap
-            && pass.uploaded_bytes < pass.total_bytes
-            && (pass.started.elapsed().as_millis() as u64) < pass.total_ms
+        more
     }
 
     pub(crate) fn finish_early_textures(pass: EarlyPass) {
@@ -2028,14 +2032,16 @@ impl State {
             );
         }
         let began = std::time::Instant::now();
-        let chunk_ops = crate::list::list_chunk_ops();
+        let chunk_ops = if bake { 0 } else { crate::list::list_chunk_ops() };
         let chunk_bytes = if chunk_ops > 0 { CHUNK_TEXTURE_BYTES } else { u64::MAX };
         PASS_BUDGET.set(Some(budget));
         if bake {
             crate::texture::BAKING.set(true);
+            self.flush_for_bake(list, host);
         }
         self.heap_textures_chunked(list, heap, host, chunk_ops, chunk_bytes);
         if bake {
+            self.flush_for_bake(list, host);
             crate::texture::BAKING.set(false);
         }
         PASS_BUDGET.set(None);
