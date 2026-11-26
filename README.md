@@ -10,13 +10,13 @@ Rather than paying console-to-PC UMA synchronization stalls every frame, this fo
 
 - **Discrete VRAM & Zero-Stall Memory Sync:**
   - `D3D12_HEAP_TYPE_GPU_UPLOAD` ReBAR direct VRAM streaming (`VICTORY_REBAR_STREAM`) and dedicated async `COPY` upload/readback queues (`VICTORY_ASYNC_UPLOAD`, `VICTORY_ASYNC_READBACK`).
-  - Demand-driven VEH `PAGE_NOACCESS` lazy VRAM readback (`VICTORY_LAZY_READBACK`) + console memory-class filtering (`VICTORY_NATIVE_VRAM`) + safe copy-back (`safecopy`) keeping GPU-written buffers resident in VRAM.
-  - Parallel multi-threaded D3D12 command recording (`VICTORY_THIN`), background submission (`VICTORY_ASYNC_SUBMIT`), concurrent relay landing (`VICTORY_RELAY=2`), GPU-side `card_steps` / in-place buffer copies (`VICTORY_COPIES_IN_PLACE`), and background texture `upload_ahead` / `levels_on_demand` with `VICTORY_PAGE_WRITES=all`.
+  - Demand-driven VEH `PAGE_NOACCESS` multi-view alias lazy VRAM readback (`VICTORY_LAZY_READBACK`, up to 4 virtual aliases per physical span) + console memory-class filtering (`VICTORY_NATIVE_VRAM`) + safe copy-back (`safecopy`) keeping GPU-written buffers resident in VRAM.
+  - **Native DX12 Enhanced Barriers** (`VICTORY_ENHANCED_BARRIERS=1`, `ID3D12GraphicsCommandList7::Barrier` with targeted `D3D12_BUFFER_BARRIER` and exact-scope `D3D12_GLOBAL_BARRIER`), parallel multi-threaded command recording (`VICTORY_THIN`), background submission (`VICTORY_ASYNC_SUBMIT`), concurrent relay landing (`VICTORY_RELAY=2`), GPU-side `card_steps` / in-place buffer copies (`VICTORY_COPIES_IN_PLACE`), sub-16 B carded-merge run coalescing, and background texture `upload_ahead` / `levels_on_demand` with `VICTORY_PAGE_WRITES=all` and hardened decoration-bake flushes.
   - Opt-in Stage M3 24 GiB sparse GDDR6X VRAM windows (`12 × 2 GiB` `CreateReservedResource`, `VICTORY_SPARSE_UMA=1`).
 - **Native DXIL Shader Recompilation (NVIDIA Ampere Wave32 / SM 6.6):**
-  - Safe Wave64-on-Wave32 compute & mesh lowering (`VICTORY_WAVE_WIDE`) with backward SGPR whole-liveness, LDS tail carving, and hardware workgroup-uniform Mode A `BAR.SYNC` (`VICTORY_ALL_GROUP_BARRIER=1`).
-  - L1-cached `SLOT_MEMORY` UAVs for non-builder shaders, guarded `SLOT_FAULTS` stores, `SLOT_VIEWS` (`t252`) bindless metadata, typed integer view strides (`SLOT_TABLE_STRIDES`), `M0Index` `v_movrel*` range-narrowing (`4.7×–5.8×` on BC texture compressors), and opt-in `VICTORY_RDNA_FLOAT`.
-  - **100.0% compute shader validation** (`2,682 / 2,682` CS) and **52 / 52 (100%)** BVH builder PSOs on RTX 3090 Wave32.
+  - Safe Wave64-on-Wave32 compute & mesh lowering (`VICTORY_WAVE_WIDE`) with backward SGPR whole-liveness, LDS tail carving, widened workgroup-uniform Mode A `BAR.SYNC` (`VICTORY_ALL_GROUP_BARRIER=1`), and dead `wave_local` `@lds` elimination.
+  - **128-bit (`LDG.128`) `smem()` raw SRV load vectorization** + Pure-Table CSE (`t250`/`t252`/`t254`/`t255`), L1-cached `SLOT_MEMORY` UAVs for non-builder shaders, guarded `SLOT_FAULTS` stores, `SLOT_VIEWS` (`t252`) bindless metadata, typed integer view strides (`SLOT_TABLE_STRIDES`), `M0Index` `v_movrel*` range-narrowing (`4.7×–5.8×` on BC texture compressors), dead-RT shader pruning when `BVH=0` + `host-pipelines.bin` compaction, and opt-in `VICTORY_RDNA_FLOAT`.
+  - **100.0% compute shader validation** (`2,682 / 2,682` CS), **52 / 52 (100%)** BVH builder PSOs on RTX 3090 Wave32, and **747 workspace tests passing** (including 9/9 live RTX 3090 D3D12 Debug Layer hardware tests).
 - **PC-Native Frame Pacing, Input & Upscaling:**
   - Simulation-safe unlocked FPS / VRR frame pacing (`VICTORY_UNLOCK_FPS=1`, `VICTORY_TARGET_FPS=120`, 120 Hz DXGI display modes, `DXGI_PRESENT_ALLOW_TEARING`, 500 Hz `GameInput` polling).
   - Clean-room HLE bridge (`VICTORY_FIDELITYFX=auto|dlss|fsr3|console`) routing console upscaler calls to externally supplied, Authenticode-signed PC **NVIDIA DLSS** (Streamline / Tensor Cores) or **AMD FSR 3.1** DLLs, unlocking 1440p / 4K output.
@@ -29,18 +29,15 @@ Rather than paying console-to-PC UMA synchronization stalls every frame, this fo
 | **Phase 6D Baseline** | `~2–3 FPS` (`~300–450 ms/f`) | `159 ms` preparing, `171 ms` readback, `1,100 ms` streaming remap stalls |
 | **Phase 7B – 8A.1** | `5.5–8.0 FPS` (`153–183 ms/f`) | Streaming remap stalls `1,100 ms → 0.0 ms`; `copying back` `171 ms → 63 ms`; indirect barrier storm & relay deadlock fixed |
 | **Phase 8B-1** | `6.8 FPS` (`146.6 ms/f`) | `preparing` `95.8 → 60.9 ms`, `copying back` `62.9 → 20.8 ms`, `ask_once` `-50%`; `VICTORY_PAGE_WRITES=all` fixed streamed skin textures |
-| **Phase 8B-2 / 8C** *(current)* | **`8.0–9.0 FPS` (`125.1 ms/f`)** | `copying back → 9–11 ms`; RTX 3090 GPU busy `108.6 ms → 85.2 ms` (`-23.4 ms` from Mode A `BAR.SYNC` + L1-cached `SLOT_MEMORY` + guarded `SLOT_FAULTS`); `card_steps` refusals `1.0 → 0.0`; locked `120.0 FPS` in 4K menus |
+| **Phase 8B-2 / 8C** | `8.0–9.0 FPS` (`125.1 ms/f`) | `copying back → 9–11 ms`; RTX 3090 GPU busy `108.6 ms → 85.2 ms` (`-23.4 ms` from Mode A `BAR.SYNC` + L1-cached `SLOT_MEMORY` + guarded `SLOT_FAULTS`); `card_steps` refusals `1.0 → 0.0`; locked `120.0 FPS` in 4K menus |
+| **Phase 9A** *(landed — awaiting 4K benchmark)* | *live 4K run next* | Multi-view alias lazy VRAM (targeting `~345K` alias rejections / `~86%` of remaining `MEM_MAPPED` readback); Native DX12 Enhanced Barriers (eliminating `~781` global `UAV(NULL)` drains); 128-bit `smem()` DXIL load vectorization + Pure-Table CSE; `55 ms` carded-merge settle fix; dead-RT shader pruning when `BVH=0` + `host-pipelines.bin` compaction; hardened decoration-bake flush |
 
 ## Roadmap / Next Direction
 
-- **Phase 9A (in progress):**
-  - Multi-view alias lazy VRAM readback (eliminating `~345K` alias rejections / `~86%` of remaining `MEM_MAPPED` readback).
-  - Native DX12 Enhanced Barriers (`D3D12_BUFFER_BARRIER`, eliminating `~781` global `UAV(NULL)` pipeline drains per frame).
-  - 128-bit `smem()` DXIL load vectorization (`LDG.128`) + Pure-Table CSE, `55 ms` carded-merge settle fix, dead-RT shader pruning when `BVH=0` + `host-pipelines.bin` compaction, and hardened decoration-bake flush.
-- **Phase 9B (Target: Native 4K 30+ FPS):**
-  - Live 4K verification of Phase 9A, fresh `VICTORY_GPU_TIMING=1` profile of remaining GPU passes, `VICTORY_RDNA_FLOAT=1` & native PC Tensor-Core DLSS 4K evaluation, and direct ReBAR `GPU_UPLOAD` backing for hot dynamic rings.
-- **Phase 10 (Hardware Ray Tracing):**
-  - Enable RTX 3090 hardware **DXR 1.1 `RayQuery` RT Cores** (`VICTORY_BVH_BUILDER=1` + `VICTORY_DXR_RAYQUERY=1`) for real ray-traced reflections and global illumination.
+- **Immediate (Phase 9B — Target: Native 4K 30+ FPS):**
+  - Live 4K verification of Phase 9A, fresh `VICTORY_GPU_TIMING=1` profile of remaining GPU passes, `VICTORY_RDNA_FLOAT=1` & native PC Tensor-Core DLSS 4K evaluation, and direct ReBAR `GPU_UPLOAD` backing for hot dynamic rings (`slot[3]` probe).
+- **Next (Phase 10 — Hardware Ray Tracing):**
+  - Enable RTX 3090 hardware **DXR 1.1 `RayQuery` RT Cores** (`VICTORY_BVH_BUILDER=1` + `VICTORY_DXR_RAYQUERY=1`) for real ray-traced window/mirror reflections and global illumination.
 
 ---
 
