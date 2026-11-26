@@ -12,8 +12,9 @@
 //! - Mode `0` (`0` / `off` / `false`): disabled (all declared card UAV ranges
 //!   are compared and read back).
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use crate::shadow::Shadow;
 use crate::watch::ConsoleMemClass;
@@ -149,23 +150,103 @@ fn filter_range(from: usize, to: usize, active: Mode, record_stats: bool) -> Vec
     kept
 }
 
+/// Tracks which carded `Shadow::id()` currently owns each `GpuResident` 64 KiB
+/// block (`block = va >> 16`) so `Shadow::update` / `merge_under_writes` skip
+/// refreshes ONLY for the owning shadow, while any overlapping sub-buffer
+/// shadow still materializes fresh GPU bytes via `ensure_cpu_resident`.
+/// Queried ONLY on the slow path after lock-free `lazy_readback::is_gpu_resident(block)`.
+static LAZY_OWNERS: OnceLock<RwLock<HashMap<usize, u64>>> = OnceLock::new();
+
+fn lazy_owners() -> &'static RwLock<HashMap<usize, u64>> {
+    LAZY_OWNERS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Returns `true` if `block` (`va >> 16`) is currently `GpuResident` AND owned
+/// by `shadow_id`. Fast path is a ~1 ns lock-free atomic bitmap check when
+/// `block` is not `GpuResident`.
+#[inline]
+pub(crate) fn is_lazy_owner(block: usize, shadow_id: u64) -> bool {
+    if !super::lazy_readback::is_gpu_resident(block) {
+        return false;
+    }
+    lazy_owners()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&block)
+        .copied()
+        == Some(shadow_id)
+}
+
+/// Records `shadow_id` as the owner of every 64 KiB block in `before` that
+/// `lazy_readback::claim_gpu_resident` promoted (i.e. now `is_gpu_resident` and
+/// no longer present in `remaining`).
+fn record_lazy_owners(shadow_id: u64, before: &[(usize, usize)], remaining: &[(usize, usize)]) {
+    let block_sz = super::lazy_readback::BLOCK;
+    let mut claimed = Vec::new();
+    for &(from, to) in before {
+        if from >= to {
+            continue;
+        }
+        for block in from / block_sz..to.div_ceil(block_sz) {
+            let b_lo = block * block_sz;
+            let b_hi = b_lo.saturating_add(block_sz);
+            if !super::touches(remaining, b_lo, b_hi) && super::lazy_readback::is_gpu_resident(block) {
+                claimed.push(block);
+            }
+        }
+    }
+    if !claimed.is_empty() {
+        let mut map = lazy_owners().write().unwrap_or_else(|e| e.into_inner());
+        for block in claimed {
+            map.insert(block, shadow_id);
+        }
+    }
+}
+
+/// Removes ownership entries for `shadow_id` when a shadow is dropped.
+pub(crate) fn forget_lazy_owner(shadow_id: u64) {
+    if let Some(lock) = LAZY_OWNERS.get() {
+        let mut map = lock.write().unwrap_or_else(|e| e.into_inner());
+        if !map.is_empty() {
+            map.retain(|_, &mut id| id != shadow_id);
+        }
+    }
+}
+
 /// Coalesces each shadow's declared UAV write ranges and filters them under
-/// `VICTORY_NATIVE_VRAM`. Shadows whose ranges drop completely are removed
-/// from `declared` so they never allocate `Card::before`, never run GPU
-/// compare, and never read back over PCIe.
-pub(super) fn filter_declared(declared: &mut Vec<(Arc<Shadow>, Vec<(usize, usize)>)>) {
+/// Move 1 (`VICTORY_NATIVE_VRAM`, dropping `GpuReadOnly` outright) and Move 2
+/// (`VICTORY_LAZY_READBACK`, claiming eligible `WriteCombinedGpuRw` /
+/// `CachedGpuRw` blocks as `GpuResident` up to `flight_fence`). Shadows whose
+/// ranges drop/claim completely are removed from `declared` so they never
+/// allocate `Card::before`, never run GPU compare, and never read back over PCIe.
+pub(super) fn filter_declared(
+    declared: &mut Vec<(Arc<Shadow>, Vec<(usize, usize)>)>,
+    flight_fence: u64,
+) {
+    if declared.is_empty() {
+        return;
+    }
     let active = mode();
-    if declared.is_empty() || active == Mode::Off {
+    let lazy_on = super::lazy_readback::on();
+    if active == Mode::Off && !lazy_on {
         return;
     }
     let mut skipped_shadows = 0u64;
-    for (_, ranges) in declared.iter_mut() {
+    for (shadow, ranges) in declared.iter_mut() {
         super::join_ranges(ranges, std::iter::empty());
-        let mut filtered = Vec::new();
-        for &(from, to) in ranges.iter() {
-            filtered.extend(filter_range(from, to, active, true));
+        if active != Mode::Off {
+            let mut filtered = Vec::new();
+            for &(from, to) in ranges.iter() {
+                filtered.extend(filter_range(from, to, active, true));
+            }
+            *ranges = filtered;
         }
-        *ranges = filtered;
+        if lazy_on && !ranges.is_empty() {
+            let before = std::mem::take(ranges);
+            let remaining = super::lazy_readback::claim_gpu_resident(shadow, &before, flight_fence);
+            record_lazy_owners(shadow.id(), &before, &remaining);
+            *ranges = remaining;
+        }
         if ranges.is_empty() {
             skipped_shadows += 1;
         }
@@ -372,5 +453,147 @@ mod tests {
         );
 
         crate::watch::clear_console_memory(base, 10 * m);
+    }
+
+    /// Live GPU D3D12 Debug Layer verification (`--features diagnostics`,
+    /// `VICTORY_D3D12_DEBUG=1`, `--ignored`): exercises BOTH:
+    /// 1. `lazy_readback`'s private `victory-lazy-fetch` COPY queue
+    ///    `Wait(&main_fence, flight_fence)` + 64 KiB readback triggered by a
+    ///    real Windows VEH `PAGE_NOACCESS` read fault on `WriteCombinedGpuRw`
+    ///    (`0x2404`) memory backed by a mirror-free ReBAR-streamed card shadow;
+    /// 2. `FillTo::Buffer` (`HostList::upload`) and `FillTo::BufferOffset`
+    ///    (`HostList::shared_scratch`) at `VICTORY_CARD_STEPS=1` via
+    ///    `card_steps` GPU copy + barrier transitions.
+    /// Asserts exact data roundtrip and ZERO D3D12 Debug Layer errors.
+    #[test]
+    #[ignore]
+    fn debug_layer_lazy_readback_copy_queue_and_card_steps_buffer_fills() {
+        use windows::Win32::Graphics::Direct3D12::ID3D12CommandList;
+        use windows::core::Interface;
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        const BLOCK: usize = super::super::lazy_readback::BLOCK;
+
+        let Some(host) = super::super::host() else {
+            panic!("host D3D12 device required for live Debug Layer test");
+        };
+        // Drain any earlier messages so we strictly check this test's commands.
+        let _ = host.log_messages();
+
+        // --- Part 1: Real VEH fault -> `victory-lazy-fetch` COPY queue Wait + 64 KiB readback ---
+        // SAFETY: fresh 64 KiB write-watched title-memory allocation freed at test end.
+        let mem = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                BLOCK,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(mem, 0);
+        struct MemGuard(usize);
+        impl Drop for MemGuard {
+            fn drop(&mut self) {
+                crate::watch::title_memory_remapped(self.0, BLOCK);
+                crate::watch::clear_console_memory(self.0, BLOCK);
+                // SAFETY: owned VirtualAlloc region.
+                unsafe { VirtualFree(self.0 as *mut _, 0, MEM_RELEASE) };
+            }
+        }
+        let _mem_guard = MemGuard(mem);
+        crate::watch::note_console_memory(
+            mem,
+            BLOCK,
+            MEM_GRAPHICS,
+            PAGE_GRAPHICS_READWRITE | PAGE_WRITECOMBINE | PAGE_READWRITE,
+        );
+
+        let shadow = crate::shadow::test_card_shadow_at(mem as u64, BLOCK as u64)
+            .expect("mirror-free card shadow");
+        assert!(shadow.is_rebar_streaming());
+
+        // Populate `shadow.buffer` on the GPU with 0x5A pattern via main queue.
+        let (src_upload, src_ptr) = host.upload_buffer(BLOCK as u64).expect("upload buffer");
+        // SAFETY: mapped `BLOCK` writable upload bytes.
+        unsafe { std::ptr::write_bytes(src_ptr, 0x5A, BLOCK) };
+        let copy_list = host.new_list().expect("host list");
+        // SAFETY: open command list and live buffers.
+        unsafe {
+            copy_list.list.CopyBufferRegion(&shadow.buffer, 0, &src_upload, 0, BLOCK as u64);
+        }
+        copy_list.close();
+        let flight_fence = {
+            let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+            *submitted += 1;
+            let val = *submitted;
+            let cmd: ID3D12CommandList = copy_list.list.cast().expect("cast cmd list");
+            // SAFETY: closed command list and live main queue/fence.
+            unsafe {
+                host.queue.ExecuteCommandLists(&[Some(cmd)]);
+                host.queue.Signal(&host.fence, val).expect("signal main fence");
+            }
+            val
+        };
+
+        // Claim the 64 KiB block as `GpuResident` up to `flight_fence` -> flips `PAGE_NOACCESS`.
+        let rem = super::super::lazy_readback::claim_gpu_resident(
+            &shadow,
+            &[(mem, mem + BLOCK)],
+            flight_fence,
+        );
+        assert!(
+            rem.is_empty(),
+            "WriteCombinedGpuRw 64 KiB block must be claimed by lazy_readback (remaining={rem:?})"
+        );
+        assert!(super::super::lazy_readback::is_gpu_resident(mem / BLOCK));
+
+        // Direct CPU read triggers Windows VEH -> `victory-lazy-fetch` private COPY queue
+        // `Wait(&main_fence, flight_fence)` -> 64 KiB GPU->CPU readback -> restores Title RAM!
+        // SAFETY: committed 64 KiB block guarded by `lazy_readback` VEH.
+        let first_byte = unsafe { (mem as *const u8).read_volatile() };
+        assert_eq!(first_byte, 0x5A, "VEH demand readback must deliver GPU bytes");
+        // SAFETY: block is now restored to `PAGE_READWRITE`.
+        let full = unsafe { std::slice::from_raw_parts(mem as *const u8, BLOCK) };
+        assert!(full.iter().all(|&b| b == 0x5A), "all 64 KiB must match GPU 0x5A bytes");
+        assert!(!super::super::lazy_readback::is_gpu_resident(mem / BLOCK));
+
+        // --- Part 2: `FillTo::Buffer` + `FillTo::BufferOffset` at `stage = 1` ---
+        assert!(super::super::card_steps::stage() >= 1);
+        let fill_list = host.new_list().expect("fill list");
+        let (buf_a, ptr_a) = fill_list.upload(host, 512).expect("shared upload buffer at stage=1");
+        let (buf_b, off_b, _gpu_b, ptr_b) = fill_list.shared_scratch(256).expect("shared scratch");
+        let (buf_b2, off_b2, _gpu_b2, ptr_b2) = fill_list.shared_scratch(256).expect("shared scratch 2");
+        assert_eq!(off_b, 0);
+        assert_eq!(off_b2, 256);
+        let (src_shared, src_shared_ptr) = host.shared_buffer(1024).expect("src shared");
+        // SAFETY: mapped 1024-byte shared buffer.
+        unsafe {
+            std::ptr::write_bytes(src_shared_ptr, 0xA1, 512);
+            std::ptr::write_bytes(src_shared_ptr.add(512), 0xB2, 256);
+            std::ptr::write_bytes(src_shared_ptr.add(768), 0xC3, 256);
+        }
+        let between = host.uav_buffer(4096).expect("between uav");
+        let own_list = host.new_list().expect("own list");
+        super::super::card_steps::record_for_test(
+            &own_list.list,
+            &between,
+            &[(&src_shared, 0, 0, 512), (&src_shared, 512, 512, 256), (&src_shared, 768, 768, 256)],
+            &[(&buf_a, 0, 0, 512), (&buf_b, off_b, 512, 256), (&buf_b2, off_b2, 768, 256)],
+        );
+        own_list.close();
+        fill_list.close();
+        host.execute(&[&own_list, &fill_list]);
+        // SAFETY: GPU execution finished; buffers are mapped `shared_buffer`s.
+        unsafe {
+            assert!(std::slice::from_raw_parts(ptr_a, 512).iter().all(|&b| b == 0xA1));
+            assert!(std::slice::from_raw_parts(ptr_b, 256).iter().all(|&b| b == 0xB2));
+            assert!(std::slice::from_raw_parts(ptr_b2, 256).iter().all(|&b| b == 0xC3));
+        }
+
+        if let Some(err) = host.log_messages() {
+            panic!("D3D12 Debug Layer reported error: {err}");
+        }
     }
 }

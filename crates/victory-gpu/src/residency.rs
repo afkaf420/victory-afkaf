@@ -104,16 +104,21 @@ pub(crate) fn allow_staging_growth(bake: bool) -> bool {
     has_growth_reserve(sample_commit(now), bake)
 }
 
+#[inline]
+fn is_limited_host_ram(total_phys: u64) -> bool {
+    total_phys < 28 * GIB
+}
+
 pub(crate) fn limited_host_ram() -> bool {
     static LIMITED: OnceLock<bool> = OnceLock::new();
-    *LIMITED.get_or_init(|| memory_status().is_some_and(|s| s.ullTotalPhys <= 32 * GIB))
+    *LIMITED.get_or_init(|| memory_status().is_some_and(|s| is_limited_host_ram(s.ullTotalPhys)))
 }
 
 fn next_pressure(was: bool, physical: u64, commit: u64) -> bool {
     if was {
-        physical < 5 * GIB || commit < 6 * GIB
+        !(commit >= 6 * GIB && (physical >= 2 * GIB || commit >= 16 * GIB))
     } else {
-        physical <= 3 * GIB || commit <= 4 * GIB
+        commit <= 4 * GIB || (physical <= GIB && commit < 12 * GIB)
     }
 }
 
@@ -203,12 +208,33 @@ mod tests {
     }
 
     #[test]
-    fn either_constraint_enters_pressure_and_both_must_recover() {
+    fn thirty_two_gb_pc_with_abundant_commit_is_neither_limited_nor_pressured() {
+        // 31.1 GiB usable RAM, 2.0 GiB free physical (Windows standby cache),
+        // 34.6 GiB free commit must NOT be falsely clamped or pressured.
+        let total_phys_31_1_gib = (31 * GIB) + (102 * MIB);
+        let avail_phys_2_0_gib = 2037 * MIB;
+        let avail_commit_34_6_gib = 34_636 * MIB;
+        assert!(!is_limited_host_ram(total_phys_31_1_gib));
+        assert!(is_limited_host_ram(16 * GIB));
+        assert!(is_limited_host_ram(24 * GIB));
+        assert!(!next_pressure(false, avail_phys_2_0_gib, avail_commit_34_6_gib));
+        assert!(!next_pressure(true, avail_phys_2_0_gib, avail_commit_34_6_gib));
+    }
+
+    #[test]
+    fn either_constraint_enters_pressure_and_recovers_with_hysteresis() {
+        // Low commit always enters pressure.
         assert!(next_pressure(false, 12 * GIB, 4 * GIB));
-        assert!(next_pressure(false, 3 * GIB, 16 * GIB));
-        assert!(next_pressure(true, 4 * GIB, 7 * GIB));
+        // Very low physical (< 1 GiB) with modest commit (< 12 GiB) enters pressure.
+        assert!(next_pressure(false, GIB, 10 * GIB));
+        // Low physical with abundant commit (>= 12 GiB) does NOT falsely latch pressure.
+        assert!(!next_pressure(false, 2 * GIB, 16 * GIB));
+        assert!(!next_pressure(false, GIB, 12 * GIB));
+        // Recovery hysteresis when already pressured.
+        assert!(next_pressure(true, 1536 * MIB, 10 * GIB));
         assert!(next_pressure(true, 6 * GIB, 5 * GIB));
-        assert!(!next_pressure(true, 5 * GIB, 6 * GIB));
+        assert!(!next_pressure(true, 2 * GIB, 6 * GIB));
+        assert!(!next_pressure(true, GIB, 16 * GIB));
         assert!(!next_pressure(false, 4 * GIB, 5 * GIB));
     }
 

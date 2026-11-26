@@ -472,7 +472,7 @@ pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 
 /// Frames after a whole upload of a texture picked by index at which its
 /// memory is looked at again, each counted from the look before.
-const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
+const RECHECK_FRAMES: [u64; 5] = [2, 6, 20, 60, 200];
 
 /// Looks at uploaded textures picked by index that found the memory as it
 /// was, and that found it changed (uploaded again), since the start.
@@ -567,6 +567,12 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     let gpu = shadow.gpu(address);
     if srv || gpu % 256 == 0 {
         shadow.refresh(list, address, len);
+        return Some(gpu);
+    }
+    if crate::host::card_steps_on()
+        && let Some((buffer, offset, gpu, to)) = list.shared_scratch(len)
+    {
+        list.defer_fill_buffer_offset(&buffer, offset, to, address as *const u8, len as usize);
         return Some(gpu);
     }
     let (gpu, to) = list.scratch(len)?;

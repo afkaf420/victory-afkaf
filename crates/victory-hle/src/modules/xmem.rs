@@ -972,6 +972,12 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
     if data.is_empty() {
         return pages_known(pages, offset, 0);
     }
+    // Prepare any `GpuResident` (`PAGE_NOACCESS`) title blocks mapped over
+    // these pages BEFORE acquiring `physical()` (zero lock inversion, zero
+    // readback for full 64 KiB overwrites, edge fetch for partial blocks).
+    for (at, bytes) in shown_at(pages, offset, data.len()) {
+        victory_gpu::prepare_cpu_overwrite(at, bytes);
+    }
     // Group section writes outside `physical()` lock while writing directly
     // into any single-view `Private` mapping while holding `physical()`.
     let mut section_writes: Vec<(Slice, usize, usize, usize, usize)> = Vec::new();
@@ -1063,6 +1069,12 @@ impl PageWindow {
 pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<PageWindow> {
     let end = offset.checked_add(len)?;
     let touched = pages.get(offset / PAGE..end.div_ceil(PAGE))?;
+    // Prepare any `GpuResident` (`PAGE_NOACCESS`) title blocks BEFORE acquiring
+    // `physical()` or decoding into the section (partial blocks fetch GPU bytes
+    // first; full 64 KiB overwrites drop `GpuResident` with zero readback).
+    for (at, bytes) in shown_at(pages, offset, len) {
+        victory_gpu::prepare_cpu_overwrite(at, bytes);
+    }
     let (slice, n) = {
         let mut physical = physical();
         let mut first: Option<(Slice, usize)> = None;
@@ -1113,6 +1125,38 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
         within: offset % PAGE,
         len,
     })
+}
+
+/// Writes a 64 KiB block into the section backing a `MEM_MAPPED` title VA `va`
+/// through a temporary alias view (`View::map`), allowing `lazy_readback` to
+/// populate physical RAM *while `va` remains `PAGE_NOACCESS`* (zero torn-read
+/// window). Uses non-blocking `PHYSICAL.try_lock()` so it can never invert
+/// lock order with `title_memory_remapped -> lazy_readback::evict_range`.
+pub fn write_va_via_alias(va: usize, data: &[u8; PAGE]) -> bool {
+    if !va.is_multiple_of(PAGE) {
+        return false;
+    }
+    let page_slice = {
+        let Ok(physical) = PHYSICAL.try_lock() else {
+            return false;
+        };
+        let Some((&base, &(size, ref slice, is_priv))) = physical.views.range(..=va).next_back()
+        else {
+            return false;
+        };
+        if is_priv || va < base || va.saturating_add(PAGE) > base.saturating_add(size) {
+            return false;
+        }
+        Slice {
+            section: slice.section.clone(),
+            index: slice.index + (va - base) / PAGE,
+        }
+    };
+    let Some(mut view) = View::map(&page_slice, 1) else {
+        return false;
+    };
+    view.bytes()[..PAGE].copy_from_slice(data);
+    true
 }
 
 /// The title addresses that show bytes `[offset, offset + len)` of `pages`
@@ -1498,6 +1542,8 @@ fn map_section(physical: &mut Physical, base: usize, len: usize, slice: Slice) -
     victory_gpu::title_memory_remapped(base, len);
     victory_gpu::sparse_uma::on_map(base, len);
     // What the range shows now, for the GPU side's in-place census.
+    static ALIAS_HOOK: std::sync::Once = std::sync::Once::new();
+    ALIAS_HOOK.call_once(|| victory_gpu::use_alias_writer(write_va_via_alias));
     victory_gpu::title_memory_view(base, len, slice.section.handle as usize, (slice.index * PAGE) as u64);
     for k in 0..len.div_ceil(PAGE) {
         let key = slice.key(k);

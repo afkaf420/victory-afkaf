@@ -16,7 +16,7 @@
 //! indexed heaps keep what their first use copied.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -74,6 +74,10 @@ pub(crate) struct Shadow {
     /// With [`cards`], for a big title buffer: `buffer` is in the card's
     /// own memory, and this is the rest of the copy.
     card: Option<Card>,
+    /// Whether shaders have ever been declared to write this copy (used by
+    /// `host::place` to tell whether a title buffer copy's source lives on
+    /// the GPU rather than in title RAM).
+    written: AtomicBool,
     /// A window of title memory outside buffers, not a title buffer's copy.
     window: bool,
     /// With `crate::inplace`: not a copy at all. `buffer` is placed in a
@@ -87,10 +91,16 @@ pub(crate) struct Shadow {
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
 /// shaders see.
 struct Card {
-    /// The CPU's side, in the PC's memory: what `data` maps. Title memory
-    /// is copied into it as into any copy, and what changed in it goes to
-    /// the card's side before the next submission.
-    staging: ID3D12Resource,
+    /// The CPU's side, in the PC's memory: `(buffer, mapped_ptr)`.
+    /// Lazily materialized (`None`) while in Move 3 Stage 3A direct ReBAR
+    /// streaming mode (`VICTORY_REBAR_STREAM=1`), eliminating the full-size
+    /// host RAM mirror and double copy for `GpuReadOnly` and `lazy_readback`-
+    /// eligible `WriteCombinedGpuRw` buffers. Materialized on demand if a block
+    /// is ever demoted to `CpuHot` or needs a fallback/merge reference.
+    staging: Mutex<Option<(ID3D12Resource, usize)>>,
+    /// Lock-free mirror of `staging`'s mapped CPU pointer (`0` while direct
+    /// ReBAR streaming; non-zero once allocated, never reset to `0`).
+    staging_ptr: AtomicUsize,
     /// The card side's bytes as they were when the submission's shaders
     /// started, in the card's memory too: made when shader writes are
     /// first declared for the copy, and compared with the card's side, on
@@ -110,6 +120,80 @@ struct Card {
     /// this card copy, disabling `copy_diff64` so CPU resets to prior byte
     /// values (e.g. zeroing a GPU-written counter) always upload full dirty pages.
     gpu_written: AtomicBool,
+}
+
+/// Resolves `VICTORY_REBAR_STREAM` (Move 3 Stage 3A): default ON (`0`/`off`/`false` disables).
+fn resolve_rebar_stream(env: Option<&str>) -> bool {
+    !matches!(
+        env.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("0" | "off" | "false")
+    )
+}
+
+/// Whether Move 3 Stage 3A direct Title RAM -> `UploadRing` (ReBAR) -> VRAM
+/// streaming is active (bypassing `Card::staging` host RAM mirror allocation
+/// and double-copy for `GpuReadOnly` and `lazy_readback`-eligible buffers).
+pub(crate) fn rebar_stream() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let env = std::env::var("VICTORY_REBAR_STREAM").ok();
+        let active = resolve_rebar_stream(env.as_deref()) && crate::host::async_upload();
+        tracing::info!(
+            active,
+            "PC-native VRAM ReBAR direct streaming (VICTORY_REBAR_STREAM={})",
+            if active { 1 } else { 0 }
+        );
+        active
+    })
+}
+
+/// Pure class eligibility rule for Move 3 Stage 3A direct ReBAR streaming:
+/// `GpuReadOnly` always qualifies; `lazy_readback`-eligible classes (e.g.
+/// `WriteCombinedGpuRw` in mode 1, + `CachedGpuRw` in mode 2) qualify when
+/// `lazy_readback` is active.
+fn rebar_stream_class_ok(class: crate::watch::ConsoleMemClass, lazy_on: bool) -> bool {
+    class == crate::watch::ConsoleMemClass::GpuReadOnly
+        || (lazy_on && crate::host::lazy_readback::class_eligible(class))
+}
+
+/// Whether a carded shadow covering `[start, start + len)` can skip allocating
+/// an upfront `Card::staging` host RAM mirror and stream dirty runs directly
+/// from Title RAM into `UploadRing`.
+fn rebar_stream_eligible(start: u64, len: u64) -> bool {
+    if !rebar_stream() || len == 0 {
+        return false;
+    }
+    let lo = start as usize;
+    let hi = lo.saturating_add(len as usize);
+    let parts = crate::watch::console_mem_class_ranges(lo, hi);
+    let lazy_on = crate::host::lazy_readback::on();
+    !parts.is_empty() && parts.iter().all(|&(_, _, c)| rebar_stream_class_ok(c, lazy_on))
+}
+
+/// Move 3 Stage 3A counters:
+/// `[0]` shadows created without RAM mirror, `[1]` live RAM mirror bytes saved,
+/// `[2]` lazy materializations (`ensure_card_staging`), `[3]` bytes streamed directly.
+static REBAR_STREAM_STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// Logs periodic summary of Move 3 Stage 3A direct ReBAR streaming savings.
+pub(crate) fn rebar_stream_log_periodic() {
+    if !rebar_stream() {
+        return;
+    }
+    let created = REBAR_STREAM_STATS[0].load(Ordering::Relaxed);
+    let live_saved = REBAR_STREAM_STATS[1].load(Ordering::Relaxed);
+    let materialized = REBAR_STREAM_STATS[2].load(Ordering::Relaxed);
+    let streamed = REBAR_STREAM_STATS[3].swap(0, Ordering::Relaxed);
+    if created == 0 && streamed == 0 {
+        return;
+    }
+    tracing::info!(
+        "PC-native ReBAR direct upload streaming (VICTORY_REBAR_STREAM=1): \
+         {created} mirror-free card buffers ({:.1} MB host RAM saved live, {materialized} lazy materializations), \
+         {:.1} MB streamed directly Title RAM -> UploadRing in interval",
+        live_saved as f64 / (1024.0 * 1024.0),
+        streamed as f64 / (1024.0 * 1024.0),
+    );
 }
 
 /// Whether the host copies of big title buffers are in the card's own
@@ -2055,6 +2139,10 @@ static LIVE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::Ato
 
 impl Drop for Shadow {
     fn drop(&mut self) {
+        if self.card.is_some() {
+            crate::host::lazy_readback::flush_shadow(self);
+            crate::host::native_vram::forget_lazy_owner(self.id);
+        }
         if self.place.is_some() {
             // Never counted with the copies (`Shadow::placed`).
             crate::inplace::gone(self.window, self.len);
@@ -2067,6 +2155,9 @@ impl Drop for Shadow {
         }
         let window = self.window;
         if let Some(card) = &mut self.card {
+            if *card.staging_ptr.get_mut() == 0 {
+                REBAR_STREAM_STATS[1].fetch_sub(card.size, Ordering::Relaxed);
+            }
             if window {
                 WINDOW_CARD_BYTES.fetch_sub(card.size, Ordering::Relaxed);
             } else {
@@ -2375,6 +2466,11 @@ impl Shadow {
         self.watched.load(Ordering::Relaxed) == NOT_WATCHED
     }
 
+    /// Whether shaders have ever been declared to write this copy.
+    pub(crate) fn written(&self) -> bool {
+        self.written.load(Ordering::Acquire)
+    }
+
     /// The copy's own number (see the field).
     pub(crate) fn id(&self) -> u64 {
         self.id
@@ -2434,6 +2530,7 @@ impl Shadow {
                 NEXT.fetch_add(1, Ordering::Relaxed)
             },
             card: None,
+            written: AtomicBool::new(false),
             window: false,
             place: None,
         }
@@ -2464,6 +2561,7 @@ impl Shadow {
         if self.place.is_some() {
             return;
         }
+        self.written.store(true, Ordering::Release);
         if let Some(card) = &self.card {
             card.gpu_written.store(true, Ordering::Release);
         }
@@ -2483,6 +2581,7 @@ impl Shadow {
         if self.place.is_some() {
             return;
         }
+        self.written.store(true, Ordering::Release);
         let range = (address, address + len);
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         // With the copy-back on its own thread: counted for this submission
@@ -2957,9 +3056,12 @@ impl Shadow {
             return true;
         }
         let base = start / PAGE;
+        let carded = self.card.is_some();
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         busy.into_iter().any(|(a, e)| match crate::watch::asked(a, e) {
-            Some((_, written)) => !stale_pages_in(base, &copied, a, e, &written).is_empty(),
+            Some((_, written)) => stale_pages_in(base, &copied, a, e, &written)
+                .into_iter()
+                .any(|page| !(carded && crate::host::native_vram::is_lazy_owner(page, self.id))),
             None => true,
         })
     }
@@ -3011,7 +3113,11 @@ impl Shadow {
             };
             let stale: Vec<usize> = {
                 let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                let carded = self.card.is_some();
                 stale_pages_in(base, &copied, a, e, &written)
+                    .into_iter()
+                    .filter(|&page| !(carded && crate::host::native_vram::is_lazy_owner(page, self.id)))
+                    .collect()
             };
             if stale.is_empty() {
                 continue;
@@ -3022,7 +3128,7 @@ impl Shadow {
             let merging = self.merging.write().unwrap_or_else(|e| e.into_inner());
             let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
             let held = if self.card.is_some() {
-                self.data as usize
+                self.ensure_card_staging().map_or(0, |(_, ptr)| ptr as usize)
             } else {
                 before.as_mut().map_or(0, |snapshot| snapshot.as_mut_ptr() as usize)
             };
@@ -3199,10 +3305,26 @@ impl Shadow {
         crate::copystat::add(crate::copystat::C::WholeBytes, (to - from) as u64);
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
-        self.copy(from, to);
+        let copied = if self.card.is_some()
+            && crate::host::lazy_readback::any_gpu_resident(from, to - from)
+        {
+            let mut total = 0usize;
+            let mut cur = from;
+            while cur < to {
+                let block = cur / PAGE;
+                let block_end = ((block + 1) * PAGE).min(to);
+                if !crate::host::native_vram::is_lazy_owner(block, self.id) {
+                    total += self.copy(cur, block_end);
+                }
+                cur = block_end;
+            }
+            total
+        } else {
+            self.copy(from, to)
+        };
         #[cfg(feature = "diagnostics")]
-        crate::copystat::whole(from, to - from, started.elapsed().as_micros() as u64);
-        to - from
+        crate::copystat::whole(from, copied, started.elapsed().as_micros() as u64);
+        copied
     }
 
     /// Diagnostic (`VICTORY_REFRESH_CHECK=1`; off by default): after a
@@ -3215,6 +3337,9 @@ impl Shadow {
     /// the copy and the address. One that differs once is a write of the
     /// title's that arrived between the refresh and the look.
     fn refresh_check(&self, from: usize, to: usize) {
+        if self.is_rebar_streaming() {
+            return;
+        }
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if !*ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_CHECK").is_some_and(|v| v == "1")) {
             return;
@@ -3276,6 +3401,7 @@ impl Shadow {
         // full dirty pages unconditionally.
         let (mut bytes, mut run): (usize, Option<(usize, bool)>) = (0, None);
         let diff = self.can_diff64();
+        let carded = self.card.is_some();
         let last = (to - 1) / PAGE;
         for page in from / PAGE..=last {
             let write = match writes.peek() {
@@ -3285,6 +3411,15 @@ impl Shadow {
                 }
                 _ => 0,
             };
+            // Skip blocks owned in VRAM by `lazy_readback`: their latest GPU
+            // bytes are already in `self.buffer` and Title RAM is `PAGE_NOACCESS`.
+            if carded && crate::host::native_vram::is_lazy_owner(page, self.id) {
+                if let Some((first, was_first)) = run.take() {
+                    let (a, b) = ((first * PAGE).max(from), (page * PAGE).min(to));
+                    bytes += if !diff || was_first { self.copy(a, b) } else { self.copy_diff64(a, b) };
+                }
+                continue;
+            }
             let at = &mut copied[page - base];
             if *at == 0 || write > *at {
                 let first_time = *at == 0;
@@ -3321,8 +3456,18 @@ impl Shadow {
     fn copy(&self, from: usize, to: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
+        if from >= to {
+            return 0;
+        }
+        // Move 3 Stage 3A: mirror-free card buffer streams dirty runs directly
+        // from Title RAM -> `UploadRing` (ReBAR) -> VRAM on `card_before`!
+        if self.is_rebar_streaming() {
+            self.card_changed(from - start, to - start);
+            return to - from;
+        }
+        let base = self.card_staging_ptr();
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
-        let at = unsafe { self.data.add(from - start) };
+        let at = unsafe { base.add(from - start) };
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
         // After the bytes are in: a snapshot taken meanwhile is not current.
         self.changed(from - start, to - start);
@@ -3384,17 +3529,109 @@ impl Shadow {
 
     /// Whether this copy is eligible for 64-byte cacheline diffing
     /// ([`Shadow::copy_diff64`]): strictly read-only card-backed windows that
-    /// have never been written by the GPU.
+    /// have never been written by the GPU and have a CPU staging mirror.
     fn can_diff64(&self) -> bool {
         let Some(card) = &self.card else {
             return false;
         };
+        if card.staging_ptr.load(Ordering::Acquire) == 0 {
+            return false;
+        }
         resolve_can_diff64(
             true,
             self.window,
             card.gpu_written.load(Ordering::Acquire),
             diff64_on(),
         )
+    }
+
+    /// True while this carded shadow has no host RAM `Card::staging` mirror
+    /// (Move 3 Stage 3A direct ReBAR upload streaming).
+    #[inline]
+    pub(crate) fn is_rebar_streaming(&self) -> bool {
+        self.card
+            .as_ref()
+            .is_some_and(|c| c.staging_ptr.load(Ordering::Acquire) == 0)
+    }
+
+    /// Lock-free CPU staging pointer (`null` if carded & direct ReBAR streaming).
+    #[inline]
+    fn card_staging_ptr(&self) -> *mut u8 {
+        match &self.card {
+            Some(c) => c.staging_ptr.load(Ordering::Acquire) as *mut u8,
+            None => self.data,
+        }
+    }
+
+    /// CPU-side staging mapping (`Card::staging`) if materialized, else `null`
+    /// while in Move 3 Stage 3A direct ReBAR streaming mode.
+    #[inline]
+    pub(crate) fn cpu_data(&self) -> *const u8 {
+        self.card_staging_ptr()
+    }
+
+    /// Ensures `Card::staging` exists for this carded shadow, lazily allocating
+    /// a `shared_buffer` and seeding non-`GpuResident` 64 KiB blocks from Title
+    /// RAM if it was created in Move 3 Stage 3A direct ReBAR streaming mode.
+    fn ensure_card_staging(&self) -> Option<(ID3D12Resource, *mut u8)> {
+        let card = self.card.as_ref()?;
+        let mut guard = card.staging.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((buf, ptr)) = guard.as_ref() {
+            return Some((buf.clone(), *ptr as *mut u8));
+        }
+        let (buf, ptr) = host()?.shared_buffer(card.size)?;
+        crate::host::name(&buf, || format!("title buffer {:#x}+{:#x} staging (lazy)", self.start, self.len));
+        // Seed only non-`GpuResident` blocks from Title RAM so we never force a
+        // GPU readback of unrelated `GpuResident` blocks inside a mixed buffer.
+        let start = self.start as usize;
+        let end = start.saturating_add(self.len as usize);
+        let mut cur = start;
+        while cur < end {
+            let block = cur / PAGE;
+            let block_end = ((block + 1) * PAGE).min(end);
+            if !crate::host::lazy_readback::is_gpu_resident(block) {
+                let off = cur - start;
+                // SAFETY: `[off, off + block_end - cur)` is inside `buf` (`card.size >= self.len`).
+                let dst = unsafe { ptr.add(off) };
+                crate::host::copy_mapped(dst, cur as *const u8, block_end - cur, false);
+            }
+            cur = block_end;
+        }
+        card.staging_ptr.store(ptr as usize, Ordering::Release);
+        REBAR_STREAM_STATS[1].fetch_sub(card.size, Ordering::Relaxed);
+        REBAR_STREAM_STATS[2].fetch_add(1, Ordering::Relaxed);
+        *guard = Some((buf.clone(), ptr as usize));
+        Some((buf, ptr))
+    }
+
+    /// Copies `len` dirty bytes at buffer offset `off` into write-only
+    /// `UploadRing` pointer `dst`. Uses `Card::staging` if materialized, else
+    /// streams directly from Title RAM into ReBAR `UploadRing` via `safecopy`
+    /// (falling back to `copy_mapped` if a source page is unmapped).
+    ///
+    /// # Safety
+    /// `dst` must hold `len` writable bytes in `UploadRing`, and `off + len <= self.len`.
+    pub(crate) unsafe fn copy_dirty_to_ring(&self, off: usize, dst: *mut u8, len: usize) {
+        if len == 0 {
+            return;
+        }
+        let ptr = self.card_staging_ptr();
+        if !ptr.is_null() {
+            // SAFETY: materialized `Card::staging` maps `self.len` bytes; caller guarantees `dst`.
+            unsafe { std::ptr::copy_nonoverlapping(ptr.add(off), dst, len) };
+            return;
+        }
+        let src = (self.start as usize + off) as *const u8;
+        crate::host::lazy_readback::ensure_cpu_resident(src as usize, len);
+        if crate::safecopy::on() {
+            // SAFETY: `dst` is `len` writable ring bytes; `safecopy` catches any unmapped source page.
+            if unsafe { crate::safecopy::copy(dst, src, len) } {
+                REBAR_STREAM_STATS[3].fetch_add(len as u64, Ordering::Relaxed);
+                return;
+            }
+        }
+        crate::host::copy_mapped(dst, src, len, false);
+        REBAR_STREAM_STATS[3].fetch_add(len as u64, Ordering::Relaxed);
     }
 
     /// The CPU side's bytes at offsets `[from, to)` changed: they go to the
@@ -3429,18 +3666,50 @@ impl Shadow {
         }
     }
 
-    /// Pointer to the CPU-side staging mapping (`Card::staging`) for async
-    /// ring-buffered copies (`host::card_before`).
-    pub(crate) fn cpu_data(&self) -> *const u8 {
-        self.data
+    /// After a submission's `card_before` has taken dirty runs: updates the
+    /// copy's reference (`Card::staging` or `before` snapshot) with the bytes
+    /// a `Step::Placed` buffer copy put into title memory so landing finds
+    /// only what the card wrote after the copy, without re-sending them.
+    pub(crate) fn placed_copy(&self, address: usize, bytes: &[u8]) {
+        let (from, to) = self.inside(address, bytes.len());
+        if from >= to || self.place.is_some() {
+            return;
+        }
+        let bytes = &bytes[self.start as usize + from - address..][..to - from];
+        let _merging = self.merging.write().unwrap_or_else(|e| e.into_inner());
+        if self.card.is_some() {
+            let ptr = self.card_staging_ptr();
+            if !ptr.is_null() {
+                // SAFETY: inside the mapping of the CPU's side, in a range no
+                // refresh writes; `merging` keeps landing out.
+                unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.add(from), bytes.len()) };
+            }
+        } else if let Some(snapshot) = self.before.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            // SAFETY: the snapshot's allocation holds the copy's length.
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), snapshot.as_mut_ptr().add(from), bytes.len()) };
+        }
+        self.changed(from, to);
     }
 
-    /// Of a copy in the card's memory: the CPU's side (PC memory), the
-    /// card side's bytes from before if made yet, and their size.
-    pub(crate) fn card_sides(&self) -> Option<(&ID3D12Resource, Option<ID3D12Resource>, u64)> {
+    /// Whether a carded shadow already has a `Card::before` hash twin allocated.
+    pub(crate) fn card_has_before(&self) -> bool {
+        self.card
+            .as_ref()
+            .is_some_and(|c| c.before.lock().unwrap_or_else(|e| e.into_inner()).is_some())
+    }
+
+    /// Of a copy in the card's memory: its "before" hash twin (if made) and size,
+    /// without forcing `Card::staging` materialization on ReBAR-streamed buffers.
+    pub(crate) fn card_before_and_size(&self) -> Option<(Option<ID3D12Resource>, u64)> {
         let card = self.card.as_ref()?;
         let before = card.before.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        Some((&card.staging, before, card.size))
+        Some((before, card.size))
+    }
+
+    /// Materializes (if needed) and returns the `Card::staging` D3D12 buffer for
+    /// the non-ring synchronous fallback upload path in `Host::card_before`.
+    pub(crate) fn card_staging_for_fallback(&self) -> Option<ID3D12Resource> {
+        self.ensure_card_staging().map(|(buf, _)| buf)
     }
 
     /// Shader writes are declared for a copy in the card's memory: makes
@@ -3453,6 +3722,9 @@ impl Shadow {
             return false;
         };
         card.gpu_written.store(true, Ordering::Release);
+        // Any shadow entering `Card::before` / `CARD_COMPARE` needs a CPU-side
+        // reference buffer for `card_merge` / `card_merge_relay` / `land_card`.
+        let _ = self.ensure_card_staging();
         let mut before = card.before.lock().unwrap_or_else(|e| e.into_inner());
         if before.is_some() {
             return false;
@@ -3547,9 +3819,12 @@ impl Shadow {
         if at + gpu.len() > self.len as usize {
             return 0;
         }
+        let Some((_, staging_ptr)) = self.ensure_card_staging() else {
+            return 0;
+        };
         // SAFETY: inside the mapping (checked above); only the submitting
         // thread writes it.
-        let old = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), gpu.len()) };
+        let old = unsafe { std::slice::from_raw_parts_mut(staging_ptr.add(at), gpu.len()) };
         let Some(first) = first_difference(gpu, old) else {
             return 0;
         };
@@ -3616,11 +3891,14 @@ impl Shadow {
             return 0;
         }
         let _side = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((_, staging_ptr)) = self.ensure_card_staging() else {
+            return 0;
+        };
         // SAFETY: inside the mapping (checked above). The offsets are in a
         // range declared and not done with, which no refresh writes; what
         // does write it (the title's bytes put in under shader writes)
         // holds the lock held here.
-        let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), gpu.len()) };
+        let held = unsafe { std::slice::from_raw_parts_mut(staging_ptr.add(at), gpu.len()) };
         let Some(first) = first_difference(gpu, held) else {
             return 0;
         };
@@ -3678,6 +3956,9 @@ impl Shadow {
             return 0;
         };
         card.gpu_written.store(true, Ordering::Release);
+        let Some((_, staging_ptr)) = self.ensure_card_staging() else {
+            return 0;
+        };
         let waiting = std::time::Instant::now();
         let _merging = self.merging.read().unwrap_or_else(|e| e.into_inner());
         crate::land::spent(crate::land::stat::LOCK, waiting);
@@ -3716,7 +3997,7 @@ impl Shadow {
                 crate::land::piece(
                     self.start as usize + lo,
                     now as *const u8,
-                    self.data.add(lo),
+                    staging_ptr.add(lo),
                     &parts,
                     true,
                     notes,
@@ -3869,6 +4150,17 @@ pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
     spans
 }
 
+/// The copy [`find`] gives for a range inside a title buffer, if it was made.
+pub(crate) fn peek(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    let end = address.checked_add(len.max(1))?;
+    buffers()
+        .range(..=(address, usize::MAX))
+        .rev()
+        .take(64)
+        .find(|(_, e)| e.end >= end)
+        .and_then(|(_, e)| e.shadow.clone())
+}
+
 /// The copy of the innermost title buffer holding `[address, address +
 /// len)`, made on first use. A `len` of 0 or 1 is an ask without a length
 /// (a root view: the caller reads on to the copy's end).
@@ -3929,29 +4221,59 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
         }
-        let (buffer, data) = host()?.shared_buffer(size)?;
-        crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
         // A big one, with `cards`: shaders get a buffer in the card's own
-        // memory, and the one just made is the CPU's side.
-        let (buffer, card) = match card_for(size) {
+        // memory. With Move 3 Stage 3A (`VICTORY_REBAR_STREAM=1`), eligible
+        // `GpuReadOnly` / `WriteCombinedGpuRw` buffers skip allocating a full
+        // host RAM `Card::staging` mirror and stream directly into `UploadRing`!
+        let (buffer, data, card) = match card_for(size) {
             Some(on_card) => {
                 crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
-                tracing::info!(
-                    start = format_args!("{:#x}", key.0),
-                    len,
-                    "a buffer's host copy is in the card's memory"
-                );
-                let card = Card {
-                    staging: buffer,
-                    before: Mutex::default(),
-                    dirty: Mutex::default(),
-                    sent: Mutex::default(),
-                    size,
-                    gpu_written: AtomicBool::new(false),
-                };
-                (on_card, Some(card))
+                if rebar_stream_eligible(key.0, len) {
+                    tracing::info!(
+                        start = format_args!("{:#x}", key.0),
+                        len,
+                        "a buffer's host copy is in the card's memory (ReBAR direct stream, 0 RAM mirror)"
+                    );
+                    REBAR_STREAM_STATS[0].fetch_add(1, Ordering::Relaxed);
+                    REBAR_STREAM_STATS[1].fetch_add(size, Ordering::Relaxed);
+                    let card = Card {
+                        staging: Mutex::new(None),
+                        staging_ptr: AtomicUsize::new(0),
+                        before: Mutex::default(),
+                        dirty: Mutex::default(),
+                        sent: Mutex::default(),
+                        size,
+                        gpu_written: AtomicBool::new(false),
+                    };
+                    (on_card, std::ptr::null_mut(), Some(card))
+                } else {
+                    let Some((staging, data)) = host()?.shared_buffer(size) else {
+                        CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+                        return None;
+                    };
+                    crate::host::name(&staging, || format!("title buffer {:#x}+{len:#x}", key.0));
+                    tracing::info!(
+                        start = format_args!("{:#x}", key.0),
+                        len,
+                        "a buffer's host copy is in the card's memory"
+                    );
+                    let card = Card {
+                        staging: Mutex::new(Some((staging, data as usize))),
+                        staging_ptr: AtomicUsize::new(data as usize),
+                        before: Mutex::default(),
+                        dirty: Mutex::default(),
+                        sent: Mutex::default(),
+                        size,
+                        gpu_written: AtomicBool::new(false),
+                    };
+                    (on_card, data, Some(card))
+                }
             }
-            None => (buffer, None),
+            None => {
+                let (buffer, data) = host()?.shared_buffer(size)?;
+                crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
+                (buffer, data, None)
+            }
         };
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -4151,24 +4473,47 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         map.insert((start, len), shadow.clone());
         return Some(shadow);
     }
-    let (buffer, data) = host()?.shared_buffer(len)?;
-    crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
     // With room for windows on the card (`window_card_most`): shaders get a
-    // buffer there, and the one just made is the CPU's side.
-    let (buffer, card) = match window_card_for(len) {
+    // buffer there; Move 3 Stage 3A skips the host RAM mirror on eligible ranges.
+    let (buffer, data, card) = match window_card_for(len) {
         Some(on_card) => {
             crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} on the card"));
-            let card = Card {
-                staging: buffer,
-                before: Mutex::default(),
-                dirty: Mutex::default(),
-                sent: Mutex::default(),
-                size: len,
-                gpu_written: AtomicBool::new(false),
-            };
-            (on_card, Some(card))
+            if rebar_stream_eligible(start, len) {
+                REBAR_STREAM_STATS[0].fetch_add(1, Ordering::Relaxed);
+                REBAR_STREAM_STATS[1].fetch_add(len, Ordering::Relaxed);
+                let card = Card {
+                    staging: Mutex::new(None),
+                    staging_ptr: AtomicUsize::new(0),
+                    before: Mutex::default(),
+                    dirty: Mutex::default(),
+                    sent: Mutex::default(),
+                    size: len,
+                    gpu_written: AtomicBool::new(false),
+                };
+                (on_card, std::ptr::null_mut(), Some(card))
+            } else {
+                let Some((staging, data)) = host()?.shared_buffer(len) else {
+                    WINDOW_CARD_BYTES.fetch_sub(len, Ordering::Relaxed);
+                    return None;
+                };
+                crate::host::name(&staging, || format!("title memory {start:#x}+{len:#x}"));
+                let card = Card {
+                    staging: Mutex::new(Some((staging, data as usize))),
+                    staging_ptr: AtomicUsize::new(data as usize),
+                    before: Mutex::default(),
+                    dirty: Mutex::default(),
+                    sent: Mutex::default(),
+                    size: len,
+                    gpu_written: AtomicBool::new(false),
+                };
+                (on_card, data, Some(card))
+            }
         }
-        None => (buffer, None),
+        None => {
+            let (buffer, data) = host()?.shared_buffer(len)?;
+            crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
+            (buffer, data, None)
+        }
     };
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -4198,13 +4543,34 @@ pub(crate) fn test_card_shadow(len: u64) -> Option<Arc<Shadow>> {
     let gpu = unsafe { on_card.GetGPUVirtualAddress() };
     let mut s = Shadow::new(on_card, data, gpu, 0, len);
     s.card = Some(Card {
-        staging,
+        staging: Mutex::new(Some((staging, data as usize))),
+        staging_ptr: AtomicUsize::new(data as usize),
         before: Mutex::default(),
         dirty: Mutex::default(),
         sent: Mutex::default(),
         size: len,
         gpu_written: AtomicBool::new(false),
     });
+    Some(Arc::new(s))
+}
+
+#[cfg(test)]
+pub(crate) fn test_card_shadow_at(start: u64, len: u64) -> Option<Arc<Shadow>> {
+    let host = host()?;
+    let on_card = host.uav_buffer(len)?;
+    // SAFETY: live D3D12 buffer.
+    let gpu = unsafe { on_card.GetGPUVirtualAddress() };
+    let mut s = Shadow::new(on_card, std::ptr::null_mut(), gpu, start, len);
+    s.card = Some(Card {
+        staging: Mutex::new(None),
+        staging_ptr: AtomicUsize::new(0),
+        before: Mutex::default(),
+        dirty: Mutex::default(),
+        sent: Mutex::default(),
+        size: len,
+        gpu_written: AtomicBool::new(false),
+    });
+    REBAR_STREAM_STATS[1].fetch_add(len, Ordering::Relaxed);
     Some(Arc::new(s))
 }
 
@@ -4430,7 +4796,7 @@ mod window_tests {
     fn gpu_written_and_buffer_shadows_upload_full_dirty_page_on_zero_reset() {
         use super::{Card, PAGE, Shadow, resolve_can_diff64};
         use std::sync::Mutex;
-        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
         use windows_sys::Win32::System::Memory::{
             MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
         };
@@ -4475,7 +4841,8 @@ mod window_tests {
             let mut s = Shadow::new(on_card, data, gpu, mem as u64, PAGE as u64);
             s.window = is_window;
             s.card = Some(Card {
-                staging,
+                staging: Mutex::new(Some((staging, data as usize))),
+                staging_ptr: AtomicUsize::new(data as usize),
                 before: Mutex::default(),
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
@@ -4534,6 +4901,80 @@ mod window_tests {
             vec![(0, PAGE)],
             "title buffer shadow must always upload full dirty page"
         );
+    }
+
+    #[test]
+    fn rebar_stream_toggle_class_eligibility_and_lazy_staging_materialization() {
+        use super::{
+            PAGE, rebar_stream_class_ok, resolve_rebar_stream, test_card_shadow_at,
+        };
+        use crate::watch::ConsoleMemClass;
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+
+        // 1. Toggle resolution defaults ON and honors disable overrides.
+        assert!(resolve_rebar_stream(None));
+        assert!(resolve_rebar_stream(Some("")));
+        assert!(resolve_rebar_stream(Some("1")));
+        assert!(!resolve_rebar_stream(Some("0")));
+        assert!(!resolve_rebar_stream(Some("off")));
+        assert!(!resolve_rebar_stream(Some("FALSE")));
+
+        // 2. Class eligibility matrix: GpuReadOnly always ok; WriteCombinedGpuRw ok when lazy_readback is on;
+        //    Unknown never ok.
+        assert!(rebar_stream_class_ok(ConsoleMemClass::GpuReadOnly, false));
+        assert!(rebar_stream_class_ok(ConsoleMemClass::GpuReadOnly, true));
+        assert!(!rebar_stream_class_ok(ConsoleMemClass::WriteCombinedGpuRw, false));
+        assert!(rebar_stream_class_ok(ConsoleMemClass::WriteCombinedGpuRw, true));
+        assert!(!rebar_stream_class_ok(ConsoleMemClass::Unknown, true));
+
+        // 3. Direct ReBAR streaming skips RAM mirror, streams Title RAM directly, and
+        //    materializes `Card::staging` cleanly on demand without crashing.
+        let Some(mem) = ({
+            // SAFETY: fresh 1-page allocation freed before return.
+            let p = unsafe { VirtualAlloc(std::ptr::null(), PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+            (!p.is_null()).then_some(p as usize)
+        }) else {
+            return;
+        };
+        struct Guard(usize);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                // SAFETY: owned VirtualAlloc region.
+                unsafe { VirtualFree(self.0 as *mut _, 0, MEM_RELEASE) };
+            }
+        }
+        let _g = Guard(mem);
+        // SAFETY: committed `PAGE` bytes.
+        unsafe {
+            let slice = std::slice::from_raw_parts_mut(mem as *mut u8, PAGE);
+            for (i, b) in slice.iter_mut().enumerate() {
+                *b = ((i * 17) ^ 0xA5) as u8;
+            }
+        }
+        let Some(shadow) = test_card_shadow_at(mem as u64, PAGE as u64) else {
+            return; // headless machine without D3D12
+        };
+        assert!(shadow.is_rebar_streaming());
+        assert!(!shadow.can_diff64());
+        // `update` records dirty range without allocating `Card::staging`.
+        assert_eq!(shadow.update(mem, PAGE), PAGE);
+        assert!(shadow.is_rebar_streaming());
+        // Direct stream into a simulated ring destination copies exact Title RAM bytes.
+        let mut ring_dst = vec![0u8; PAGE];
+        // SAFETY: valid destination slice of `PAGE` bytes.
+        unsafe { shadow.copy_dirty_to_ring(0, ring_dst.as_mut_ptr(), PAGE) };
+        // SAFETY: committed `PAGE` bytes.
+        let expected = unsafe { std::slice::from_raw_parts(mem as *const u8, PAGE) };
+        assert_eq!(&ring_dst[..], expected);
+        assert!(shadow.is_rebar_streaming(), "direct stream must not materialize staging");
+        // Lazy materialization (e.g. on CpuHot fallback) populates `Card::staging` cleanly.
+        let (_, ptr) = shadow.ensure_card_staging().expect("lazy staging allocation");
+        assert!(!shadow.is_rebar_streaming());
+        // SAFETY: newly materialized `PAGE`-byte `shared_buffer`.
+        let mirrored = unsafe { std::slice::from_raw_parts(ptr, PAGE) };
+        assert_eq!(mirrored, expected);
     }
 }
 

@@ -32,6 +32,25 @@ pub(super) fn stage() -> u32 {
     })
 }
 
+/// Resolves `VICTORY_PLACED_ORDER`: on by default (`0` disables). When on,
+/// an inline `Step::Placed` copy only blocks `card_steps` for steps that stand
+/// AFTER it in the submission, and `cut_for` splits the submission cleanly
+/// behind the placed copy's list instead of stalling 40-60 ms.
+fn resolve_placed_order(env: Option<&str>) -> bool {
+    env.is_none_or(|v| v.trim() != "0")
+}
+
+fn placed_order() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let env = std::env::var("VICTORY_PLACED_ORDER").ok();
+        resolve_placed_order(env.as_deref())
+    })
+}
+
+/// Why [`plan`] refuses for [`place`].
+const BEHIND_PLACED: &str = "a copy at its place in a list writes what it reads, or reads or writes what it writes";
+
 /// The bytes of our buffer between reading and writing: what one submission
 /// may do this way (each place read once, however many fills take it).
 const BETWEEN: u64 = 4 << 20;
@@ -48,6 +67,9 @@ pub(super) enum FillTo {
     Slot(usize, u32),
     /// A buffer the card can write, filled from its beginning.
     Buffer(ID3D12Resource),
+    /// A slice `(buffer, byte_offset)` of a card-writable buffer (e.g. a
+    /// `shared_buffer` scratch chunk backing an unaligned root CBV).
+    BufferOffset(ID3D12Resource, u64),
 }
 
 /// Title memory something in the air writes: the host copy it goes through
@@ -143,6 +165,8 @@ enum Does {
     Read { from: usize, to: usize, asked: bool },
     /// A refresh of a host copy (named by its address).
     Refresh { shadow: usize, from: usize, to: usize },
+    /// A copy that its list does on the card ([`place`]).
+    Placed { dst: usize, src: usize, len: usize },
     /// Anything, anywhere.
     Run,
 }
@@ -176,7 +200,12 @@ fn touched(ranges: &[(usize, usize)], r: (usize, usize)) -> bool {
 /// Steps of a level are done together, every read before every write; a
 /// step that writes what an earlier one reads or writes, or reads what it
 /// writes, is of a higher level. Our list does them level by level.
-fn plan(does: &[Does], stage: u32) -> Result<Vec<(usize, u32)>, &'static str> {
+fn plan(
+    does: &[Does],
+    stage: u32,
+    by_order: bool,
+    behind_placed: &mut Option<(usize, usize)>,
+) -> Result<Vec<(usize, u32)>, &'static str> {
     let takes = |d: &Does| match *d {
         Does::Copy { .. } if stage < 2 => Err("a buffer copy (VICTORY_CARD_STEPS=2 does it on the card)"),
         Does::Fill { to: false, .. } => Err("a fill of memory the card cannot be given the bytes of"),
@@ -222,6 +251,27 @@ fn plan(does: &[Does], stage: u32) -> Result<Vec<(usize, u32)>, &'static str> {
                 && (touched(&written, r) || touched(&written, w) || touched(&read, w))
             {
                 more.push(i);
+            }
+        }
+    }
+    // A copy at its place in a list comes after what is done in front of all
+    // of them: as it should after the steps ahead of it, but not after those
+    // behind it that read or write its bytes.
+    for (p, d) in does.iter().enumerate() {
+        if let Does::Placed { dst, src, len } = *d
+            && (touched(&read, (dst, dst + len))
+                || touched(&written, (dst, dst + len))
+                || touched(&written, (src, src + len)))
+        {
+            let (to, from) = ((dst, dst + len), (src, src + len));
+            let in_the_way = |i: usize| {
+                reads_writes(&does[i])
+                    .is_some_and(|(r, w)| meet(r, to) || (w.0 < w.1 && (meet(w, to) || meet(w, from))))
+            };
+            let found = (p + 1..does.len()).find(|&i| taken[i] && in_the_way(i));
+            *behind_placed = found.map(|i| (p, i));
+            if !by_order || found.is_some() {
+                return Err(BEHIND_PLACED);
             }
         }
     }
@@ -348,6 +398,7 @@ fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(u
                     to: *at + *len,
                 },
                 Step::Run(_) => Does::Run,
+                Step::Placed(p) => Does::Placed { dst: p.dst, src: p.src, len: p.len },
                 Step::GpuWrite(..) | Step::Host(..) => continue,
             });
             steps.push((std::ptr::from_ref::<HostList>(list) as usize, i));
@@ -356,19 +407,48 @@ fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(u
     (does, steps)
 }
 
+/// With flights in the air: before which of `runs` the submission is cut so
+/// that what reads or writes the bytes of a copy at its place in an earlier
+/// list ([`BEHIND_PLACED`]) is done on the card in front of a submission of
+/// its own, behind that copy.
+pub(super) fn cut_for(runs: &[&HostList]) -> Option<usize> {
+    if stage() == 0 || !relay_exact() || !placed_order() || runs.len() < 2 {
+        return None;
+    }
+    let first = runs
+        .iter()
+        .position(|l| l.deferred().copies.iter().any(|s| matches!(s, Step::Placed(_))))?;
+    if first + 1 == runs.len() {
+        return None;
+    }
+    let written = line().written.clone();
+    blocked_by(&written, runs, false)?;
+    let (does, steps) = does_of(&written, runs);
+    let mut behind = None;
+    if plan(&does, stage(), true, &mut behind) != Err(BEHIND_PLACED) {
+        return None;
+    }
+    let (placed, reader) = behind?;
+    let place = |i: usize| runs.iter().position(|l| std::ptr::from_ref::<HostList>(l) as usize == steps[i].0);
+    let cut = place(placed)? + 1;
+    (place(reader)? >= cut).then_some(cut)
+}
+
 /// Whether every page of `[from, to)` can be read (through the kernel:
 /// asking Windows walks the page tables, milliseconds in the title's heap).
 /// `known`: pages that could be, of the same submission.
 fn mapped(from: usize, to: usize, known: &mut HashSet<usize>) -> bool {
     const PAGE: usize = 4096;
     (from / PAGE..to.div_ceil(PAGE)).all(|page| {
-        known.contains(&page) || {
-            let there = read_into((page * PAGE).max(from) as *const u8, &mut [0]);
-            if there {
-                known.insert(page);
+        known.contains(&page)
+            || lazy_readback::is_gpu_resident((page * PAGE) / lazy_readback::BLOCK)
+            || {
+                let there = read_into((page * PAGE).max(from) as *const u8, &mut [0]);
+                if there {
+                    known.insert(page);
+                }
+                there
             }
-            there
-        }
     })
 }
 
@@ -399,6 +479,8 @@ enum To {
     Slot(usize, u32),
     /// A buffer's beginning.
     Buffer(ID3D12Resource),
+    /// A byte offset inside a card-writable buffer (e.g. unaligned root CBV).
+    BufferOffset(ID3D12Resource, u64),
 }
 
 /// Records a level of what [`stage`] describes into `list` (open): `reads`
@@ -461,6 +543,17 @@ fn record(
     }
 }
 
+/// Wrapper exposing `record()` to sibling live D3D12 Debug Layer tests.
+#[cfg(test)]
+pub(super) fn record_for_test(
+    list: &ID3D12GraphicsCommandList,
+    between: &ID3D12Resource,
+    reads: &[(&ID3D12Resource, u64, u64, u64)],
+    writes: &[(&ID3D12Resource, u64, u64, u64)],
+) {
+    record(true, list, between, reads, writes);
+}
+
 /// The list in front of a submission's, and its buffer ([`BETWEEN`] bytes).
 struct Own {
     list: HostList,
@@ -486,6 +579,26 @@ static POOL: Mutex<Vec<Own>> = Mutex::new(Vec::new());
 /// Since the last frame-rate line: fills and copies done on the card, their
 /// bytes, and submissions that waited instead, refused by a check.
 static DONE: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Per-reason counts of submissions refused by [`Host::card_steps`], for
+/// rate-limited diagnostics and the frame-rate summary.
+static REFUSED_WHY: Mutex<Option<HashMap<&'static str, u64>>> = Mutex::new(None);
+
+fn note_refused(why: &'static str) {
+    let mut map = REFUSED_WHY.lock().unwrap_or_else(|e| e.into_inner());
+    let entry = map.get_or_insert_with(HashMap::new).entry(why).or_insert(0);
+    *entry += 1;
+    let count = *entry;
+    drop(map);
+    if count <= 8 || count.is_power_of_two() {
+        tracing::info!(
+            reason = why,
+            count,
+            stage = stage(),
+            "card_steps refused submission; falling back to flight wait"
+        );
+    }
+}
 
 /// What [`Host::card_steps`] took off a submission: the list that does it,
 /// for the submission to run first, and the steps the CPU leaves out (their
@@ -548,8 +661,9 @@ impl Host {
         };
         match taken {
             Ok(taken) => taken,
-            Err(_why) => {
+            Err(why) => {
                 DONE[3].fetch_add(1, Ordering::Relaxed);
+                note_refused(why);
                 None
             }
         }
@@ -557,7 +671,8 @@ impl Host {
 
     fn take_steps(&self, written: &[(usize, usize)], runs: &[&HostList]) -> Result<Option<Taken>, &'static str> {
         let (does, steps) = does_of(written, runs);
-        let chosen = plan(&does, stage())?;
+        let mut behind_placed = None;
+        let chosen = plan(&does, stage(), placed_order(), &mut behind_placed)?;
         if chosen.is_empty() {
             return Ok(None);
         }
@@ -634,6 +749,7 @@ impl Host {
                 _ => match fill_to(runs, steps[i]) {
                     Some(FillTo::Slot(heap, index)) => To::Slot(heap, index),
                     Some(FillTo::Buffer(buffer)) => To::Buffer(buffer),
+                    Some(FillTo::BufferOffset(buffer, offset)) => To::BufferOffset(buffer, offset),
                     None => continue,
                 },
             };
@@ -696,6 +812,7 @@ impl Host {
                 match &op.to {
                     To::Copy(to, dst) => writes.push((&to.buffer, to.offset(*dst as u64), op.at, len)),
                     To::Buffer(buffer) => writes.push((buffer, 0, op.at, len)),
+                    To::BufferOffset(buffer, offset) => writes.push((buffer, *offset, op.at, len)),
                     To::Slot(..) => {}
                 }
             }
@@ -766,9 +883,25 @@ pub(super) fn log(frames: f64) {
     }
     let d: Vec<f64> = DONE.iter().map(|d| d.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     if d[0] + d[1] + d[3] > 0.0 {
+        let reasons: String = if d[3] > 0.0 {
+            let map = REFUSED_WHY.lock().unwrap_or_else(|e| e.into_inner());
+            let mut items: Vec<(&&'static str, &u64)> = map
+                .as_ref()
+                .map(|m| m.iter().collect())
+                .unwrap_or_default();
+            items.sort_by(|a, b| b.1.cmp(a.1));
+            let top: Vec<String> = items.into_iter().take(4).map(|(k, v)| format!("{k} ({v})")).collect();
+            if top.is_empty() {
+                String::new()
+            } else {
+                format!(" [reasons: {}]", top.join(", "))
+            }
+        } else {
+            String::new()
+        };
         tracing::info!(
             "steps done on the card instead of waiting for flights, per frame (VICTORY_CARD_STEPS={}): {:.2} fills, {:.2} buffer \
-             copies, {:.1} KB; {:.2} submissions refused and waited",
+             copies, {:.1} KB; {:.2} submissions refused and waited{reasons}",
             stage(),
             d[0],
             d[1],
@@ -794,8 +927,13 @@ mod tests {
         Does::Fill { src, len, asked: false, to: false }
     }
 
+    fn plan_simple(does: &[Does], stage: u32) -> Result<Vec<(usize, u32)>, &'static str> {
+        let mut behind = None;
+        plan(does, stage, true, &mut behind)
+    }
+
     fn planned(does: &[Does]) -> Vec<(usize, u32)> {
-        plan(does, 2).unwrap()
+        plan_simple(does, 2).unwrap()
     }
 
     #[test]
@@ -805,6 +943,9 @@ mod tests {
         assert_eq!(resolve_stage(Some("0")), 0);
         assert_eq!(resolve_stage(Some("1")), 1);
         assert_eq!(resolve_stage(Some("2")), 2);
+        assert!(resolve_placed_order(None));
+        assert!(resolve_placed_order(Some("1")));
+        assert!(!resolve_placed_order(Some("0")));
     }
 
     #[test]
@@ -819,8 +960,8 @@ mod tests {
             stuck(3100, 5),
         ];
         assert_eq!(planned(&does), [(1, 0), (3, 0)]);
-        assert_eq!(plan(&[fill(0, 64, true), fill(32, 64, true)], 1), Ok(vec![(0, 0), (1, 0)]));
-        assert_eq!(plan(&[fill(0, 64, false)], 1), Ok(vec![]));
+        assert_eq!(plan_simple(&[fill(0, 64, true), fill(32, 64, true)], 1), Ok(vec![(0, 0), (1, 0)]));
+        assert_eq!(plan_simple(&[fill(0, 64, false)], 1), Ok(vec![]));
         let does = [
             copy(1000, 5000, 100, true),
             copy(900, 9000, 100, false),
@@ -828,6 +969,31 @@ mod tests {
             copy(4900, 9000, 100, false),
         ];
         assert_eq!(planned(&does), [(0, 0)]);
+    }
+
+    #[test]
+    fn placed_copy_allows_earlier_fills_and_flags_later_reads_for_split() {
+        let placed = Does::Placed { dst: 1000, src: 5000, len: 100 };
+        // A fill ahead of Placed reading Placed's dst is safe under by_order=true,
+        // because own.list runs ahead of Placed in GPU order!
+        let mut behind = None;
+        assert_eq!(
+            plan(&[fill(1000, 64, true), placed], 1, true, &mut behind),
+            Ok(vec![(0, 0)])
+        );
+        assert_eq!(behind, None);
+        // Under by_order=false, even an earlier fill is refused.
+        assert_eq!(
+            plan(&[fill(1000, 64, true), placed], 1, false, &mut behind),
+            Err(BEHIND_PLACED)
+        );
+        // A fill AFTER Placed reading Placed's dst must split behind Placed!
+        let mut behind = None;
+        assert_eq!(
+            plan(&[placed, fill(1000, 64, true)], 1, true, &mut behind),
+            Err(BEHIND_PLACED)
+        );
+        assert_eq!(behind, Some((0, 1)));
     }
 
     #[test]
@@ -876,7 +1042,7 @@ mod tests {
                     }
                 })
                 .collect();
-            let Ok(chosen) = plan(&does, 2) else {
+            let Ok(chosen) = plan_simple(&does, 2) else {
                 refused += 1;
                 continue;
             };
@@ -926,17 +1092,17 @@ mod tests {
     #[test]
     fn steps_in_the_way_are_refused() {
         let taken = copy(1000, 5000, 100, true);
-        assert!(plan(&[taken, Does::Run], 2).is_err());
-        assert!(plan(&[taken, Does::Read { from: 1, to: 2, asked: true }], 2).is_err());
-        assert!(plan(&[Does::Fill { src: 1, len: 1, asked: true, to: false }], 2).is_err());
+        assert!(plan_simple(&[taken, Does::Run], 2).is_err());
+        assert!(plan_simple(&[taken, Does::Read { from: 1, to: 2, asked: true }], 2).is_err());
+        assert!(plan_simple(&[Does::Fill { src: 1, len: 1, asked: true, to: false }], 2).is_err());
         for read in [Does::Read { from: 900, to: 1001, asked: false }, stuck(1050, 3)] {
-            assert!(plan(&[taken, read], 2).is_err(), "{read:?} behind");
+            assert!(plan_simple(&[taken, read], 2).is_err(), "{read:?} behind");
             assert_eq!(planned(&[read, taken]), [(1, 0)], "{read:?} ahead");
         }
-        assert!(plan(&[taken, copy(3000, 1000, 10, false), stuck(3005, 1)], 2).is_err());
-        assert!(plan(&[copy(1000, 1050, 100, true)], 2).is_err());
-        assert!(plan(&[taken], 1).is_err());
-        assert!(plan(&[fill(1000, 4, true), copy(1000, 5000, 100, false)], 1).is_err());
+        assert!(plan_simple(&[taken, copy(3000, 1000, 10, false), stuck(3005, 1)], 2).is_err());
+        assert!(plan_simple(&[copy(1000, 1050, 100, true)], 2).is_err());
+        assert!(plan_simple(&[taken], 1).is_err());
+        assert!(plan_simple(&[fill(1000, 4, true), copy(1000, 5000, 100, false)], 1).is_err());
     }
 
     #[test]

@@ -74,6 +74,8 @@ pub mod upscaler_bridge;
 mod watch;
 
 #[cfg(windows)]
+pub use host::lazy_readback::{prepare_cpu_overwrite, use_alias_writer};
+#[cfg(windows)]
 pub use host::on_failure;
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_view};

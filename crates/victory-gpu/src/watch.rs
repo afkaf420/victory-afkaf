@@ -498,6 +498,7 @@ impl Journal {
     }
 
     /// The 4 KiB parts of `page` written by an asking after `taken`.
+    #[allow(dead_code)]
     fn parts_since(&self, page: usize, taken: u64) -> u16 {
         match self.parts.get(&page) {
             Some(all) => all
@@ -525,6 +526,7 @@ impl Journal {
 
 /// Of the pages of a copy that were written after it took them `(page, taken)`:
 /// the 4 KiB parts to take again (a bitmask per page, in the same order).
+#[allow(dead_code)]
 pub(crate) fn parts_written(pages: &[(usize, u64)]) -> Vec<u16> {
     let j = journal();
     pages
@@ -889,6 +891,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
 /// whole, or 0) does not hold, as [`writes`] would answer with nothing asked:
 /// the submission's asking covers the range, or its blocks are known by their
 /// [`PUBLISHED`] bits. `false` if something would have to be asked.
+#[allow(dead_code)]
 pub(crate) fn nothing_new(
     start: usize,
     end: usize,
@@ -1441,6 +1444,7 @@ impl IntervalSet {
     }
 
     /// Total number of blocks across all intervals.
+    #[allow(dead_code)]
     fn len(&self) -> usize {
         self.0.iter().map(|(&s, &e)| e - s).sum()
     }
@@ -1464,6 +1468,7 @@ impl IntervalSet {
     }
 
     /// Collects up to `limit` covered blocks `>= from` in ascending order.
+    #[allow(dead_code)]
     fn take_from(&self, from: usize, limit: usize) -> Vec<usize> {
         let mut out = Vec::with_capacity(limit.min(1024));
         if limit == 0 {
@@ -1652,12 +1657,14 @@ static PROTECTED: Bits = Bits::new();
 
 /// Whether any 64 KiB block of `[start, end)` is view memory guarded read-only
 /// by our hand.
+#[allow(dead_code)]
 pub(crate) fn guarded(start: usize, end: usize) -> bool {
     start < end && PROTECTED.any(start / BLOCK, end.div_ceil(BLOCK))
 }
 
 /// Whether any 64 KiB block of `[at, at + len)` is guarded read-only by our
 /// hand.
+#[allow(dead_code)]
 #[inline]
 pub(crate) fn guards_any(at: usize, len: usize) -> bool {
     len != 0 && PROTECTED.any(at / BLOCK, (at.saturating_add(len) - 1) / BLOCK + 1)
@@ -1702,6 +1709,7 @@ fn publish_range(first: usize, last: usize) {
 
 /// The runtime gave the title memory at `[at, at + len)`, allocated or
 /// committed: forget any known placeholder holes there so they are queried again.
+#[allow(dead_code)]
 pub fn title_memory_allocated(at: usize, len: usize) {
     if len == 0 || !known_holes() {
         return;
@@ -1718,6 +1726,7 @@ pub fn title_memory_allocated(at: usize, len: usize) {
 /// Once a frame: sample 1/100th of known placeholder holes (`Guards::held`) to
 /// catch any hole filled without calling `title_memory_remapped` or
 /// `title_memory_allocated`.
+#[allow(dead_code)]
 pub(crate) fn look_at_holes() {
     const PARTS: usize = 100;
     if !known_holes() {
@@ -1757,6 +1766,7 @@ pub(crate) fn look_at_holes() {
 }
 
 /// Opens the guarded block around `at` as by a CPU write fault.
+#[allow(dead_code)]
 pub(crate) fn opened_for_writing(at: usize) {
     let mut g = guards();
     if open(&mut g, at, at.saturating_add(1)) {
@@ -1814,6 +1824,7 @@ impl Landed {
     }
 
     /// Whether `page` was noted in a frame from `since` on, up to `now`.
+    #[allow(dead_code)]
     fn since(&self, page: usize, since: u64, now: u64) -> bool {
         let Some(place) = self.0.get(page / Landed::PAGES) else {
             return false;
@@ -1942,6 +1953,7 @@ pub(crate) fn landed_beside(
 
 /// Whether shader writes landed into any 4 KiB page of `[at, at + len)` within
 /// the last `frames` frames.
+#[allow(dead_code)]
 pub(crate) fn landed_lately(at: usize, len: usize, frames: u64) -> bool {
     let now = crate::frame::current();
     let since = now.saturating_sub(frames);
@@ -1952,6 +1964,7 @@ pub(crate) fn landed_lately(at: usize, len: usize, frames: u64) -> bool {
 
 /// Whether every 64 KiB block of `[at, at + len)` is view memory written since
 /// a host copy last took it (neither clean, absent, nor currently protected).
+#[allow(dead_code)]
 pub(crate) fn written_since_taken(at: usize, len: usize) -> bool {
     if len == 0 {
         return false;
@@ -2069,6 +2082,15 @@ fn guard_gaps(g: &mut Guards, first: usize, last: usize) -> Vec<usize> {
             }
             #[cfg(test)]
             THREAD_GUARD_GAP_BLOCKS.with(|c| c.set(c.get() + 1));
+            if crate::host::lazy_readback::is_gpu_resident(block) {
+                if let Some(from) = run.take() {
+                    protect(g, from, block);
+                }
+                // Owned by `lazy_readback` (`PAGE_NOACCESS`): do not overwrite
+                // protection with `PAGE_READONLY` and do not mark dirty.
+                block += 1;
+                continue;
+            }
             if let Some(prot_end) = g.protected.covering_end(block) {
                 if let Some(from) = run.take() {
                     protect(g, from, block);
@@ -2249,7 +2271,7 @@ pub(crate) static ALIASES: [std::sync::atomic::AtomicU64; 3] = [const { std::syn
 /// its copies took them, `open` would have opened it.
 fn protect_alias(g: &mut Guards, block: usize) {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
-    if g.protected.contains(block) {
+    if g.protected.contains(block) || crate::host::lazy_readback::is_gpu_resident(block) {
         return;
     }
     PROTECTED.set(block);
@@ -2431,11 +2453,28 @@ fn journal_clear(at: usize, len: usize) {
     }
 }
 
+/// Releases any read-only `GUARDS` tracking on 64 KiB `block` right before
+/// `host::lazy_readback` flips it to `PAGE_NOACCESS` (does NOT call
+/// `VirtualProtect`). Lock order: `lazy_readback::STATE -> GUARDS`.
+pub(crate) fn release_guard_for_lazy(block: usize) {
+    let mut g = guards();
+    let had_prot = !g.protected.remove_range(block, block + 1).is_empty();
+    g.clean.remove_range(block, block + 1);
+    g.opened.remove(&block);
+    g.aliased.remove(&block);
+    PUBLISHED.clear(block);
+    PROTECTED.clear(block);
+    if had_prot {
+        bump_guard_epoch();
+    }
+}
+
 /// Before our own write into title memory `[at, at + len)` through the
 /// kernel (which does not fault into our handler): opens its guarded blocks.
 /// The runtime calls it (as `kernel_will_write`) before the title's kernel
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
+    crate::host::lazy_readback::prepare_cpu_overwrite(at, len);
     wrote(at, len);
     // The length is the title's (`fread`'s size times count, saturated).
     if len > 0 && PROTECTED.any(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK)) {
@@ -2556,6 +2595,7 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
 /// The runtime is about to unmap a view of which it maps a part again at once:
 /// open what is guarded of its physical pages at other views and hold them out
 /// of re-guarding until the enclosing [`Remapping`] finishes.
+#[allow(dead_code)]
 pub fn title_memory_splitting(at: usize, len: usize) {
     let others: Vec<usize> = elsewhere(at, len)
         .into_iter()
@@ -2802,6 +2842,8 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     crate::shadow::remapped(at, len);
     // Invalidate any pending GPU texture readbacks targeting `[at, at + len)`.
     crate::texback::remapped(at, len);
+    // Evict any lazy-readback `GpuResident` / `CpuHot` state (0 readback).
+    crate::host::lazy_readback::evict_range(at, len);
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);
@@ -2845,6 +2887,19 @@ pub(crate) fn install() {
         let r = unsafe { &*(*info).ExceptionRecord };
         const READ: usize = 0;
         const WRITE: usize = 1;
+        // PC-Native VRAM Move 2 (`lazy_readback`): intercept BOTH read and write
+        // `PAGE_NOACCESS` faults on `GpuResident` blocks BEFORE `safecopy::failing_exit`
+        // so CPU & `safecopy` reads seamlessly pull the latest 64 KiB from VRAM.
+        if r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION as NTSTATUS
+            && r.NumberParameters >= 2
+            && matches!(r.ExceptionInformation[0], READ | WRITE)
+            && crate::host::lazy_readback::handle_fault(
+                r.ExceptionInformation[1],
+                r.ExceptionInformation[0] == WRITE,
+            )
+        {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
         // A fault of our own copies (`crate::safecopy`): if it is not a guarded
         // block we can open, redirect Rip to the assembly failing exit.
         let ours = crate::safecopy::failing_exit(r.ExceptionAddress as usize);

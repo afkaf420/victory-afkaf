@@ -33,9 +33,9 @@ pub(crate) const LISTED: u8 = 3;
 
 /// Bytes of title memory on their way at most: past it uploads go into the
 /// lists, as before.
-const MOST: u64 = 96 << 20;
+const MOST: u64 = 256 << 20;
 /// Bytes and textures of one submission at most.
-const BATCH: (u64, usize) = (16 << 20, 64);
+const BATCH: (u64, usize) = (32 << 20, 128);
 
 /// Whether it is on (`VICTORY_UPLOAD_AHEAD`; on by default, `=0` disables).
 pub(crate) fn on() -> bool {
@@ -203,7 +203,7 @@ fn workers() -> Option<&'static ID3D12CommandQueue> {
                     })
                     .ok()?
             };
-            for n in 0..2 {
+            for n in 0..4 {
                 let worker = Worker::new(&host.device, queue.clone()).ok()?;
                 std::thread::Builder::new().name(format!("uploads ahead {n}")).spawn(move || worker.work()).ok()?;
             }
