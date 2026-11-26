@@ -207,6 +207,46 @@ fn windows() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_none_or(|v| v != "0"))
 }
 
+/// Whether single-record indirect executions are clamped in batched passes
+/// (`VICTORY_INDIRECT_BATCH`; default `2`: dispatches do not end a batch until
+/// a barrier/sync or draw; `=1`: dispatches end the batch; `=0`: disabled).
+fn batches() -> u8 {
+    static ON: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("VICTORY_INDIRECT_BATCH").ok().as_deref().map(str::trim) {
+        Some("0") => 0,
+        Some("1") => 1,
+        _ => 2,
+    })
+}
+
+/// Active batched indirect clamp pass on this list (`batches()`).
+struct Batch {
+    table: crate::indirect::batch::Table,
+    scratch: ID3D12Resource,
+    /// Dispatches ran since the batch opened (`VICTORY_INDIRECT_BATCH=2`).
+    wrote: bool,
+}
+
+static ARGUMENT_COPIES: std::sync::Mutex<Vec<std::sync::Weak<crate::shadow::Shadow>>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Live recently-used indirect argument copies (excluding `first`), putting
+/// `first` at the front of the cache for subsequent batches.
+fn argument_copies(first: &std::sync::Arc<crate::shadow::Shadow>) -> Vec<(u64, ID3D12Resource)> {
+    let mut copies = ARGUMENT_COPIES.lock().unwrap_or_else(|e| e.into_inner());
+    let live: Vec<_> = copies
+        .iter()
+        .filter_map(std::sync::Weak::upgrade)
+        .filter(|s| s.id() != first.id())
+        .collect();
+    *copies = std::iter::once(first)
+        .chain(&live)
+        .take(crate::indirect::batch::SOURCES)
+        .map(std::sync::Arc::downgrade)
+        .collect();
+    live.iter().map(|s| (s.id(), s.buffer.clone())).collect()
+}
+
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
@@ -240,6 +280,11 @@ pub(crate) struct State {
     /// The indirect records clamped last, if later draws may still read
     /// them ([`windows`]).
     window: Option<Window>,
+    /// Active batched indirect clamp pass ([`batches`]).
+    batch: Option<Batch>,
+    /// Fresh descriptor tables made for the current ambient-role compute
+    /// dispatch (`crate::ambient`): `(root slot, byte offset in host heap)`.
+    ambient_tables: Vec<(u8, u32)>,
     /// What the host list has: pipeline, root signature, heaps.
     host_pipeline: usize,
     /// Graphics, compute.
@@ -738,6 +783,7 @@ impl State {
         // chunk allocates CBVs from its own scratch buffer.
         self.fresh_tables.clear();
         self.window = None;
+        self.batch = None;
         if self.topology_set {
             self.set_topology(list, self.topology);
         }
@@ -1045,6 +1091,10 @@ impl State {
                 once!("a draw whose descriptor table found no free slots is dropped");
                 return false;
             }
+            if stage.shader.ambient.is_some() {
+                self.ambient_tables.clear();
+                self.ambient_tables.extend(made.iter().copied());
+            }
             // What the shader stores through root views and raw addresses is
             // copied back into title memory afterwards.
             let writes = (t.stores || !write_skip())
@@ -1323,7 +1373,10 @@ impl State {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| find(a).map(|s| (a, s)));
-                let Some(index) = host.dynamic(1) else {
+                let Some(index) = host.dynamic(1).or_else(|| {
+                    crate::host::settle_for_fence();
+                    host.dynamic(1)
+                }) else {
                     return false;
                 };
                 self.dynamic.push((key.0, index, 1));
@@ -1394,7 +1447,10 @@ impl State {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
-                let Some(index) = host.dynamic(1) else {
+                let Some(index) = host.dynamic(1).or_else(|| {
+                    crate::host::settle_for_fence();
+                    host.dynamic(1)
+                }) else {
                     return false;
                 };
                 self.dynamic.push((key.0, index, 1));
@@ -1541,7 +1597,7 @@ impl State {
             .entry(std::ptr::from_ref(host) as usize)
             .or_insert_with(|| (0, Ranges::new()));
         let changed = host.buffer_changes();
-        let slots = if *passes % 64 == 0 {
+        let slots = if *passes % 16 == 0 {
             ranges.clear();
             host.buffer_slots()
         } else {
@@ -2300,6 +2356,7 @@ impl State {
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         // It may write the arguments a window holds clamped.
         self.window = None;
+        self.buffers_written();
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -2349,6 +2406,84 @@ impl State {
         list.mark_uav_write();
         list.record_op();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
+            && crate::ambient::on()
+            && self.ambient(list, p, role)
+        {
+            self.host_pipeline = 0;
+            self.host_roots[1] = 0;
+        }
+    }
+
+    /// The stand-in for the indirect light after a dispatch of `p`
+    /// (`crate::ambient`). Returns whether it recorded commands (replacing
+    /// the list's compute root signature and pipeline).
+    fn ambient(&self, list: &HostList, p: &HostPipeline, role: crate::ambient::Role) -> bool {
+        use crate::ambient::{AIR, DEPTH, LIGHT, RADIANCE, Role, Views};
+        let Some(t) = p.stages.first().map(|s| s.translated()) else {
+            return false;
+        };
+        let Some(heap) = self
+            .heaps
+            .iter()
+            .filter(|&&h| h != 0)
+            .map(|&h| crate::descriptor::heap(h as This))
+            .find(|h| !h.samplers())
+            .and_then(|h| h.host())
+        else {
+            return false;
+        };
+        let entry = |kind: ResourceType, (slot, offset): (u8, u32)| {
+            t.used.iter().find(|u| {
+                u.kind == kind && u.root == RootType::Table && (u.slot, u.table_offset_dwords) == (slot, offset)
+            })?;
+            let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(slot)) else {
+                return None;
+            };
+            let resource = match crate::descriptor::view(table + u64::from(offset) * 4)? {
+                View::Shader(r, _) | View::Unordered(r, ..) => r,
+                _ => return None,
+            };
+            let start = match self.ambient_tables.iter().find(|m| m.0 == slot) {
+                Some(m) => m.1,
+                None => self.user_value(true, slot, RootType::Table, 0),
+            };
+            let host = crate::resource::host_resource(resource as This)?;
+            // SAFETY: a live resource.
+            let desc = unsafe { host.GetDesc() };
+            Some((desc, heap.gpu_handle((start + offset * 4) / 32)))
+        };
+        let at = match role {
+            Role::Resolve => LIGHT,
+            Role::Radiance => RADIANCE,
+            Role::Air => AIR,
+        };
+        let image = entry(ResourceType::Uav, at);
+        let depth = match role {
+            Role::Resolve => entry(ResourceType::Srv, DEPTH),
+            Role::Radiance | Role::Air => image,
+        };
+        let (Some((of, image)), Some((seen, depth))) = (image, depth) else {
+            once!(?role, "no stand-in for the indirect light: other tables");
+            return false;
+        };
+        // DXGI_FORMAT_R32_UINT (42, holding R9G9B9E5); DXGI_FORMAT_R11G11B10_FLOAT (26).
+        let format = if role == Role::Resolve { 42 } else { 26 };
+        let volume = of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+        if of.Format.0 != format || (seen.Width, seen.Height) != (of.Width, of.Height) || volume != (role == Role::Air) {
+            once!(?role, format = of.Format.0, "no stand-in for the indirect light: another image");
+            return false;
+        }
+        crate::ambient::after(
+            list,
+            role,
+            &Views {
+                image,
+                depth,
+                size: [of.Width as u32, of.Height],
+                slices: u32::from(of.DepthOrArraySize),
+            },
+        )
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -2614,6 +2749,7 @@ impl State {
         let stores = self.bound_stores();
         if stores {
             self.window = None;
+            self.batch = None;
         }
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
@@ -2874,7 +3010,10 @@ impl State {
                 made.push((slot, first * 32));
                 continue;
             }
-            let Some(first) = host.dynamic(n) else {
+            let Some(first) = host.dynamic(n).or_else(|| {
+                crate::host::settle_for_fence();
+                host.dynamic(n)
+            }) else {
                 // No room: the draw must not run with the title's own
                 // offsets (slots never made for it); `bind` drops it.
                 made.push((slot, u32::MAX));
@@ -2897,7 +3036,12 @@ impl State {
                             host.make_null(index);
                             continue;
                         };
-                        list.defer_fill(to, address as *const u8, size as usize);
+                        list.defer_constants(
+                            to,
+                            address as *const u8,
+                            size as usize,
+                            (std::ptr::from_ref(heap) as usize, index),
+                        );
                         host.constant_at(index, gpu, size);
                     }
                     Some(view) => {
@@ -3012,6 +3156,7 @@ impl State {
         let stores = self.bound_stores();
         if stores {
             self.window = None;
+            self.batch = None;
         }
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
@@ -3086,7 +3231,7 @@ impl State {
             };
             let (from, to, stride) = (from as usize, to as usize, stride as usize);
             let n = rects as usize;
-            list.defer_host(move || {
+            list.defer_host_reading((from, from + n * 3 * stride), move || {
                 // The vertices are read in place, at submission: no change
                 // of mapping under the read (see
                 // `crate::watch::title_memory_reading`).
@@ -3124,6 +3269,7 @@ impl State {
         let stores = self.bound_stores();
         if stores {
             self.window = None;
+            self.batch = None;
         }
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
@@ -3248,13 +3394,24 @@ impl State {
             why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
             return false;
         }
+        // Track batched indirect clamping (`VICTORY_INDIRECT_BATCH`).
+        let batch = if batches() > 0 && max == 1 && count.is_none() {
+            args.refresh(list, arguments, len);
+            self.batched(list, &args, arguments, kind)
+        } else {
+            None
+        };
+        if batch.is_some() {
+            self.window = None;
+        }
         // A window of records clamped in one pass (`windows`): for single
         // records without a count buffer, drawn by shaders that store to no
         // buffer. Anything else ends the window: it uses the scratch buffer
         // or may write the arguments.
         const WINDOW_USE: usize = usize::MAX - 0x77;
         let offset = args.offset(arguments);
-        let windowed = windows()
+        let windowed = batch.is_none()
+            && windows()
             && kind != DISPATCH
             && max == 1
             && count.is_none()
@@ -3265,12 +3422,16 @@ impl State {
             self.window = None;
         }
         let same = |w: &Window| w.copy == args.id() && w.kind == kind && w.stride == stride;
-        let hit = self
-            .window
-            .as_ref()
-            .filter(|w| same(w) && offset >= w.base)
-            .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
-            .map(|w| (w.scratch.clone(), offset - w.base));
+        let hit = batch.or_else(|| {
+            self.window
+                .as_ref()
+                .filter(|w| same(w) && offset >= w.base)
+                .filter(|w| {
+                    (offset - w.base) % u64::from(w.step) == 0
+                        && (offset - w.base) / u64::from(w.step) < u64::from(w.records)
+                })
+                .map(|w| (w.scratch.clone(), offset - w.base))
+        });
         let (bounded, at) = match hit {
             Some(hit) => hit,
             None => {
@@ -3367,6 +3528,11 @@ impl State {
         }
         if stores {
             list.mark_uav_write();
+            if kind == DISPATCH {
+                self.buffers_written();
+            } else {
+                self.batch = None;
+            }
         }
         list.record_op();
         if kind == DISPATCH {
@@ -3375,6 +3541,64 @@ impl State {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         true
+    }
+
+    /// A compute dispatch ran and may have written indirect argument buffers.
+    fn buffers_written(&mut self) {
+        match &mut self.batch {
+            Some(batch) if batches() == 2 => batch.wrote = true,
+            batch => *batch = None,
+        }
+    }
+
+    /// A buffer was copied to: invalidate ahead-clamped indirect arguments.
+    pub(crate) fn copied(&mut self) {
+        self.window = None;
+        self.batch = None;
+    }
+
+    /// The title issued a barrier or pipeline sync: close any batch that saw
+    /// intervening compute dispatches (`VICTORY_INDIRECT_BATCH=2`).
+    pub(crate) fn synced(&mut self) {
+        if self.batch.as_ref().is_some_and(|b| b.wrote) {
+            self.batch = None;
+        }
+    }
+
+    /// Places a single-record indirect execution into the active batched clamp
+    /// pass (or opens a new batch if full / source unbound / invalidated).
+    fn batched(
+        &mut self,
+        list: &HostList,
+        args: &std::sync::Arc<crate::shadow::Shadow>,
+        arguments: u64,
+        kind: u32,
+    ) -> Option<(ID3D12Resource, u64)> {
+        const BATCH_USE: usize = usize::MAX - 0x78;
+        const DISPATCH: u32 = 2;
+        if list.first_use(BATCH_USE) {
+            self.batch = None;
+        }
+        if kind != DISPATCH {
+            self.synced();
+        }
+        let (id, offset) = (args.id(), args.offset(arguments));
+        if let Some(b) = &mut self.batch
+            && let Some(at) = b.table.place(id, offset, kind)
+        {
+            return Some((b.scratch.clone(), at));
+        }
+        self.batch = None;
+        let (mut table, scratch) = crate::indirect::open_batch(list, (id, &args.buffer), &argument_copies(args))?;
+        self.host_pipeline = 0;
+        self.host_roots[1] = 0;
+        let at = table.place(id, offset, kind)?;
+        self.batch = Some(Batch {
+            table,
+            scratch: scratch.clone(),
+            wrote: false,
+        });
+        Some((scratch, at))
     }
 }
 

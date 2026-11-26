@@ -524,6 +524,32 @@ pub extern "C" fn _wfsopen(path: *const u16, mode: *const u16, share: i32) -> Fi
 // threads) fails that `ReadFile`, and the title's retry opens it again;
 // `fread` has no such retry and reads beside instead (see there).
 
+/// Scoped RAII guard for kernel/CRT writes into `[at, at + len)` of title
+/// memory: opens guarded blocks before the call and re-notifies the GPU side
+/// when the write finishes so no refresh misses freshly read bytes.
+struct KernelWrite {
+    at: usize,
+    len: usize,
+}
+
+impl KernelWrite {
+    fn begin(at: usize, len: usize) -> Self {
+        if at != 0 && len > 0 {
+            victory_gpu::kernel_will_write(at, len);
+        }
+        Self { at, len }
+    }
+}
+
+impl Drop for KernelWrite {
+    fn drop(&mut self) {
+        if self.at != 0 && self.len > 0 {
+            victory_gpu::kernel_will_write(self.at, self.len);
+            victory_gpu::title_memory_written(self.at, self.len, false);
+        }
+    }
+}
+
 pub extern "system" fn ReadFile(
     file: *mut c_void,
     buffer: *mut u8,
@@ -531,10 +557,22 @@ pub extern "system" fn ReadFile(
     read: *mut u32,
     overlapped: *mut c_void,
 ) -> i32 {
-    victory_gpu::kernel_will_write(buffer as usize, len as usize);
-    host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
-        file, buffer, len, read, overlapped,
-    )
+    const ERROR_NOACCESS: u32 = 998;
+    let _writing = KernelWrite::begin(buffer as usize, len as usize);
+    let call = host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32);
+    let ok = call(file, buffer, len, read, overlapped);
+    // If another thread re-guarded a block right before the kernel write
+    // landed, re-open once and retry synchronous reads cleanly.
+    if ok == 0
+        && overlapped.is_null()
+        && !buffer.is_null()
+        && len > 0
+        && unsafe { windows_sys::Win32::Foundation::GetLastError() } == ERROR_NOACCESS
+    {
+        victory_gpu::kernel_will_write(buffer as usize, len as usize);
+        return call(file, buffer, len, read, overlapped);
+    }
+    ok
 }
 
 /// The host CRT reads large requests straight into the caller's buffer
@@ -551,6 +589,7 @@ pub extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File
         // The CRT's own checks and answer (EINVAL, or nothing to read).
         return read(buffer, size, count, stream);
     }
+    let _writing = KernelWrite::begin(buffer as usize, total);
     const CHUNK: usize = 1 << 20;
     let mut beside = vec![0u8; total.min(CHUNK)];
     let mut done = 0;

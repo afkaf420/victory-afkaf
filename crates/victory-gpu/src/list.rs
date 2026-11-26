@@ -216,6 +216,13 @@ impl Detached {
     pub(crate) fn host(&self) -> &crate::host::HostList {
         &self.host
     }
+
+    /// Releases this list's dynamic descriptor slots as soon as its GPU
+    /// submission finishes, without waiting for the full `bury_lag` allocator
+    /// delay (prevents exhausting NVIDIA's 262k dynamic descriptor slot pool).
+    pub(crate) fn release_tables(&mut self) {
+        self._state.tables_done();
+    }
 }
 
 /// A host list that has run and waits to be used again, and the bytes of
@@ -946,6 +953,8 @@ const UAV_BARRIER: Barrier = Barrier {
 /// Returns the console's barrier "actions" (none).
 extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
     #[cfg(windows)]
+    with_state(this, |_, state| state.synced());
+    #[cfg(windows)]
     if let Some(list) = host_list(this)
         && !barriers.is_null()
     {
@@ -1032,6 +1041,7 @@ extern "system" fn copy_buffer_region(
         && let Some(from) = buffer_range(src, src_offset, len)
     {
         list.defer_copy(to, from, len as usize);
+        with_state(this, |_, state| state.copied());
     }
     #[cfg(not(windows))]
     let _ = (this, dst, dst_offset, src, src_offset, len);
@@ -1092,6 +1102,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::buffer_bytes(src),
         ) {
             list.defer_copy(to, from, a.min(b) as usize);
+            with_state(this, |_, state| state.copied());
         }
     }
     #[cfg(not(windows))]
@@ -1227,7 +1238,7 @@ extern "system" fn copy_texture_region(
             };
             // The list owns this mapped D3D12 upload buffer. Wine can report
             // its address as MEM_FREE, so use the host-upload path.
-            list.defer_fill(staging, data, bytes as usize);
+            list.defer_fill_buffer(&buffer, staging, data, bytes as usize);
             from.resource = buffer.as_raw().cast_const().cast();
             from.footprint.offset = 0;
             src_dims = Some(src.footprint.dims());
@@ -1712,7 +1723,12 @@ extern "system" fn set_pipeline(this: This, pipeline: This) {
 /// bottom of the pipe `(flags, control, address, size)`. Host lists order
 /// their own work and every submission is waited for, so there is nothing
 /// to do.
-extern "system" fn sync(_: This, _flags: u32, _control: u32, _address: u64, _size: u64) {}
+extern "system" fn sync(this: This, _flags: u32, _control: u32, _address: u64, _size: u64) {
+    #[cfg(windows)]
+    with_state(this, |_, state| state.synced());
+    #[cfg(not(windows))]
+    let _ = this;
+}
 
 /// Reset with console flags `(allocator, pipeline, flags)`; the flags only
 /// tune the console's command memory.
@@ -2269,6 +2285,10 @@ extern "system" fn wait_value64(this: This, address: u64, comparison: u32, refer
 /// first, so only their ordering matters: one barrier on every shader
 /// write (the title's buffer barriers order compute passes).
 extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
+    #[cfg(windows)]
+    if count > 0 {
+        with_state(this, |_, state| state.synced());
+    }
     #[cfg(windows)]
     if count > 0
         && let Some(list) = host_list(this)

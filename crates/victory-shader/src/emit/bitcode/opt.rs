@@ -234,308 +234,9 @@ impl Module {
                 }
             }
         }
-        if passes & LOADS != 0
-            && self.coalesce_raw_loads()
-            && passes & (FOLD | REUSE | FACTS | LOADS) != 0
-        {
-            self.merge(passes);
-        }
         if passes & DEAD != 0 {
             self.drop_dead();
         }
-    }
-
-    /// If `h` is an `dx.op.annotateHandle` for a strictly read-only SRV
-    /// (`kind` in `1..=12`, neither UAV `0x1000` nor globally-coherent
-    /// `0x4000`), returns its resource kind (`11` = `ByteAddressBuffer`, etc.).
-    fn ro_srv_kind(&self, h: V) -> Option<i64> {
-        let V::Inst(a) = h else { return None };
-        let Op::Call(f, args) = &self.insts[a as usize].op else {
-            return None;
-        };
-        if self.funcs[*f as usize].name != "dx.op.annotateHandle" {
-            return None;
-        }
-        let V::Const(props) = *args.get(2)? else {
-            return None;
-        };
-        let Const::Aggregate(fields) = &self.consts[props as usize].1 else {
-            return None;
-        };
-        let Const::Int(kind) = self.consts[*fields.first()? as usize].1 else {
-            return None;
-        };
-        (1..=12).contains(&kind).then_some(kind)
-    }
-
-    /// Whether `i` is a read-only SRV lookup whose result depends only on its
-    /// arguments and immutable SRV memory (excludes implicit-derivative sample
-    /// ops and all UAV/globally-coherent handles).
-    fn is_ro_srv_load(&self, i: u32) -> bool {
-        let Op::Call(f, args) = &self.insts[i as usize].op else {
-            return false;
-        };
-        let Some(&h) = args.get(1) else { return false };
-        if self.ro_srv_kind(h).is_none() {
-            return false;
-        }
-        let name = self.funcs[*f as usize].name.as_str();
-        let name = name.strip_prefix("dx.op.").unwrap_or(name);
-        name.starts_with("rawBufferLoad.")
-            || name.starts_with("bufferLoad.")
-            || name.starts_with("textureLoad.")
-            || name.starts_with("sampleLevel.")
-            || name.starts_with("sampleGrad.")
-            || name.starts_with("sampleCmpLevelZero.")
-            || name.starts_with("textureGather.")
-            || name.starts_with("textureGatherCmp.")
-    }
-
-    /// Vectorises adjacent read-only `ByteAddressBuffer` (`kind == 11`)
-    /// `dx.op.rawBufferLoad.f32` calls within a basic-block segment (between
-    /// `Effect::Writes`) into 2/3/4-wide contiguous loads (`mask = 3/7/15`,
-    /// 64/128-bit GPU loads).
-    fn coalesce_raw_loads(&mut self) -> bool {
-        let effects = self.effects();
-        let reached = self.reached();
-        let n_insts = self.insts.len();
-        let mut extract_only = vec![true; n_insts];
-        let mut def_pos = vec![(usize::MAX, usize::MAX); n_insts];
-        for (b, blk) in self.blocks.iter().enumerate() {
-            if !reached[b] {
-                continue;
-            }
-            for &p in &blk.phis {
-                for_each_operand(&self.insts[p as usize].op, |v| {
-                    if let V::Inst(src) = v {
-                        extract_only[src as usize] = false;
-                    }
-                });
-            }
-            for (pos, &i) in blk.body.iter().enumerate() {
-                def_pos[i as usize] = (b, pos);
-                match &self.insts[i as usize].op {
-                    Op::Extract(V::Inst(src), ch) => {
-                        if *ch >= 4 {
-                            extract_only[*src as usize] = false;
-                        }
-                    }
-                    op => {
-                        for_each_operand(op, |v| {
-                            if let V::Inst(src) = v {
-                                extract_only[src as usize] = false;
-                            }
-                        });
-                    }
-                }
-            }
-            if let Some(Term::CondBr(V::Inst(src), ..)) = blk.term {
-                extract_only[src as usize] = false;
-            }
-        }
-
-        let is_ro_raw_srv = |h: V| -> bool { self.ro_srv_kind(h) == Some(11) };
-
-        let disjoint_or = |base: V, c: u64| -> bool {
-            let V::Inst(bi) = base else { return false };
-            match self.insts[bi as usize].op {
-                Op::Bin(Bin::Shl, _, s) => self
-                    .int_k(s)
-                    .is_some_and(|(bits, sh)| bits == 32 && sh < 32 && c < (1u64 << sh)),
-                Op::Bin(Bin::And, p, q) => {
-                    self.int_k(p).is_some_and(|(bits, m)| bits == 32 && (m & c) == 0)
-                        || self.int_k(q).is_some_and(|(bits, m)| bits == 32 && (m & c) == 0)
-                }
-                _ => false,
-            }
-        };
-
-        let split_addr = |off: V| -> (Option<V>, u32) {
-            if let Some((32, c)) = self.int_k(off) {
-                return (None, c as u32);
-            }
-            if let V::Inst(oi) = off {
-                match self.insts[oi as usize].op {
-                    Op::Bin(Bin::Add, x, y) => {
-                        if let Some((32, c)) = self.int_k(y) {
-                            return (Some(x), c as u32);
-                        }
-                        if let Some((32, c)) = self.int_k(x) {
-                            return (Some(y), c as u32);
-                        }
-                    }
-                    Op::Bin(Bin::Or, x, y) => {
-                        if let Some((32, c)) = self.int_k(y)
-                            && disjoint_or(x, c)
-                        {
-                            return (Some(x), c as u32);
-                        }
-                        if let Some((32, c)) = self.int_k(x)
-                            && disjoint_or(y, c)
-                        {
-                            return (Some(y), c as u32);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            (Some(off), 0)
-        };
-
-        #[derive(Clone, Copy)]
-        struct Cand {
-            pos: usize,
-            inst_id: u32,
-            off: V,
-            dw: u32,
-            width: u32,
-        }
-
-        let mut updates: Vec<(u32, V, u8)> = Vec::new();
-        let mut remap: HashMap<u32, (u32, u32)> = HashMap::new();
-
-        for (b, blk) in self.blocks.iter().enumerate() {
-            if !reached[b] || blk.body.len() < 2 {
-                continue;
-            }
-            let flush_segment = |groups: &mut HashMap<(V, Option<V>), Vec<Cand>>,
-                                 updates: &mut Vec<(u32, V, u8)>,
-                                 remap: &mut HashMap<u32, (u32, u32)>| {
-                let off_avail = |off: V, at_pos: usize| -> bool {
-                    match off {
-                        V::Inst(oi) => {
-                            let (db, dp) = def_pos[oi as usize];
-                            db != b || dp < at_pos
-                        }
-                        _ => true,
-                    }
-                };
-                for (_, mut cands) in groups.drain() {
-                    if cands.len() < 2 {
-                        continue;
-                    }
-                    cands.sort_by_key(|c| (c.dw, c.pos));
-                    let mut used = vec![false; cands.len()];
-                    for i in 0..cands.len() {
-                        if used[i] {
-                            continue;
-                        }
-                        used[i] = true;
-                        let first = cands[i];
-                        let start_dw = first.dw;
-                        let mut end_dw = first.dw + first.width;
-                        let min_off = first.off;
-                        let mut min_pos = first.pos;
-                        let mut anchor = first.inst_id;
-                        let mut members = vec![first];
-                        for j in (i + 1)..cands.len() {
-                            if used[j] {
-                                continue;
-                            }
-                            let next = cands[j];
-                            if next.dw > end_dw {
-                                break;
-                            }
-                            let new_end = end_dw.max(next.dw + next.width);
-                            let total_w = new_end - start_dw;
-                            if total_w > 4 {
-                                continue;
-                            }
-                            if start_dw
-                                .checked_mul(4)
-                                .and_then(|s| s.checked_add(4 * total_w))
-                                .is_none()
-                            {
-                                continue;
-                            }
-                            let new_min_pos = min_pos.min(next.pos);
-                            if !off_avail(min_off, new_min_pos) {
-                                continue;
-                            }
-                            used[j] = true;
-                            end_dw = new_end;
-                            if next.pos < min_pos {
-                                min_pos = next.pos;
-                                anchor = next.inst_id;
-                            }
-                            members.push(next);
-                        }
-                        if members.len() >= 2 {
-                            let total_w = end_dw - start_dw;
-                            updates.push((anchor, min_off, (1u8 << total_w) - 1));
-                            for m in members {
-                                let delta = m.dw - start_dw;
-                                if m.inst_id != anchor || delta != 0 {
-                                    remap.insert(m.inst_id, (anchor, delta));
-                                }
-                            }
-                        }
-                    }
-                }
-            };
-
-            let mut groups: HashMap<(V, Option<V>), Vec<Cand>> = HashMap::new();
-            for (pos, &i) in blk.body.iter().enumerate() {
-                if self.class(&effects, i) == Effect::Writes {
-                    flush_segment(&mut groups, &mut updates, &mut remap);
-                    continue;
-                }
-                if !extract_only[i as usize] {
-                    continue;
-                }
-                let Op::Call(f, args) = &self.insts[i as usize].op else {
-                    continue;
-                };
-                if args.len() != 6 || self.funcs[*f as usize].name != "dx.op.rawBufferLoad.f32" {
-                    continue;
-                }
-                let (h, off, elem, mask_v, align_v) = (args[1], args[2], args[3], args[4], args[5]);
-                if !is_ro_raw_srv(h)
-                    || !matches!(elem, V::Const(ci) if matches!(self.consts[ci as usize].1, Const::Undef))
-                    || self.int_k(align_v) != Some((32, 4))
-                {
-                    continue;
-                }
-                let width = match self.int_k(mask_v) {
-                    Some((8, 1)) => 1u32,
-                    Some((8, 3)) => 2,
-                    Some((8, 7)) => 3,
-                    Some((8, 15)) => 4,
-                    _ => continue,
-                };
-                let (base, byte_off) = split_addr(off);
-                if byte_off % 4 != 0 {
-                    continue;
-                }
-                groups.entry((h, base)).or_default().push(Cand {
-                    pos,
-                    inst_id: i,
-                    off,
-                    dw: byte_off / 4,
-                    width,
-                });
-            }
-            flush_segment(&mut groups, &mut updates, &mut remap);
-        }
-
-        if updates.is_empty() {
-            return false;
-        }
-        for (anchor, min_off, new_mask) in updates {
-            let mask_v = self.i8(new_mask);
-            if let Op::Call(_, args) = &mut self.insts[anchor as usize].op {
-                args[2] = min_off;
-                args[4] = mask_v;
-            }
-        }
-        for inst in &mut self.insts {
-            if let Op::Extract(V::Inst(src), ch) = inst.op
-                && let Some(&(anchor, delta)) = remap.get(&src)
-            {
-                inst.op = Op::Extract(V::Inst(anchor), ch + delta);
-            }
-        }
-        true
     }
 
     /// Per function: what a call of it does.
@@ -1217,27 +918,12 @@ impl Module {
                     known.insert(key.clone(), V::Inst(i));
                     added.push(key);
                 }
-                // Read-only SRV lookups (`1 <= kind <= 12`, non-UAV, explicit LOD):
-                // immutable for the shader invocation, so reuse across dominating
-                // blocks just like `cbufferLoadLegacy` and `getDimensions`.
+                // Reads of memory, and wave operations (the same lanes run
+                // the whole block): the block's own earlier one.
                 if passes & LOADS != 0
-                    && class == Effect::Reads
-                    && self.is_ro_srv_load(i)
-                    && let Some(key) = self.key(i)
-                {
-                    if let Some(&first) = known.get(&key) {
-                        repl[i as usize] = Some(first);
-                        changed = true;
-                        continue;
-                    }
-                    known.insert(key.clone(), V::Inst(i));
-                    added.push(key);
-                } else if passes & LOADS != 0
                     && matches!(class, Effect::Reads | Effect::Lanes)
                     && let Some(key) = self.key(i)
                 {
-                    // Mutable/UAV reads and wave operations (the same lanes run
-                    // the whole block): the block's own earlier one.
                     if let Some(&first) = read.get(&key) {
                         repl[i as usize] = Some(first);
                         changed = true;
@@ -2563,190 +2249,50 @@ mod tests {
     }
 
     #[test]
-    fn coalesces_adjacent_readonly_raw_buffer_loads_to_vec4() {
+    fn folds_chained_add_constants_and_exact_square_legacy_mul() {
         let mut m = Module::default();
         let i32t = m.int(32);
-        let i8t = m.int(8);
         let f32t = m.float();
         let void = m.void();
-        let i8ptr = m.ptr(i8t);
-        let handle = m.named_struct("dx.types.Handle", vec![i8ptr]);
-        let props = m.named_struct("dx.types.ResourceProperties", vec![i32t, i32t]);
-        let res_ret = m.named_struct("dx.types.ResRet.f32", vec![f32t, f32t, f32t, f32t, i32t]);
-        let ann_ty = m.func_ty(handle, vec![i32t, handle, props]);
-        let load_ty = m.func_ty(res_ret, vec![i32t, handle, i32t, i32t, i8t, i32t]);
-        let store_ty = m.func_ty(void, vec![i32t, f32t]);
-        let main_ty = m.func_ty(void, vec![]);
-        m.ptr(ann_ty);
-        m.ptr(load_ty);
-        m.ptr(store_ty);
-        m.ptr(main_ty);
-        let ann_f = m.function("dx.op.annotateHandle", ann_ty, Some(Attr::ReadNone), false);
-        let load_f = m.function("dx.op.rawBufferLoad.f32", load_ty, Some(Attr::ReadOnly), false);
-        let sink_f = m.function("dx.op.bufferStore.f32", store_ty, Some(Attr::NoUnwind), false);
-        m.function("main", main_ty, None, true);
-
-        let b = m.new_block();
-        let raw_h = m.undef(handle);
-        let ro_props = [m.i32(11), m.i32(0)];
-        let ro_props = m.aggregate(props, &ro_props);
-        let op_ann = m.i32(216);
-        let h = m.call(b, ann_f, vec![op_ann, raw_h, ro_props]);
-        let (op_load, iu, m1, al4) = (m.i32(139), m.undef(i32t), m.i8(1), m.i32(4));
-        let (o28, o32, o36, o40, o48) = (m.i32(28), m.i32(32), m.i32(36), m.i32(40), m.i32(48));
-
-        // 4 contiguous scalar loads at offsets 28, 32, 36, 40 (intentionally out of order: 32, 28, 40, 36)
-        let l32 = m.call(b, load_f, vec![op_load, h, o32, iu, m1, al4]);
-        let e32 = m.extract(b, l32, 0);
-        let l28 = m.call(b, load_f, vec![op_load, h, o28, iu, m1, al4]);
-        let e28 = m.extract(b, l28, 0);
-        let l40 = m.call(b, load_f, vec![op_load, h, o40, iu, m1, al4]);
-        let e40 = m.extract(b, l40, 0);
-        let l36 = m.call(b, load_f, vec![op_load, h, o36, iu, m1, al4]);
-        let e36 = m.extract(b, l36, 0);
-        // Gap at 44, then 48 must stay separate!
-        let l48 = m.call(b, load_f, vec![op_load, h, o48, iu, m1, al4]);
-        let e48 = m.extract(b, l48, 0);
-
-        let s1 = m.bin(b, Bin::Add, e28, e32);
-        let s2 = m.bin(b, Bin::Add, e36, e40);
-        let s3 = m.bin(b, Bin::Add, s1, s2);
-        let s4 = m.bin(b, Bin::Add, s3, e48);
-        let op_sink = m.i32(69);
-        m.call(b, sink_f, vec![op_sink, s4]);
-        m.terminate(b, Term::Ret);
-
-        m.optimise(ALL);
-
-        let loads: Vec<(u64, u64)> = m.blocks[0]
-            .body
-            .iter()
-            .filter_map(|&id| match &m.insts[id as usize].op {
-                Op::Call(f, args) if m.funcs[*f as usize].name == "dx.op.rawBufferLoad.f32" => {
-                    Some((m.int_k(args[2])?.1, m.int_k(args[4])?.1))
-                }
-                _ => None,
-            })
-            .collect();
-        // 5 scalar loads collapsed to 2 loads: vec4 at 28 (mask=15) + scalar at 48 (mask=1)!
-        assert_eq!(loads, vec![(28, 15), (48, 1)]);
-        // Verify channels 0,1,2,3 are extracted from the coalesced load.
-        let mut chs: Vec<u32> = m.blocks[0]
-            .body
-            .iter()
-            .filter_map(|&id| match m.insts[id as usize].op {
-                Op::Extract(V::Inst(src), ch) if src == m.blocks[0].body[1] => Some(ch),
-                _ => None,
-            })
-            .collect();
-        chs.sort_unstable();
-        assert_eq!(chs, vec![0, 1, 2, 3]);
-    }
-
-    #[test]
-    fn readonly_srv_reused_across_blocks_while_uav_not_coalesced_or_reused() {
-        let mut m = Module::default();
-        let i32t = m.int(32);
-        let i8t = m.int(8);
-        let f32t = m.float();
-        let void = m.void();
-        let i8ptr = m.ptr(i8t);
-        let handle = m.named_struct("dx.types.Handle", vec![i8ptr]);
-        let props = m.named_struct("dx.types.ResourceProperties", vec![i32t, i32t]);
-        let res_ret = m.named_struct("dx.types.ResRet.f32", vec![f32t, f32t, f32t, f32t, i32t]);
-        let ann_ty = m.func_ty(handle, vec![i32t, handle, props]);
-        let load_ty = m.func_ty(res_ret, vec![i32t, handle, i32t, i32t, i8t, i32t]);
         let tid_ty = m.func_ty(i32t, vec![i32t, i32t]);
         let store_ty = m.func_ty(void, vec![i32t, f32t]);
         let main_ty = m.func_ty(void, vec![]);
-        m.ptr(ann_ty);
-        m.ptr(load_ty);
         m.ptr(tid_ty);
         m.ptr(store_ty);
         m.ptr(main_ty);
-        let ann_f = m.function("dx.op.annotateHandle", ann_ty, Some(Attr::ReadNone), false);
-        let load_f = m.function("dx.op.rawBufferLoad.f32", load_ty, Some(Attr::ReadOnly), false);
         let tid_f = m.function("dx.op.threadId.i32", tid_ty, Some(Attr::ReadNone), false);
         let sink_f = m.function("dx.op.bufferStore.f32", store_ty, Some(Attr::NoUnwind), false);
         m.function("main", main_ty, None, true);
 
-        let b0 = m.new_block();
-        let b1 = m.new_block();
-        let raw_h = m.undef(handle);
-        let ro_arr = [m.i32(11), m.i32(0)];
-        let ro_props = m.aggregate(props, &ro_arr);
-        let uav_arr = [m.i32(11 | 0x1000), m.i32(0)];
-        let uav_props = m.aggregate(props, &uav_arr);
-        let op_ann = m.i32(216);
-        let h_ro = m.call(b0, ann_f, vec![op_ann, raw_h, ro_props]);
-        let h_uav = m.call(b0, ann_f, vec![op_ann, raw_h, uav_props]);
-        let (op_load, iu, m1, al4) = (m.i32(139), m.undef(i32t), m.i8(1), m.i32(4));
-        let (op_tid, z0, op_sink) = (m.i32(93), m.i32(0), m.i32(69));
-        let (k4, k16, fzero) = (m.i32(4), m.i32(16), m.f32(0));
-
-        let tid = m.call(b0, tid_f, vec![op_tid, z0]);
-        // RO SRV load in entry block + chained Add(Add(tid, 16), 4) that folds & coalesces.
-        let ro0 = m.call(b0, load_f, vec![op_load, h_ro, z0, iu, m1, al4]);
-        let ro0_v = m.extract(b0, ro0, 0);
-        let a16 = m.bin(b0, Bin::Add, tid, k16);
-        let a20 = m.bin(b0, Bin::Add, a16, k4);
-        let ro16 = m.call(b0, load_f, vec![op_load, h_ro, a16, iu, m1, al4]);
-        let ro20 = m.call(b0, load_f, vec![op_load, h_ro, a20, iu, m1, al4]);
-        let ro16_v = m.extract(b0, ro16, 0);
-        let ro20_v = m.extract(b0, ro20, 0);
-        // Adjacent UAV loads at 0 and 4: MUST NOT coalesce!
-        let u0 = m.call(b0, load_f, vec![op_load, h_uav, z0, iu, m1, al4]);
-        let u4 = m.call(b0, load_f, vec![op_load, h_uav, k4, iu, m1, al4]);
-        let u0_v = m.extract(b0, u0, 0);
-        let u4_v = m.extract(b0, u4, 0);
-        // Exact x * x legacy_mul select MUST simplify to plain fmul!
-        let sq = m.bin(b0, Bin::Mul, ro0_v, ro0_v);
-        let is_z = m.cmp(b0, pred::OEQ, ro0_v, fzero);
-        let sq_sel = m.select(b0, is_z, fzero, sq);
-        let sum0 = m.bin(b0, Bin::Add, sq_sel, ro16_v);
-        let sum0 = m.bin(b0, Bin::Add, sum0, ro20_v);
-        let sum0 = m.bin(b0, Bin::Add, sum0, u0_v);
-        let sum0 = m.bin(b0, Bin::Add, sum0, u4_v);
-        // Write separating b0 and b1: RO SRV load in b1 reuses ro0, UAV load in b1 stays!
-        m.call(b0, sink_f, vec![op_sink, sum0]);
-        m.terminate(b0, Term::Br(b1));
-
-        let ro0_dup = m.call(b1, load_f, vec![op_load, h_ro, z0, iu, m1, al4]);
-        let ro0_dup_v = m.extract(b1, ro0_dup, 0);
-        let u0_dup = m.call(b1, load_f, vec![op_load, h_uav, z0, iu, m1, al4]);
-        let u0_dup_v = m.extract(b1, u0_dup, 0);
-        let sum1 = m.bin(b1, Bin::Add, ro0_dup_v, u0_dup_v);
-        m.call(b1, sink_f, vec![op_sink, sum1]);
-        m.terminate(b1, Term::Ret);
+        let b = m.new_block();
+        let (op_tid, z0, k16, k4, fzero) = (m.i32(93), m.i32(0), m.i32(16), m.i32(4), m.f32(0));
+        let tid = m.call(b, tid_f, vec![op_tid, z0]);
+        let a16 = m.bin(b, Bin::Add, tid, k16);
+        let a20 = m.bin(b, Bin::Add, a16, k4);
+        let xf = m.cast(b, Cast::Bitcast, a20, f32t);
+        let sq = m.bin(b, Bin::Mul, xf, xf);
+        let is_z = m.cmp(b, pred::OEQ, xf, fzero);
+        let sq_sel = m.select(b, is_z, fzero, sq);
+        m.call(b, sink_f, vec![a20, sq_sel]);
+        m.terminate(b, Term::Ret);
 
         m.optimise(ALL);
 
-        let loads_in = |blk_idx: usize| -> Vec<(V, u64)> {
-            m.blocks[blk_idx]
-                .body
-                .iter()
-                .filter_map(|&id| match &m.insts[id as usize].op {
-                    Op::Call(f, args) if m.funcs[*f as usize].name == "dx.op.rawBufferLoad.f32" => {
-                        Some((args[1], m.int_k(args[4])?.1))
-                    }
-                    _ => None,
-                })
-                .collect()
-        };
-        let b0_loads = loads_in(0);
-        let b1_loads = loads_in(1);
-        // b0: ro0 (mask 1) + coalesced ro16/ro20 (mask 3) + two uncoalesced UAV loads (mask 1, 1).
-        let ro_b0: Vec<u64> = b0_loads.iter().filter(|(h, _)| *h == h_ro).map(|x| x.1).collect();
-        let uav_b0: Vec<u64> = b0_loads.iter().filter(|(h, _)| *h == h_uav).map(|x| x.1).collect();
-        assert_eq!(ro_b0, vec![1, 3], "RO SRV loads at tid+16 & (tid+16)+4 must coalesce to vec2");
-        assert_eq!(uav_b0, vec![1, 1], "UAV loads must NOT coalesce");
-        // b1: RO SRV load reused from b0 (gone!), UAV load preserved!
-        assert_eq!(b1_loads, vec![(h_uav, 1)], "only UAV load should remain in b1");
-        // Verify x * x select & fcmp were eliminated.
-        let has_select = m.blocks[0]
+        let adds: Vec<u64> = m.blocks[0]
             .body
             .iter()
-            .any(|&id| matches!(m.insts[id as usize].op, Op::Select(..)));
-        assert!(!has_select, "exact x * x legacy_mul select should simplify to plain fmul");
+            .filter_map(|&id| match m.insts[id as usize].op {
+                Op::Bin(Bin::Add, _, c) => Some(m.int_k(c)?.1),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(adds, vec![20], "chained (tid + 16) + 4 must fold to tid + 20");
+        assert!(
+            !m.blocks[0]
+                .body
+                .iter()
+                .any(|&id| matches!(m.insts[id as usize].op, Op::Select(..) | Op::Cmp(..))),
+            "bit-exact x * x legacy_mul select and fcmp must simplify to plain fmul"
+        );
     }
 }

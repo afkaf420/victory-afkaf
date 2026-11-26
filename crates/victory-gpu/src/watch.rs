@@ -24,8 +24,214 @@
 //! system call writing into a guarded block fails (none is known to).
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+/// PC-native memory class derived from Xbox console `XMemVirtualAlloc` flags
+/// and `flProtect` bits before host sanitization strips them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConsoleMemClass {
+    Unknown,
+    CpuOnly,
+    GpuReadOnly,
+    WriteCombinedGpuRw,
+    CachedGpuRw,
+    CoherentGpuRw,
+}
+
+fn classify_console_memory(flags: u32, protect: u32) -> ConsoleMemClass {
+    const MEM_GRAPHICS: u32 = 0x2;
+    const PAGE_WRITECOMBINE: u32 = 0x400;
+    const PAGE_GRAPHICS_NOACCESS: u32 = 0x800;
+    const PAGE_GRAPHICS_READONLY: u32 = 0x1000;
+    const PAGE_GRAPHICS_READWRITE: u32 = 0x2000;
+    const PAGE_GRAPHICS_EXECUTE_READ: u32 = 0x8000;
+    const PAGE_GRAPHICS_COHERENT: u32 = 0x20000;
+    const PAGE_GRAPHICS_NOCACHE: u32 = 0x40000;
+
+    if (flags & MEM_GRAPHICS) == 0 || (protect & PAGE_GRAPHICS_NOACCESS) != 0 {
+        ConsoleMemClass::CpuOnly
+    } else if (protect & PAGE_GRAPHICS_COHERENT) != 0 || (protect & PAGE_GRAPHICS_NOCACHE) != 0 {
+        ConsoleMemClass::CoherentGpuRw
+    } else if (protect & PAGE_GRAPHICS_READWRITE) == 0
+        && ((protect & PAGE_GRAPHICS_READONLY) != 0 || (protect & PAGE_GRAPHICS_EXECUTE_READ) != 0)
+    {
+        ConsoleMemClass::GpuReadOnly
+    } else if (protect & PAGE_GRAPHICS_READWRITE) != 0 && (protect & PAGE_WRITECOMBINE) != 0 {
+        ConsoleMemClass::WriteCombinedGpuRw
+    } else if (protect & PAGE_GRAPHICS_READWRITE) != 0 {
+        ConsoleMemClass::CachedGpuRw
+    } else {
+        ConsoleMemClass::Unknown
+    }
+}
+
+/// Disjoint sorted intervals `start -> (end, ConsoleMemClass)` with adjacent
+/// identical classes merged. Protected by its own `RwLock` (never nests with
+/// `JOURNAL` or `GUARDS`).
+static CONSOLE_MEM: RwLock<BTreeMap<usize, (usize, ConsoleMemClass)>> =
+    RwLock::new(BTreeMap::new());
+
+fn console_mem_insert(
+    map: &mut BTreeMap<usize, (usize, ConsoleMemClass)>,
+    lo: usize,
+    hi: usize,
+    class: ConsoleMemClass,
+) {
+    if lo >= hi {
+        return;
+    }
+    // Remove/split any intervals overlapping `[lo, hi)`.
+    let mut overlapping: Vec<(usize, usize, ConsoleMemClass)> = Vec::new();
+    if let Some((&s, &(e, c))) = map.range(..lo).next_back()
+        && e > lo
+    {
+        overlapping.push((s, e, c));
+    }
+    for (&s, &(e, c)) in map.range(lo..hi) {
+        overlapping.push((s, e, c));
+    }
+    for &(s, _, _) in &overlapping {
+        map.remove(&s);
+    }
+    for (s, e, c) in overlapping {
+        if s < lo {
+            map.insert(s, (lo, c));
+        }
+        if e > hi {
+            map.insert(hi, (e, c));
+        }
+    }
+    // Merge with touching left/right neighbors of the same class.
+    let mut new_lo = lo;
+    let mut new_hi = hi;
+    if let Some((&s, &(e, c))) = map.range(..lo).next_back()
+        && e == lo
+        && c == class
+    {
+        map.remove(&s);
+        new_lo = s;
+    }
+    if let Some(&(e, c)) = map.get(&hi)
+        && c == class
+    {
+        map.remove(&hi);
+        new_hi = e;
+    }
+    map.insert(new_lo, (new_hi, class));
+}
+
+fn console_mem_clear(map: &mut BTreeMap<usize, (usize, ConsoleMemClass)>, lo: usize, hi: usize) {
+    if lo >= hi {
+        return;
+    }
+    let mut overlapping: Vec<(usize, usize, ConsoleMemClass)> = Vec::new();
+    if let Some((&s, &(e, c))) = map.range(..lo).next_back()
+        && e > lo
+    {
+        overlapping.push((s, e, c));
+    }
+    for (&s, &(e, c)) in map.range(lo..hi) {
+        overlapping.push((s, e, c));
+    }
+    for &(s, _, _) in &overlapping {
+        map.remove(&s);
+    }
+    for (s, e, c) in overlapping {
+        if s < lo {
+            map.insert(s, (lo, c));
+        }
+        if e > hi {
+            map.insert(hi, (e, c));
+        }
+    }
+}
+
+/// Records the console memory classification of `[base, base + len)` from raw
+/// Xbox `XMemVirtualAlloc` / placeholder split `flags` and `protect` bits.
+pub fn note_console_memory(base: usize, len: usize, flags: u32, protect: u32) {
+    if base == 0 || len == 0 {
+        return;
+    }
+    let end = base.saturating_add(len);
+    if end <= base {
+        return;
+    }
+    let class = classify_console_memory(flags, protect);
+    let mut map = CONSOLE_MEM.write().unwrap_or_else(|e| e.into_inner());
+    console_mem_insert(&mut map, base, end, class);
+}
+
+/// Clears any recorded console memory classification over `[base, base + len)`
+/// (called when virtual memory is released/unmapped).
+pub fn clear_console_memory(base: usize, len: usize) {
+    if base == 0 || len == 0 {
+        return;
+    }
+    let end = base.saturating_add(len);
+    if end <= base {
+        return;
+    }
+    let mut map = CONSOLE_MEM.write().unwrap_or_else(|e| e.into_inner());
+    console_mem_clear(&mut map, base, end);
+}
+
+/// Returns a complete, sorted partition of `[start, end)` into contiguous
+/// `(lo, hi, ConsoleMemClass)` sub-ranges (unregistered gaps report `Unknown`).
+pub(crate) fn console_mem_class_ranges(
+    start: usize,
+    end: usize,
+) -> Vec<(usize, usize, ConsoleMemClass)> {
+    let mut out = Vec::new();
+    if start >= end {
+        return out;
+    }
+    let map = CONSOLE_MEM.read().unwrap_or_else(|e| e.into_inner());
+    let mut cur = start;
+    let push_merged = |out: &mut Vec<(usize, usize, ConsoleMemClass)>,
+                       lo: usize,
+                       hi: usize,
+                       c: ConsoleMemClass| {
+        if lo >= hi {
+            return;
+        }
+        if let Some(last) = out.last_mut()
+            && last.1 == lo
+            && last.2 == c
+        {
+            last.1 = hi;
+        } else {
+            out.push((lo, hi, c));
+        }
+    };
+    if let Some((_, &(e, c))) = map.range(..start).next_back()
+        && e > start
+    {
+        let hi = e.min(end);
+        push_merged(&mut out, start, hi, c);
+        cur = hi;
+    }
+    if cur >= end {
+        return out;
+    }
+    for (&s, &(e, c)) in map.range(cur..end) {
+        if s > cur {
+            push_merged(&mut out, cur, s.min(end), ConsoleMemClass::Unknown);
+        }
+        let lo = s.max(cur);
+        let hi = e.min(end);
+        push_merged(&mut out, lo, hi, c);
+        cur = cur.max(hi);
+        if cur >= end {
+            break;
+        }
+    }
+    if cur < end {
+        push_merged(&mut out, cur, end, ConsoleMemClass::Unknown);
+    }
+    out
+}
 
 /// Monotonic epoch incremented whenever any guarded `MEM_MAPPED` block leaves
 /// the clean state (write fault, alias open, `writing`, `views_mapped`,
@@ -47,6 +253,9 @@ fn bump_guard_epoch() {
 thread_local! {
     static THREAD_MIXED_VQS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static THREAD_GUARD_GAP_BLOCKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static THREAD_UNCOMMITTED_VQS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static KNOWN_HOLES_IN_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    static REST_IN_TEST: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::ZERO) };
 }
 
 #[cfg(test)]
@@ -67,6 +276,92 @@ fn reset_guard_gap_blocks() {
 #[cfg(test)]
 fn guard_gap_blocks() -> u64 {
     THREAD_GUARD_GAP_BLOCKS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn reset_uncommitted_vqs() {
+    THREAD_UNCOMMITTED_VQS.with(|c| c.set(0));
+}
+
+#[cfg(test)]
+fn uncommitted_vqs() -> u64 {
+    THREAD_UNCOMMITTED_VQS.with(std::cell::Cell::get)
+}
+
+/// Whether placeholder holes are trusted via `title_memory_remapped` instead of
+/// issuing `VirtualQuery` on every submission (`VICTORY_KNOWN_HOLES`, default ON,
+/// `=0` disables).
+fn known_holes() -> bool {
+    #[cfg(test)]
+    if let Some(v) = KNOWN_HOLES_IN_TEST.with(std::cell::Cell::get) {
+        return v;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_KNOWN_HOLES").is_none_or(|v| v != "0"))
+}
+
+/// How long a block opened by a CPU write fault rests before being re-guarded
+/// (`VICTORY_GUARD_REST=<microseconds>`, default `3000` µs = 3 ms, `=0` disables).
+/// Resting blocks still report as dirty at each check so no writes are missed,
+/// avoiding back-to-back `VirtualProtect(PAGE_READONLY)` TLB shootdown storms.
+fn guard_rest() -> Duration {
+    #[cfg(test)]
+    {
+        REST_IN_TEST.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        static US: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let us = *US.get_or_init(|| match std::env::var("VICTORY_GUARD_REST") {
+            Ok(v) => v.trim().parse::<u64>().unwrap_or(3000),
+            Err(_) => 3000,
+        });
+        Duration::from_micros(us)
+    }
+}
+
+/// True if `block` lies in a Windows `MEM_RESERVE_PLACEHOLDER` reservation,
+/// where pages can only appear via `MapViewOfFile3`/`VirtualAlloc2(MEM_REPLACE_PLACEHOLDER)`
+/// (always routed through `xmem` -> `title_memory_remapped`), never via plain
+/// `VirtualAlloc(MEM_COMMIT)`.
+fn placeholder(block: usize) -> bool {
+    #[repr(C)]
+    #[derive(Default)]
+    struct Region {
+        allocation_base: usize,
+        allocation_protect: u32,
+        region_type: u32,
+        region_size: usize,
+        commit_size: usize,
+        partition_id: usize,
+        node_preference: usize,
+    }
+    #[link(name = "ntdll", kind = "raw-dylib")]
+    unsafe extern "system" {
+        fn NtQueryVirtualMemory(
+            process: *mut std::ffi::c_void,
+            at: *const std::ffi::c_void,
+            class: u32,
+            out: *mut std::ffi::c_void,
+            len: usize,
+            returned: *mut usize,
+        ) -> i32;
+    }
+    const MEMORY_REGION_INFORMATION_EX: u32 = 7;
+    const PLACEHOLDER_RESERVATION: u32 = 1 << 8;
+    let mut region = Region::default();
+    // SAFETY: valid output buffer and size for current process query.
+    let status = unsafe {
+        NtQueryVirtualMemory(
+            windows_sys::Win32::System::Threading::GetCurrentProcess(),
+            (block * BLOCK) as *const _,
+            MEMORY_REGION_INFORMATION_EX,
+            (&raw mut region).cast(),
+            size_of::<Region>(),
+            std::ptr::null_mut(),
+        )
+    };
+    status >= 0 && (region.region_type & PLACEHOLDER_RESERVATION) != 0
 }
 
 /// Whether `VICTORY_GUARD_ASK=1` forces Windows `VirtualQuery` checks on
@@ -938,21 +1233,48 @@ struct Guards {
     clean: IntervalSet,
     /// Blocks already copied as zeros and confirmed uncommitted (coalesced intervals).
     absent: IntervalSet,
-    /// Intervals confirmed to be pure `MEM_MAPPED`/placeholder view memory
-    /// (populated by `guard()`/`protect()`, cleared by `title_memory_remapped()`).
+    /// Subset of `absent` confirmed to be `MEM_RESERVE_PLACEHOLDER` reservations
+    /// (`VICTORY_KNOWN_HOLES`): skipped with 0 `VirtualQuery` until `title_memory_remapped`.
+    held: IntervalSet,
+    /// Intervals confirmed to be protected `MEM_MAPPED` views or `MEM_RESERVE_PLACEHOLDER`
+    /// holes (populated only after `VirtualProtect` succeeds or `placeholder()` confirms;
+    /// cleared by `title_memory_remapped()`).
     known_views: IntervalSet,
     /// Blocks whose physical page was guarded together with its other views
     /// (those views' blocks are in it too): a write to one opens them all.
     /// A write range can be huge (`fread`), so only these are looked up.
     aliased: BTreeSet<usize>,
+    /// Blocks recently opened by a CPU write fault and when (`VICTORY_GUARD_REST`).
+    opened: BTreeMap<usize, Instant>,
+}
+
+impl Guards {
+    fn note_opened(&mut self, block: usize) {
+        const MANY: usize = 8192;
+        if self.opened.len() >= MANY {
+            let cutoff = Duration::from_millis(50);
+            self.opened.retain(|_, at| at.elapsed() < cutoff);
+            if self.opened.len() >= MANY {
+                self.opened.clear();
+            }
+        }
+        self.opened.insert(block, Instant::now());
+    }
+
+    #[inline]
+    fn is_resting(&self, block: usize, rest: Duration) -> bool {
+        !rest.is_zero() && self.opened.get(&block).is_some_and(|at| at.elapsed() < rest)
+    }
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     protected: IntervalSet::new(),
     clean: IntervalSet::new(),
     absent: IntervalSet::new(),
+    held: IntervalSet::new(),
     known_views: IntervalSet::new(),
     aliased: BTreeSet::new(),
+    opened: BTreeMap::new(),
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
@@ -960,19 +1282,29 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
 }
 
 /// Processes ONLY the non-clean gaps of `[first, last)` inside `g` in
-/// `O(log N + K)` (skipping contiguous clean intervals and confirmed-uncommitted
-/// `absent` runs without scanning individual blocks).
+/// `O(log N + K)` (skipping contiguous clean intervals, confirmed placeholder
+/// `held` holes with 0 `VirtualQuery`, and confirmed-uncommitted `absent` runs;
+/// honoring `VICTORY_GUARD_REST` on recently faulted blocks).
 fn guard_gaps(g: &mut Guards, first: usize, last: usize) -> Vec<usize> {
     let mut written = Vec::new();
     if g.clean.covers(first, last) {
         return written;
     }
+    let holes_known = known_holes();
+    let rest = guard_rest();
     let gaps = g.clean.gaps(first, last);
     let mut uncommitted_until = first;
     for (gap_start, gap_end) in gaps {
         let mut block = gap_start;
         let mut run: Option<usize> = None;
         while block < gap_end {
+            if holes_known && let Some(held_end) = g.held.covering_end(block) {
+                if let Some(from) = run.take() {
+                    protect(g, from, block);
+                }
+                block = held_end.min(gap_end);
+                continue;
+            }
             if let Some(abs_end) = g.absent.covering_end(block) {
                 let abs_hi = abs_end.min(gap_end);
                 if block >= uncommitted_until {
@@ -986,6 +1318,7 @@ fn guard_gaps(g: &mut Guards, first: usize, last: usize) -> Vec<usize> {
                     continue;
                 }
                 g.absent.remove(block);
+                g.held.remove(block);
             }
             #[cfg(test)]
             THREAD_GUARD_GAP_BLOCKS.with(|c| c.set(c.get() + 1));
@@ -998,7 +1331,16 @@ fn guard_gaps(g: &mut Guards, first: usize, last: usize) -> Vec<usize> {
                 written.extend(block..prot_hi);
                 g.clean.insert_range(block, prot_hi);
                 block = prot_hi;
+            } else if g.is_resting(block, rest) {
+                if let Some(from) = run.take() {
+                    protect(g, from, block);
+                }
+                // Still resting after a recent write fault: report dirty so
+                // nothing is missed, without thrashing `VirtualProtect`.
+                written.push(block);
+                block += 1;
             } else {
+                g.opened.remove(&block);
                 written.push(block);
                 run.get_or_insert(block);
                 block += 1;
@@ -1052,7 +1394,6 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     install();
     let mut g = guards();
     let written = guard_gaps(&mut g, first, last);
-    g.known_views.insert_range(first, last);
     Some(written)
 }
 
@@ -1205,7 +1546,14 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
             let uncomm = uncommitted_end(block).min(to);
             if block < uncomm {
                 g.absent.insert_range(block, uncomm);
-                g.known_views.insert_range(block, uncomm);
+                // Only `MEM_RESERVE_PLACEHOLDER` holes are safe to cache in
+                // `held`/`known_views`: ordinary `MEM_RESERVE` private regions
+                // can be committed via `VirtualAlloc(MEM_COMMIT)` without
+                // `title_memory_remapped()`.
+                if known_holes() && placeholder(block) {
+                    g.held.insert_range(block, uncomm);
+                    g.known_views.insert_range(block, uncomm);
+                }
                 block = uncomm;
             } else {
                 block += 1;
@@ -1219,6 +1567,8 @@ fn uncommitted_end(block: usize) -> usize {
     use windows_sys::Win32::System::Memory::{
         MEM_FREE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery,
     };
+    #[cfg(test)]
+    THREAD_UNCOMMITTED_VQS.with(|c| c.set(c.get() + 1));
     // SAFETY: plain data filled in by the query.
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.
@@ -1495,12 +1845,17 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     let first = at / BLOCK;
     let last = at.saturating_add(len).div_ceil(BLOCK);
     g.absent.remove_range(first, last);
+    g.held.remove_range(first, last);
     g.protected.remove_range(first, last);
     g.clean.remove_range(first, last);
     g.known_views.remove_range(first, last);
     let aliased: Vec<usize> = g.aliased.range(first..last).copied().collect();
     for block in aliased {
         g.aliased.remove(&block);
+    }
+    let opened: Vec<usize> = g.opened.range(first..last).map(|(&b, _)| b).collect();
+    for block in opened {
+        g.opened.remove(&block);
     }
     if len > 0 {
         bump_guard_epoch();
@@ -1531,6 +1886,7 @@ fn install() {
         // (then it is ours again, not read-only for some other reason).
         let mut g = guards();
         if open(&mut g, at, at + 1) {
+            g.note_opened(at / BLOCK);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::GuardFaults, 1);
             return EXCEPTION_CONTINUE_EXECUTION;
@@ -2506,6 +2862,274 @@ mod tests {
         assert_eq!(newly_dirty_run, expected_run);
         assert_eq!(mixed_virtual_queries(), 0);
         assert_eq!(guard_gap_blocks(), 16);
+    }
+
+    #[test]
+    fn console_mem_class_classification_and_interval_splitting() {
+        // Verify exact Xbox console flag/protect classification rules (#174/#176).
+        assert_eq!(classify_console_memory(0x21, 0x0004), ConsoleMemClass::CpuOnly);
+        assert_eq!(classify_console_memory(0x181, 0x0004), ConsoleMemClass::CpuOnly);
+        assert_eq!(classify_console_memory(0x03, 0x0801), ConsoleMemClass::CpuOnly);
+        assert_eq!(classify_console_memory(0x27, 0x1004), ConsoleMemClass::GpuReadOnly);
+        assert_eq!(classify_console_memory(0x27, 0x1404), ConsoleMemClass::GpuReadOnly);
+        assert_eq!(classify_console_memory(0x27, 0x8404), ConsoleMemClass::GpuReadOnly);
+        assert_eq!(classify_console_memory(0x27, 0x2404), ConsoleMemClass::WriteCombinedGpuRw);
+        assert_eq!(classify_console_memory(0x283, 0x2404), ConsoleMemClass::WriteCombinedGpuRw);
+        assert_eq!(classify_console_memory(0x27, 0x2004), ConsoleMemClass::CachedGpuRw);
+        assert_eq!(classify_console_memory(0x183, 0x22004), ConsoleMemClass::CoherentGpuRw);
+        assert_eq!(classify_console_memory(0x283, 0x42404), ConsoleMemClass::CoherentGpuRw);
+        assert_eq!(classify_console_memory(0x02, 0x0004), ConsoleMemClass::Unknown);
+
+        // Use a high synthetic VA bucket disjoint from real host allocations.
+        let base: usize = 0x7000_0000_0000;
+        let mb: usize = 1 << 20;
+        clear_console_memory(base, 200 * mb);
+
+        // Composite Low-4GB-style zones: Z3 (GpuReadOnly), Z4 (WC), Z5 (Cached).
+        note_console_memory(base, 64 * mb, 0x27, 0x8404);
+        note_console_memory(base + 64 * mb, 64 * mb, 0x27, 0x2404);
+        note_console_memory(base + 128 * mb, 46 * mb, 0x27, 0x2004);
+        assert_eq!(
+            console_mem_class_ranges(base, base + 174 * mb),
+            vec![
+                (base, base + 64 * mb, ConsoleMemClass::GpuReadOnly),
+                (base + 64 * mb, base + 128 * mb, ConsoleMemClass::WriteCombinedGpuRw),
+                (base + 128 * mb, base + 174 * mb, ConsoleMemClass::CachedGpuRw),
+            ]
+        );
+
+        // Overwriting a middle slice splits surrounding intervals cleanly.
+        note_console_memory(base + 80 * mb, 16 * mb, 0x183, 0x22004);
+        assert_eq!(
+            console_mem_class_ranges(base + 64 * mb, base + 128 * mb),
+            vec![
+                (base + 64 * mb, base + 80 * mb, ConsoleMemClass::WriteCombinedGpuRw),
+                (base + 80 * mb, base + 96 * mb, ConsoleMemClass::CoherentGpuRw),
+                (base + 96 * mb, base + 128 * mb, ConsoleMemClass::WriteCombinedGpuRw),
+            ]
+        );
+
+        // Clearing a sub-range leaves gaps reporting `Unknown`.
+        clear_console_memory(base + 80 * mb, 16 * mb);
+        assert_eq!(
+            console_mem_class_ranges(base + 64 * mb, base + 128 * mb),
+            vec![
+                (base + 64 * mb, base + 80 * mb, ConsoleMemClass::WriteCombinedGpuRw),
+                (base + 80 * mb, base + 96 * mb, ConsoleMemClass::Unknown),
+                (base + 96 * mb, base + 128 * mb, ConsoleMemClass::WriteCombinedGpuRw),
+            ]
+        );
+
+        // Re-inserting the same class coalesces back into one interval.
+        note_console_memory(base + 80 * mb, 16 * mb, 0x27, 0x2404);
+        assert_eq!(
+            console_mem_class_ranges(base + 64 * mb, base + 128 * mb),
+            vec![(base + 64 * mb, base + 128 * mb, ConsoleMemClass::WriteCombinedGpuRw)]
+        );
+        clear_console_memory(base, 200 * mb);
+    }
+
+    #[test]
+    fn known_holes_skips_placeholder_virtual_queries_until_remapped() {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER,
+            MEM_RESERVE, MEM_RESERVE_PLACEHOLDER, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile3,
+            PAGE_NOACCESS, PAGE_READWRITE, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2,
+            VirtualFree,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+        const TOTAL: usize = 3 * BLOCK;
+        // SAFETY: 3-block placeholder reservation (block 0 mapped, blocks 1..3 remain placeholder holes).
+        let base = unsafe {
+            VirtualAlloc2(
+                GetCurrentProcess(),
+                std::ptr::null(),
+                TOTAL,
+                MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                PAGE_NOACCESS,
+                std::ptr::null_mut(),
+                0,
+            )
+        } as usize;
+        assert_ne!(base, 0);
+        // SAFETY: split block 0 off the 3-block placeholder.
+        assert_ne!(
+            unsafe { VirtualFree(base as *mut _, BLOCK, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) },
+            0
+        );
+        // SAFETY: 1-block anonymous section mapped into block 0.
+        let sec = unsafe {
+            CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                BLOCK as u32,
+                std::ptr::null(),
+            )
+        };
+        assert!(!sec.is_null());
+        // SAFETY: map section into split placeholder block 0.
+        let view = unsafe {
+            MapViewOfFile3(
+                sec,
+                GetCurrentProcess(),
+                base as *const _,
+                0,
+                BLOCK,
+                MEM_REPLACE_PLACEHOLDER,
+                PAGE_READWRITE,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        assert_eq!(view.Value as usize, base);
+
+        // Also allocate an ordinary non-placeholder `MEM_RESERVE` block to verify
+        // it is NOT cached in `held` or `known_views`.
+        // SAFETY: ordinary private reservation.
+        let priv_res = unsafe { VirtualAlloc(std::ptr::null(), BLOCK, MEM_RESERVE, PAGE_READWRITE) } as usize;
+        assert_ne!(priv_res, 0);
+
+        struct Cleanup {
+            base: usize,
+            sec: windows_sys::Win32::Foundation::HANDLE,
+            priv_res: usize,
+        }
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                KNOWN_HOLES_IN_TEST.with(|c| c.set(None));
+                title_memory_remapped(self.base, TOTAL);
+                title_memory_remapped(self.priv_res, BLOCK);
+                // SAFETY: unmapping test view and releasing reservations.
+                unsafe {
+                    let proc = GetCurrentProcess();
+                    UnmapViewOfFile2(
+                        proc,
+                        MEMORY_MAPPED_VIEW_ADDRESS { Value: self.base as *mut _ },
+                        MEM_PRESERVE_PLACEHOLDER,
+                    );
+                    VirtualFree(self.base as *mut _, BLOCK, MEM_RELEASE);
+                    VirtualFree((self.base + BLOCK) as *mut _, 2 * BLOCK, MEM_RELEASE);
+                    CloseHandle(self.sec);
+                    VirtualFree(self.priv_res as *mut _, 0, MEM_RELEASE);
+                }
+            }
+        }
+        let _cleanup = Cleanup { base, sec, priv_res };
+        KNOWN_HOLES_IN_TEST.with(|c| c.set(Some(true)));
+
+        let first = base / BLOCK;
+        let last = (base + TOTAL) / BLOCK;
+        let mut j = Journal::new_for_test();
+
+        // Prime: block 0 guarded, blocks 1..3 recognized as placeholder holes (`held` + `known_views`).
+        assert!(writes_on(&mut j, base, base + TOTAL, true).is_some());
+        {
+            let g = guards();
+            assert!(g.known_views.covers(first, last));
+            assert!(g.held.covers(first + 1, last));
+        }
+
+        // Repeat checks on `[base, base + TOTAL)` must issue 0 `VirtualQuery` syscalls!
+        reset_mixed_virtual_queries();
+        reset_uncommitted_vqs();
+        for _ in 0..5 {
+            assert!(writes_on(&mut j, base, base + TOTAL, true).is_some());
+        }
+        assert_eq!(mixed_virtual_queries(), 0, "known placeholder pool must do 0 writes_mixed VQs");
+        assert_eq!(uncommitted_vqs(), 0, "VICTORY_KNOWN_HOLES must do 0 uncommitted_end VQs");
+
+        // `title_memory_remapped` clears `held` and `known_views` cleanly.
+        title_memory_remapped(base + BLOCK, BLOCK);
+        {
+            let g = guards();
+            assert!(!g.held.contains(first + 1));
+            assert!(!g.known_views.contains(first + 1));
+        }
+
+        // Non-placeholder `MEM_RESERVE` must NEVER enter `held` or `known_views`.
+        assert!(writes_on(&mut j, priv_res, priv_res + BLOCK, true).is_some());
+        {
+            let g = guards();
+            let pb = priv_res / BLOCK;
+            assert!(g.absent.contains(pb));
+            assert!(!g.held.contains(pb), "ordinary MEM_RESERVE must not enter held");
+            assert!(!g.known_views.contains(pb), "ordinary MEM_RESERVE must not enter known_views");
+        }
+    }
+
+    #[test]
+    fn guard_rest_leaves_hot_faulted_block_open_until_rest_expires() {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_ALL_ACCESS, MapViewOfFile, PAGE_READWRITE, UnmapViewOfFile,
+        };
+        const LEN: usize = 2 * BLOCK;
+        // SAFETY: 2-block anonymous mapped view for rest window verification.
+        let sec = unsafe {
+            CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                LEN as u32,
+                std::ptr::null(),
+            )
+        };
+        assert!(!sec.is_null());
+        // SAFETY: mapping 2-block section.
+        let view = unsafe { MapViewOfFile(sec, FILE_MAP_ALL_ACCESS, 0, 0, LEN) };
+        assert!(!view.Value.is_null());
+        struct Cleanup {
+            view: windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS,
+            sec: windows_sys::Win32::Foundation::HANDLE,
+        }
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                REST_IN_TEST.with(|c| c.set(Duration::ZERO));
+                title_memory_remapped(self.view.Value as usize, LEN);
+                // SAFETY: releasing test mapping & handle.
+                unsafe {
+                    UnmapViewOfFile(self.view);
+                    CloseHandle(self.sec);
+                }
+            }
+        }
+        let _cleanup = Cleanup { view, sec };
+        REST_IN_TEST.with(|c| c.set(Duration::from_millis(60)));
+
+        let start = view.Value as usize;
+        let end = start + LEN;
+        let b0 = start / BLOCK;
+        let mut j = Journal::new_for_test();
+
+        // Prime guards on both blocks.
+        assert!(writes_on(&mut j, start, end, true).is_some());
+        assert!(guards().protected.contains(b0));
+
+        // CPU write faults block 0 -> VEH opens it and records `opened[b0]`.
+        // SAFETY: writing within our mapped test view.
+        unsafe { (start as *mut u32).write_volatile(0x1234_5678) };
+
+        // Immediate check during rest window: reports block 0 dirty AND leaves it unprotected!
+        let (t1, w1) = writes_on(&mut j, start, end, true).expect("check during rest");
+        assert!(w1.iter().any(|&(p, a)| p == b0 && a == t1));
+        assert!(
+            !guards().protected.contains(b0),
+            "resting block must stay writable without re-guarding"
+        );
+
+        // Wait past the 60 ms rest window; next check re-guards block 0 cleanly.
+        std::thread::sleep(Duration::from_millis(80));
+        let (t2, w2) = writes_on(&mut j, start, end, true).expect("check after rest");
+        assert!(w2.iter().any(|&(p, a)| p == b0 && a == t2));
+        assert!(
+            guards().protected.contains(b0),
+            "block must be re-protected once rest window expires"
+        );
     }
 }
 

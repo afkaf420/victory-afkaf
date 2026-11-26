@@ -2065,6 +2065,22 @@ impl HostHeap {
         };
     }
 
+    /// Makes slot `index` a constant buffer view of `buffer` at `gpu`, holding
+    /// a reference to `buffer` in the slot until it is overwritten or freed.
+    pub(crate) fn constant_at_kept(&self, index: u32, buffer: &ID3D12Resource, gpu: u64, size: u32) {
+        self.keep(index, Some(buffer.clone()));
+        let Some(host) = host() else { return };
+        let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
+            BufferLocation: gpu,
+            SizeInBytes: size.next_multiple_of(256),
+        };
+        // SAFETY: a slot of our heap; `buffer` is kept live by the slot.
+        unsafe {
+            host.device
+                .CreateConstantBufferView(Some(&desc), self.cpu(index))
+        };
+    }
+
     fn cpu(&self, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
         D3D12_CPU_DESCRIPTOR_HANDLE {
             ptr: self.cpu + index as usize * self.step as usize,

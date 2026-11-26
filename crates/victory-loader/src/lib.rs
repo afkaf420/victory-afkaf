@@ -40,6 +40,8 @@ mod thunks;
 mod tls;
 #[cfg(windows)]
 mod windows;
+#[cfg(windows)]
+pub mod write_sites;
 
 #[cfg(windows)]
 pub use crash::{

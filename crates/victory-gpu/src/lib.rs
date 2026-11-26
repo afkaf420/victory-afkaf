@@ -15,6 +15,8 @@
 //! share, [`console`] which console model the title sees. Planned:
 //! `present` (swap chain).
 
+#[cfg(windows)]
+mod ambient;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 pub mod console;
@@ -69,6 +71,6 @@ pub use host::on_failure;
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
 #[cfg(windows)]
 pub use watch::{
-    title_memory_reading, title_memory_remapped, title_memory_remapping, title_memory_written,
-    writing as kernel_will_write,
+    clear_console_memory, note_console_memory, title_memory_reading, title_memory_remapped,
+    title_memory_remapping, title_memory_written, writing as kernel_will_write,
 };

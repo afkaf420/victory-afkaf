@@ -10,8 +10,8 @@
 use std::alloc::{Layout, alloc, dealloc};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock, RwLock};
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_COMMITMENT_LIMIT, HANDLE, INVALID_HANDLE_VALUE,
@@ -84,6 +84,164 @@ fn address_range(flags: u64) -> (usize, usize) {
     (1 << 32, (1 << bits) - 1)
 }
 
+/// Per-VA console `(flags, raw_protect)` table preserved across placeholder
+/// map/unmap cycles so `XMemMapPhysicalPages` restores each Low-4GB zone's
+/// exact console protection (`0x1004`/`0x1404`/`0x8404`/`0x2404`/`0x2004`)
+/// while upgrading `PAGE_GRAPHICS_NOACCESS` (`0x0801`) streaming pools to
+/// `CachedGpuRw` (`0x2004`) when physical pages are mapped.
+static VA_PROTECT: RwLock<BTreeMap<usize, (usize, u32, u32)>> = RwLock::new(BTreeMap::new());
+
+fn record_va_protect(base: usize, len: usize, flags: u32, raw_protect: u32) {
+    if base == 0 || len == 0 {
+        return;
+    }
+    let end = base.saturating_add(len);
+    if end <= base {
+        return;
+    }
+    {
+        let mut map = VA_PROTECT.write().unwrap_or_else(|e| e.into_inner());
+        let mut overlapping: Vec<(usize, usize, u32, u32)> = Vec::new();
+        if let Some((&s, &(e, f, p))) = map.range(..base).next_back()
+            && e > base
+        {
+            overlapping.push((s, e, f, p));
+        }
+        for (&s, &(e, f, p)) in map.range(base..end) {
+            overlapping.push((s, e, f, p));
+        }
+        for &(s, _, _, _) in &overlapping {
+            map.remove(&s);
+        }
+        for (s, e, f, p) in overlapping {
+            if s < base {
+                map.insert(s, (base, f, p));
+            }
+            if e > end {
+                map.insert(end, (e, f, p));
+            }
+        }
+        map.insert(base, (end, flags, raw_protect));
+    }
+    victory_gpu::note_console_memory(base, len, flags, raw_protect);
+}
+
+fn clear_va_protect(base: usize, len: usize) {
+    if base == 0 || len == 0 {
+        return;
+    }
+    let end = base.saturating_add(len);
+    if end <= base {
+        return;
+    }
+    let mut map = VA_PROTECT.write().unwrap_or_else(|e| e.into_inner());
+    let mut overlapping: Vec<(usize, usize, u32, u32)> = Vec::new();
+    if let Some((&s, &(e, f, p))) = map.range(..base).next_back()
+        && e > base
+    {
+        overlapping.push((s, e, f, p));
+    }
+    for (&s, &(e, f, p)) in map.range(base..end) {
+        overlapping.push((s, e, f, p));
+    }
+    for &(s, _, _, _) in &overlapping {
+        map.remove(&s);
+    }
+    for (s, e, f, p) in overlapping {
+        if s < base {
+            map.insert(s, (base, f, p));
+        }
+        if e > end {
+            map.insert(end, (e, f, p));
+        }
+    }
+}
+
+/// Restores the console protection classification for newly mapped physical
+/// pages in `[base, base + len)`: preserves explicit zone protections
+/// (`GpuReadOnly`, `WriteCombinedGpuRw`, `CachedGpuRw`, `CoherentGpuRw`) and
+/// promotes `PAGE_GRAPHICS_NOACCESS` (`0x0801`) or unregistered placeholders
+/// to `flags = 0x2, protect = 0x2004` (`CachedGpuRw`).
+fn note_mapped_console_memory(base: usize, len: usize) {
+    const PAGE_GRAPHICS_NOACCESS: u32 = 0x800;
+    const MEM_GRAPHICS: u32 = 0x2;
+    const DEFAULT_MAPPED_PROTECT: u32 = 0x2004;
+    if base == 0 || len == 0 {
+        return;
+    }
+    let end = base.saturating_add(len);
+    if end <= base {
+        return;
+    }
+    let slices: Vec<(usize, usize, u32, u32)> = {
+        let map = VA_PROTECT.read().unwrap_or_else(|e| e.into_inner());
+        let mut out = Vec::new();
+        let mut cur = base;
+        if let Some((_, &(e, f, p))) = map.range(..base).next_back()
+            && e > base
+        {
+            let hi = e.min(end);
+            let (ef, ep) = if (f & MEM_GRAPHICS) != 0 && (p & PAGE_GRAPHICS_NOACCESS) == 0 {
+                (f, p)
+            } else {
+                (MEM_GRAPHICS, DEFAULT_MAPPED_PROTECT)
+            };
+            out.push((base, hi, ef, ep));
+            cur = hi;
+        }
+        if cur < end {
+            for (&s, &(e, f, p)) in map.range(cur..end) {
+                if s > cur {
+                    out.push((cur, s.min(end), MEM_GRAPHICS, DEFAULT_MAPPED_PROTECT));
+                }
+                let lo = s.max(cur);
+                let hi = e.min(end);
+                if lo < hi {
+                    let (ef, ep) = if (f & MEM_GRAPHICS) != 0 && (p & PAGE_GRAPHICS_NOACCESS) == 0 {
+                        (f, p)
+                    } else {
+                        (MEM_GRAPHICS, DEFAULT_MAPPED_PROTECT)
+                    };
+                    out.push((lo, hi, ef, ep));
+                }
+                cur = cur.max(hi);
+                if cur >= end {
+                    break;
+                }
+            }
+            if cur < end {
+                out.push((cur, end, MEM_GRAPHICS, DEFAULT_MAPPED_PROTECT));
+            }
+        }
+        out
+    };
+    for (lo, hi, flags, protect) in slices {
+        victory_gpu::note_console_memory(lo, hi - lo, flags, protect);
+    }
+}
+
+/// Logs the 1st, 2nd, 4th... occurrence of each console `(protect, kind, flags)`
+/// tuple with cumulative MiB to aid PC-native VRAM placement diagnostics.
+fn note_protection(protect: u32, kind: u32, flags: u64, at: usize, size: usize) {
+    type Seen = HashMap<(u32, u32, u64), (u64, usize)>;
+    static SEEN: Mutex<Option<Seen>> = Mutex::new(None);
+    let (n, bytes) = {
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        let e = seen
+            .get_or_insert_with(Default::default)
+            .entry((protect, kind, flags))
+            .or_default();
+        *e = (e.0 + 1, e.1.saturating_add(size));
+        *e
+    };
+    if n.is_power_of_two() {
+        tracing::info!(
+            "title memory asked for as protection {protect:#x}, kind {kind:#x}, flags {flags:#x}: {n} times, {} MB, last {at:#x}+{size:#x}",
+            bytes >> 20
+        );
+    }
+}
+
 pub extern "system" fn XMemVirtualAlloc(
     base: *mut c_void,
     size: usize,
@@ -91,6 +249,8 @@ pub extern "system" fn XMemVirtualAlloc(
     flags: u64,
     protect: u32,
 ) -> *mut c_void {
+    let raw_protect = protect;
+    let raw_kind = kind;
     let (lowest, highest) = address_range(flags);
     let mut requirements = MEM_ADDRESS_REQUIREMENTS {
         LowestStartingAddress: lowest as *mut c_void,
@@ -113,7 +273,12 @@ pub extern "system" fn XMemVirtualAlloc(
     let placeholder = kind & PAGES_64K == PAGES_64K && kind & MEM_COMMIT == 0;
     if placeholder {
         if kind & MEM_REPLACE_PLACEHOLDER != 0 {
-            // Part of a placeholder the title split: it stays one.
+            // Part of a placeholder the title split: it stays one, but still
+            // carries the zone's console protection (e.g. Low-4GB Zones 1..5).
+            if !base.is_null() && size > 0 {
+                record_va_protect(base as usize, size, flags as u32, raw_protect);
+                note_protection(raw_protect, raw_kind, flags, base as usize, size);
+            }
             return base;
         }
         protect = PAGE_NOACCESS;
@@ -184,8 +349,12 @@ pub extern "system" fn XMemVirtualAlloc(
             )
         };
     }
-    if !at.is_null() && !placeholder && (kind & MEM_COMMIT) != 0 {
-        victory_gpu::sparse_uma::on_map(at as usize, size);
+    if !at.is_null() {
+        record_va_protect(at as usize, size, flags as u32, raw_protect);
+        note_protection(raw_protect, raw_kind, flags, at as usize, size);
+        if !placeholder && (kind & MEM_COMMIT) != 0 {
+            victory_gpu::sparse_uma::on_map(at as usize, size);
+        }
     }
     if base.is_null() {
         tracing::debug!(
@@ -352,6 +521,19 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
+            let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            let queried = VirtualQueryEx(
+                GetCurrentProcess(),
+                address,
+                &mut mbi,
+                size_of::<MEMORY_BASIC_INFORMATION>(),
+            );
+            let len = if queried != 0 { mbi.RegionSize } else { 0 };
+            if len > 0 {
+                clear_va_protect(address as usize, len);
+                victory_gpu::clear_console_memory(address as usize, len);
+                victory_gpu::title_memory_remapped(address as usize, len);
+            }
             VirtualFree(address, 0, MEM_RELEASE);
             return;
         }
@@ -400,7 +582,110 @@ fn single_view_watch() -> bool {
     *ON
 }
 
-struct Section(HANDLE);
+/// Number of threads used for page mapping (`VICTORY_MAP_THREADS`, default `1`
+/// to avoid Windows VAD address-space lock contention).
+fn map_threads() -> usize {
+    static N: LazyLock<usize> = LazyLock::new(|| {
+        std::env::var("VICTORY_MAP_THREADS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(1)
+            .clamp(1, 32)
+    });
+    *N
+}
+
+/// Whether already-committed section pages skip redundant `VirtualAlloc(MEM_COMMIT)`
+/// calls (`VICTORY_MAP_LEAN`, default ON, `=0` disables).
+fn map_lean() -> bool {
+    static ON: LazyLock<bool> =
+        LazyLock::new(|| std::env::var_os("VICTORY_MAP_LEAN").is_none_or(|v| v != "0"));
+    *ON
+}
+
+struct Section {
+    handle: HANDLE,
+    pages: usize,
+    /// Persistent whole-section write view (`VICTORY_SECTION_WINDOW`, default ON,
+    /// `=0` disables); `0` if mapping failed or disabled.
+    window: OnceLock<usize>,
+    /// Bit per 64 KiB page already committed via `window()` or `commit_shown()`.
+    committed: Box<[AtomicU64]>,
+}
+
+impl Section {
+    fn new(handle: HANDLE, pages: usize) -> Self {
+        let words = pages.div_ceil(64);
+        let init = if on_wine() { u64::MAX } else { 0 };
+        Self {
+            handle,
+            pages,
+            window: OnceLock::new(),
+            committed: (0..words).map(|_| AtomicU64::new(init)).collect(),
+        }
+    }
+
+    /// Persistent writable address for `n` pages starting at `index`, avoiding
+    /// per-write `MapViewOfFile`/`UnmapViewOfFile` TLB shootdowns
+    /// (`VICTORY_SECTION_WINDOW=0` disables).
+    fn window(&self, index: usize, n: usize) -> Option<usize> {
+        use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
+        static ON: LazyLock<bool> =
+            LazyLock::new(|| std::env::var_os("VICTORY_SECTION_WINDOW").is_none_or(|v| v != "0"));
+        if !*ON || index.checked_add(n).is_none_or(|e| e > self.pages) {
+            return None;
+        }
+        let base = *self.window.get_or_init(|| {
+            // SAFETY: mapping the whole section we own for our write window.
+            unsafe { MapViewOfFile(self.handle, FILE_MAP_WRITE, 0, 0, self.pages * PAGE) }.Value
+                as usize
+        });
+        if base == 0 {
+            return None;
+        }
+        let missing = |page: usize| (self.committed[page / 64].load(Ordering::Acquire) >> (page % 64)) & 1 == 0;
+        let mut page = index;
+        while page < index + n {
+            if !missing(page) {
+                page += 1;
+                continue;
+            }
+            let run = (page..index + n).take_while(|&p| missing(p)).count();
+            if run == 0 {
+                continue;
+            }
+            if !commit(base + page * PAGE, run * PAGE) {
+                return None;
+            }
+            for p in page..page + run {
+                self.committed[p / 64].fetch_or(1u64 << (p % 64), Ordering::AcqRel);
+            }
+            page += run;
+        }
+        Some(base + index * PAGE)
+    }
+
+    /// Commits `len` bytes at `base` (showing pages starting at `index`),
+    /// skipping the syscall when `VICTORY_MAP_LEAN` knows they are already committed.
+    fn commit_shown(&self, index: usize, base: usize, len: usize) -> bool {
+        let pages = index..(index + len / PAGE).min(self.pages);
+        let done = || {
+            pages.clone().all(|p| {
+                (self.committed[p / 64].load(Ordering::Acquire) >> (p % 64)) & 1 != 0
+            })
+        };
+        if map_lean() && done() {
+            return true;
+        }
+        if !commit(base, len) {
+            return false;
+        }
+        for p in pages {
+            self.committed[p / 64].fetch_or(1u64 << (p % 64), Ordering::AcqRel);
+        }
+        true
+    }
+}
 
 // SAFETY: a section handle may be used from any thread.
 unsafe impl Send for Section {}
@@ -409,8 +694,19 @@ unsafe impl Sync for Section {}
 
 impl Drop for Section {
     fn drop(&mut self) {
+        use windows_sys::Win32::System::Memory::UnmapViewOfFile;
+        if let Some(&base) = self.window.get()
+            && base != 0
+        {
+            // SAFETY: our persistent window view; all holders of `Arc<Section>` are gone.
+            unsafe {
+                UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: base as *mut c_void,
+                })
+            };
+        }
         // SAFETY: our handle; views keep the section alive on their own.
-        unsafe { CloseHandle(self.0) };
+        unsafe { CloseHandle(self.handle) };
     }
 }
 
@@ -506,7 +802,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     // For the GPU side's in-place census: only a committed section can be
     // opened as a host heap.
     victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
-    let section = Arc::new(Section(handle));
+    let section = Arc::new(Section::new(handle, n));
     let mut physical = physical();
     let first = physical.next_page;
     physical.next_page += n * FRAMES;
@@ -533,35 +829,58 @@ pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> B
     if pages.is_null() {
         return 0;
     }
-    let mut physical = physical();
-    for i in 0..n {
-        // SAFETY: the title passes `n` page numbers.
-        if let Some(slice) = physical.pages.remove(&unsafe { *pages.add(i) }) {
-            let key = slice.key(0);
-            if !physical.shown.contains_key(&key) {
-                physical.backed.remove(&key);
+    let mut gone = Vec::with_capacity(n);
+    {
+        let mut physical = physical();
+        for i in 0..n {
+            // SAFETY: the title passes `n` page numbers.
+            if let Some(slice) = physical.pages.remove(&unsafe { *pages.add(i) }) {
+                let key = slice.key(0);
+                if !physical.shown.contains_key(&key) {
+                    physical.backed.remove(&key);
+                }
+                gone.push(slice);
             }
         }
     }
+    // Drop `Arc<Section>` outside `physical()` lock so unmapping a persistent
+    // section window never runs while holding the page-table mutex.
+    drop(gone);
     1
 }
 
 /// A view of our own on consecutive slices of one section, committed and
-/// writable, unmapped when dropped.
-struct View {
-    at: MEMORY_MAPPED_VIEW_ADDRESS,
-    len: usize,
+/// writable — backed by `Section::window()` (`VICTORY_SECTION_WINDOW=1`) when
+/// available, or a temporary `MapViewOfFile` unmapped on drop.
+enum View {
+    Window {
+        _section: Arc<Section>,
+        ptr: usize,
+        len: usize,
+    },
+    Temp {
+        at: MEMORY_MAPPED_VIEW_ADDRESS,
+        len: usize,
+    },
 }
 
 impl View {
-    /// Maps `n` slices from `slice` on.
+    /// Opens `n` slices from `slice` on, preferring the persistent section window.
     fn map(slice: &Slice, n: usize) -> Option<View> {
         use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
-        let (offset, len) = ((slice.index * PAGE) as u64, n * PAGE);
+        let len = n * PAGE;
+        if let Some(ptr) = slice.section.window(slice.index, n) {
+            return Some(View::Window {
+                _section: slice.section.clone(),
+                ptr,
+                len,
+            });
+        }
+        let offset = (slice.index * PAGE) as u64;
         // SAFETY: slices of a section we own; the view is ours until dropped.
         let at = unsafe {
             MapViewOfFile(
-                slice.section.0,
+                slice.section.handle,
                 FILE_MAP_WRITE,
                 (offset >> 32) as u32,
                 offset as u32,
@@ -571,23 +890,36 @@ impl View {
         if at.Value.is_null() {
             return None;
         }
-        let view = View { at, len };
-        commit(at.Value as usize, len).then_some(view)
+        let view = View::Temp { at, len };
+        slice
+            .section
+            .commit_shown(slice.index, at.Value as usize, len)
+            .then_some(view)
     }
 
     fn bytes(&mut self) -> &mut [u8] {
-        // SAFETY: the view holds `len` committed read-write bytes, ours
-        // alone while `self` lives (other views of the slices only alias
-        // them, as the console's do).
-        unsafe { std::slice::from_raw_parts_mut(self.at.Value.cast(), self.len) }
+        match self {
+            View::Window { ptr, len, .. } => {
+                // SAFETY: `ptr..ptr+len` lies inside the section's committed
+                // persistent write window kept alive by `_section`.
+                unsafe { std::slice::from_raw_parts_mut(*ptr as *mut u8, *len) }
+            }
+            View::Temp { at, len } => {
+                // SAFETY: the view holds `len` committed read-write bytes, ours
+                // alone while `self` lives.
+                unsafe { std::slice::from_raw_parts_mut(at.Value.cast(), *len) }
+            }
+        }
     }
 }
 
 impl Drop for View {
     fn drop(&mut self) {
-        use windows_sys::Win32::System::Memory::UnmapViewOfFile;
-        // SAFETY: our view.
-        unsafe { UnmapViewOfFile(self.at) };
+        if let View::Temp { at, .. } = self {
+            use windows_sys::Win32::System::Memory::UnmapViewOfFile;
+            // SAFETY: our temporary view.
+            unsafe { UnmapViewOfFile(*at) };
+        }
     }
 }
 
@@ -855,6 +1187,7 @@ pub extern "system" fn XMemMapPhysicalPages(
     // SAFETY: the title passes `n` page numbers.
     let pages = unsafe { std::slice::from_raw_parts(pages, n) };
     let mut i = 0;
+    let _threads = map_threads();
     while i < n {
         let Some(first) = physical.pages.get(&pages[i]).cloned() else {
             tracing::warn!(page = pages[i], "XMemMapPhysicalPages: unknown page");
@@ -875,6 +1208,7 @@ pub extern "system" fn XMemMapPhysicalPages(
         }
         i += run;
     }
+    note_mapped_console_memory(base, n * PAGE);
     address
 }
 
@@ -938,6 +1272,9 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
         if !map(&mut physical, to + k, PAGE, slice) {
             return false;
         }
+    }
+    if from != 0 {
+        note_mapped_console_memory(to, len);
     }
     true
 }
@@ -1009,7 +1346,7 @@ fn promote_view_containing(physical: &mut Physical, addr: usize) -> bool {
     // SAFETY: map the `SEC_RESERVE` section into the restored placeholder.
     let view = unsafe {
         MapViewOfFile3(
-            slice.section.0,
+            slice.section.handle,
             GetCurrentProcess(),
             view_base as *const c_void,
             (slice.index * PAGE) as u64,
@@ -1030,7 +1367,7 @@ fn promote_view_containing(physical: &mut Physical, addr: usize) -> bool {
         rollback_after_free(physical, &saved);
         return false;
     }
-    if !commit(view_base, view_len) {
+    if !slice.section.commit_shown(slice.index, view_base, view_len) {
         // SAFETY: unmap view back to placeholder on commit failure.
         unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
         rollback_after_free(physical, &saved);
@@ -1044,7 +1381,7 @@ fn promote_view_containing(physical: &mut Physical, addr: usize) -> bool {
     victory_gpu::title_memory_view(
         view_base,
         view_len,
-        slice.section.0 as usize,
+        slice.section.handle as usize,
         (slice.index * PAGE) as u64,
     );
     for k in 0..view_len.div_ceil(PAGE) {
@@ -1131,7 +1468,7 @@ fn map_section(physical: &mut Physical, base: usize, len: usize, slice: Slice) -
             MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
         );
         MapViewOfFile3(
-            slice.section.0,
+            slice.section.handle,
             GetCurrentProcess(),
             base as *const c_void,
             (slice.index * PAGE) as u64,
@@ -1151,7 +1488,7 @@ fn map_section(physical: &mut Physical, base: usize, len: usize, slice: Slice) -
         );
         return false;
     }
-    if !commit(base, len) {
+    if !slice.section.commit_shown(slice.index, base, len) {
         // SAFETY: the view just mapped, back to a placeholder.
         unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
         return false;
@@ -1160,7 +1497,7 @@ fn map_section(physical: &mut Physical, base: usize, len: usize, slice: Slice) -
     victory_gpu::title_memory_remapped(base, len);
     victory_gpu::sparse_uma::on_map(base, len);
     // What the range shows now, for the GPU side's in-place census.
-    victory_gpu::title_memory_view(base, len, slice.section.0 as usize, (slice.index * PAGE) as u64);
+    victory_gpu::title_memory_view(base, len, slice.section.handle as usize, (slice.index * PAGE) as u64);
     for k in 0..len.div_ceil(PAGE) {
         let key = slice.key(k);
         physical.shown.entry(key).or_default().push(base + k * PAGE);
@@ -1247,6 +1584,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         let unmap_start = base.max(at);
         let unmap_end = end.min(at + size);
         if unmap_start < unmap_end {
+            victory_gpu::clear_console_memory(unmap_start, unmap_end - unmap_start);
             victory_gpu::sparse_uma::on_unmap(unmap_start, unmap_end - unmap_start);
         }
         for k in 0..size.div_ceil(PAGE) {

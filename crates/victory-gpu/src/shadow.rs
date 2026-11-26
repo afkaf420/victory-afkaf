@@ -105,11 +105,6 @@ struct Card {
     /// this card copy, disabling `copy_diff64` so CPU resets to prior byte
     /// values (e.g. zeroing a GPU-written counter) always upload full dirty pages.
     gpu_written: AtomicBool,
-    /// Highest `Host::fence` value of a graphics submission that uploaded to
-    /// (`COPY_DEST`) or declared a shader write (`UNORDERED_ACCESS`) to this
-    /// card copy. Used by `Host::relay_card_back` to issue zero-wait readbacks
-    /// on the dedicated COPY queue whenever `last_gpu_fence <= completed`.
-    last_gpu_fence: AtomicU64,
 }
 
 /// Whether the host copies of big title buffers are in the card's own
@@ -156,26 +151,47 @@ fn resolve_card_buffers_bytes(env: Option<&str>, high_vram: bool) -> u64 {
     env.and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default_mb) << 20
 }
 
+/// Resolves the minimum title buffer size (in bytes) promoted to card VRAM:
+/// explicit `VICTORY_CARD_BUFFERS_MIN_KB` wins, else explicit
+/// `VICTORY_CARD_BUFFERS_MIN_MB`, else 64 KiB on high-VRAM GPUs (>= 16 GiB)
+/// so small 64 KiB–1 MiB buffers live in GDDR6X instead of crossing PCIe, or
+/// 1 MiB on smaller GPUs.
+fn resolve_card_buffers_min_bytes(min_kb_env: Option<&str>, min_mb_env: Option<&str>, high_vram: bool) -> u64 {
+    if let Some(kb) = min_kb_env.and_then(|v| v.trim().parse::<u64>().ok())
+        && kb > 0
+    {
+        return kb << 10;
+    }
+    if let Some(mb) = min_mb_env.and_then(|v| v.trim().parse::<u64>().ok())
+        && mb > 0
+    {
+        return mb << 20;
+    }
+    if high_vram { 64 << 10 } else { 1 << 20 }
+}
+
 /// The smallest title buffer whose copy goes to the card's memory, and the
 /// most bytes of such copies (their "before" twins not counted: a copy
 /// shaders write takes its size twice), both in bytes:
-/// `VICTORY_CARD_BUFFERS_MIN_MB` (default 1) and `VICTORY_CARD_BUFFERS_MB`
-/// (default 1024, or 4096 when host dedicated VRAM >= 16 GiB).
+/// `VICTORY_CARD_BUFFERS_MIN_KB` (default 64 on >= 16 GiB GPUs),
+/// `VICTORY_CARD_BUFFERS_MIN_MB` (default 1 on smaller GPUs), and
+/// `VICTORY_CARD_BUFFERS_MB` (default 1024, or 4096 on >= 16 GiB GPUs).
 fn card_limits() -> (u64, u64) {
     static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
     *LIMITS.get_or_init(|| {
-        let min = std::env::var("VICTORY_CARD_BUFFERS_MIN_MB")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(1)
-            << 20;
+        let high_vram = crate::host::high_vram();
+        let min_kb = std::env::var("VICTORY_CARD_BUFFERS_MIN_KB").ok();
+        let min_mb = std::env::var("VICTORY_CARD_BUFFERS_MIN_MB").ok();
+        let min = resolve_card_buffers_min_bytes(min_kb.as_deref(), min_mb.as_deref(), high_vram);
         let max_env = std::env::var("VICTORY_CARD_BUFFERS_MB").ok();
-        let max = resolve_card_buffers_bytes(max_env.as_deref(), crate::host::high_vram());
-        // From 1 MiB up and 1,024 MB (or 4,096 MB on >= 16 GiB GPUs) by default:
-        // the shader writes of the smaller buffers are then found by the
-        // card's hashes too, and with that the first room's walls were
-        // drawn in every run.
-        (min.max(1 << 20), max)
+        let max = resolve_card_buffers_bytes(max_env.as_deref(), high_vram);
+        tracing::info!(
+            card_buffers_min_kb = min >> 10,
+            card_buffers_max_mb = max >> 20,
+            high_vram,
+            "card buffer VRAM promotion limits"
+        );
+        (min, max)
     })
 }
 
@@ -544,6 +560,14 @@ fn card_span_of(start: usize, from: usize, to: usize) -> CardSpan {
 fn card_piece_of(start: usize, len: usize, span: &CardSpan, i: u32) -> (usize, usize) {
     let (lo, hi) = piece_at(start, len, (span.first + i) as usize);
     (lo.max(span.from as usize), hi.min(span.to as usize))
+}
+
+/// The offsets [`Shadow::card_hashed`] gives, for a card's buffer of `size`
+/// bytes for title memory from `start` on (widened to 16 bytes, matching
+/// `CARD_COMPARE`).
+fn card_hashed_of(start: usize, size: usize, piece: usize) -> (usize, usize) {
+    let (lo, hi) = piece_at(start, size, piece);
+    (lo & !15, hi.next_multiple_of(16))
 }
 
 #[cfg(test)]
@@ -2738,6 +2762,16 @@ impl Shadow {
         !self.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
     }
 
+    /// Whether shaders of a submission not yet copied back may be writing
+    /// `[from, to)`.
+    pub(crate) fn writes_pending_in(&self, from: usize, to: usize) -> bool {
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|&(a, b)| a < to && b > from)
+    }
+
     /// Whether [`Shadow::update`] of `[address, address + len)` would leave
     /// title bytes behind: a range shaders may be writing holds a page the
     /// title wrote since the copy last took it. The answer comes from the
@@ -3142,20 +3176,10 @@ impl Shadow {
         self.card.is_some()
     }
 
-    /// Records that graphics submission `fence` uploads to or declares a UAV
-    /// write on this card copy (`Host::card_before`).
-    pub(crate) fn note_gpu_write_fence(&self, fence: u64) {
-        if let Some(card) = &self.card {
-            card.last_gpu_fence.fetch_max(fence, Ordering::Release);
-        }
-    }
-
-    /// Highest `Host::fence` value of a graphics submission that writes this
-    /// card copy (0 if none recorded).
-    pub(crate) fn last_gpu_write_fence(&self) -> u64 {
-        self.card
-            .as_ref()
-            .map_or(0, |c| c.last_gpu_fence.load(Ordering::Acquire))
+    /// Whether this buffer is placed in-place directly over title memory
+    /// (`crate::inplace`).
+    pub(crate) fn in_place(&self) -> bool {
+        self.place.is_some()
     }
 
     /// Whether this copy is eligible for 64-byte cacheline diffing
@@ -3257,6 +3281,17 @@ impl Shadow {
     /// The offsets of piece `i` of `span` that lie in the span.
     pub(crate) fn card_piece(&self, span: &CardSpan, i: u32) -> (usize, usize) {
         card_piece_of(self.start as usize, self.len as usize, span, i)
+    }
+
+    /// The piece index holding buffer offset `at`.
+    pub(crate) fn card_piece_of(&self, at: usize) -> u32 {
+        self.pieces(at, at + 1).start as u32
+    }
+
+    /// The 16-byte widened offsets `CARD_COMPARE` hashes for `piece`.
+    pub(crate) fn card_hashed(&self, piece: u32) -> (usize, usize) {
+        let size = self.card.as_ref().map_or(self.len, |c| c.size) as usize;
+        card_hashed_of(self.start as usize, size, piece as usize)
     }
 
     /// The walls trace (`crate::host::walls_trace`): a piece of `fetched`
@@ -3587,7 +3622,6 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     sent: Mutex::default(),
                     size,
                     gpu_written: AtomicBool::new(false),
-                    last_gpu_fence: AtomicU64::new(0),
                 };
                 (on_card, Some(card))
             }
@@ -3805,7 +3839,6 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 sent: Mutex::default(),
                 size: len,
                 gpu_written: AtomicBool::new(false),
-                last_gpu_fence: AtomicU64::new(0),
             };
             (on_card, Some(card))
         }
@@ -3845,7 +3878,6 @@ pub(crate) fn test_card_shadow(len: u64) -> Option<Arc<Shadow>> {
         sent: Mutex::default(),
         size: len,
         gpu_written: AtomicBool::new(false),
-        last_gpu_fence: AtomicU64::new(0),
     });
     Some(Arc::new(s))
 }
@@ -4118,7 +4150,6 @@ mod window_tests {
                 sent: Mutex::default(),
                 size: PAGE as u64,
                 gpu_written: AtomicBool::new(false),
-                last_gpu_fence: std::sync::atomic::AtomicU64::new(0),
             });
             s
         };

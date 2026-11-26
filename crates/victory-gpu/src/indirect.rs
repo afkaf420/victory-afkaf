@@ -20,6 +20,8 @@
 //! dispatches, the budget) cut legitimate work beyond them; raise them if
 //! the title needs more.
 
+pub(crate) mod batch;
+
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -77,9 +79,9 @@ void main(uint3 id : SV_DispatchThreadID) {
         cost = count * instances;
         draw_counts = uint2(count, instances);
     } else if (kind == 2) {
-        uint3 g = min(src_args.Load3(src_at), uint3(65535u, 65535u, 65535u));
+        uint3 g = min(src_args.Load3(src_at), uint3(src_args.Load(src_at) <= WIDEST ? WIDEST : 65535u, 65535u, 65535u));
         // x * y fits 32 bits; the whole count may not.
-        if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
+        if ((g.y != 0 && g.x > GROUPS / g.y) || (g.z != 0 && g.x * g.y > GROUPS / g.z)) {
             g = uint3(0, 0, 0);
         }
         cost = g.x * g.y * g.z * 64u;
@@ -113,7 +115,8 @@ void main(uint3 id : SV_DispatchThreadID) {
         budget.InterlockedOr(0, 0, before);
         [allow_uav_condition]
         while (before < BUDGET) {
-            uint next = (BUDGET - before <= cost) ? BUDGET : (before + cost);
+            uint next = (BUDGET - before < cost) ? (REST ? BUDGET : before) : (before + cost);
+            if (next == before) break;
             uint prev;
             budget.InterlockedCompareExchange(0, before, next, prev);
             if (prev == before) break;
@@ -169,14 +172,43 @@ fn make() -> windows::core::Result<Clamp> {
     make_for(device)
 }
 
+/// Whether an oversized record that exceeds the remaining list budget also
+/// consumes the rest of the budget (`VICTORY_INDIRECT_REST=1`; off by default
+/// so one bad record runs empty without zeroing later valid draws).
+fn rest() -> u32 {
+    u32::from(std::env::var("VICTORY_INDIRECT_REST").is_ok_and(|v| v == "1"))
+}
+
+/// Whether `device` is an AMD adapter (allows >65,535 indirect dispatch groups).
+fn is_amd(device: &ID3D12Device) -> bool {
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory4};
+    // SAFETY: plain DXGI queries.
+    unsafe {
+        CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+            .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter1>(device.GetAdapterLuid()))
+            .and_then(|a| a.GetDesc1())
+            .is_ok_and(|d| d.VendorId == 0x1002)
+    }
+}
+
+fn widest(amd: bool) -> u32 {
+    let on = std::env::var_os("VICTORY_INDIRECT_WIDE").is_none_or(|v| v != "0");
+    if amd && on { 1 << 20 } else { 65_535 }
+}
+
 fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
+    make_from(device, SOURCE)
+}
+
+fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
+    let source = format!("#define WIDEST {}u\n#define REST {}\n{source}", widest(is_amd(device)), rest());
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
     let compiled = unsafe {
         D3DCompile(
-            SOURCE.as_ptr().cast(),
-            SOURCE.len(),
+            source.as_ptr().cast(),
+            source.len(),
             s!("clamp"),
             None,
             None,
@@ -292,6 +324,71 @@ pub(crate) fn bound_ahead(
         Some(dst)
     } else {
         None
+    }
+}
+
+/// The batched clamp's pipeline ([`batch`]).
+fn batch_clamp() -> Option<&'static Clamp> {
+    static CLAMP: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
+    CLAMP
+        .get_or_init(|| {
+            let made = host()
+                .ok_or_else(windows::core::Error::empty)
+                .and_then(|h| make_from(&h.device, batch::SOURCE));
+            match made {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    tracing::warn!(error = %e, "no batched argument clamp: falling back to windows");
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
+/// Opens a batched clamp pass in `list` (`VICTORY_INDIRECT_BATCH`), binding
+/// `source` plus up to `batch::SOURCES - 1` recent argument buffers so all
+/// single-record indirect executions until the next write/sync share ONE
+/// compute clamp pass with zero speculative tail overshoot.
+pub(crate) fn open_batch(
+    list: &HostList,
+    source: (u64, &ID3D12Resource),
+    recent: &[(u64, ID3D12Resource)],
+) -> Option<(batch::Table, ID3D12Resource)> {
+    let c = batch_clamp()?;
+    let budget = list.budget()?;
+    let (jobs, at) = list.scratch(batch::TABLE)?;
+    let (dst, base, before) = list.batch_place()?;
+    let gpu = |b: &ID3D12Resource| {
+        // SAFETY: live D3D12 buffer.
+        Some(unsafe { b.GetGPUVirtualAddress() }).filter(|at| at.is_multiple_of(4))
+    };
+    let mut ids = [0u64; batch::SOURCES];
+    let mut sources = [gpu(source.1)?; batch::SOURCES];
+    ids[0] = source.0;
+    let others = recent.iter().filter(|r| r.0 != source.0).take(batch::SOURCES - 1);
+    for (i, (id, buffer)) in others.enumerate() {
+        if let Some(addr) = gpu(buffer) {
+            list.keep(buffer);
+            (ids[i + 1], sources[i + 1]) = (*id, addr);
+        }
+    }
+    batch::record(c, &list.list, (&dst, before), budget, sources, jobs);
+    list.clear_uav_dirty();
+    // SAFETY: `at` points to `batch::TABLE` bytes of mapped upload memory owned
+    // by `list` until reset.
+    Some((unsafe { batch::Table::new(at, base, ids) }, dst))
+}
+
+fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
+    D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                pResource: std::mem::ManuallyDrop::new(None),
+            }),
+        },
     }
 }
 
@@ -440,18 +537,6 @@ fn done_on(list: &ID3D12GraphicsCommandList, scratch: &ID3D12Resource) {
             D3D12_RESOURCE_STATE_COMMON,
         )])
     };
-}
-
-fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
-    D3D12_RESOURCE_BARRIER {
-        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
-        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-        Anonymous: D3D12_RESOURCE_BARRIER_0 {
-            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
-                pResource: std::mem::ManuallyDrop::new(None),
-            }),
-        },
-    }
 }
 
 #[cfg(test)]
@@ -724,34 +809,41 @@ void main() {
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
-                warp.list.Dispatch(PIECES.div_ceil(64), 1, 1);
+                // 64-thread-per-piece CARD_COMPARE: 1 group per piece.
+                warp.list.Dispatch(PIECES, 1, 1);
             }
             warp.submit_and_wait();
             // SAFETY: as above.
             [0, 1, 2].map(|piece| unsafe { differs_ptr.cast::<u32>().add(piece).read_volatile() })
         };
+        let flags = |r: [u32; 3]| r.map(|d| u32::from(crate::host::card_flagged(d)));
         let at = PIECE + 1234;
         // SAFETY (each): inside the mapping.
         let set = |value: u8| unsafe { now_ptr.add(at).write_volatile(value) };
         // 0: the hashes are stored, nothing is flagged.
         assert_eq!(run(&mut warp, 0), [7, 7, 7]);
-        assert_eq!(run(&mut warp, 1), [0, 0, 0]);
+        let r0 = run(&mut warp, 1);
+        assert_eq!(flags(r0), [0, 0, 0]);
+        // Upper 31 bits must match the CPU AVX2 piece hash (`host::piece_hash`).
+        for p in 0..3 {
+            assert_eq!(r0[p] >> 1, crate::host::piece_hash(&content[p * PIECE..(p + 1) * PIECE]));
+        }
         // A change in the second piece: flagged, and with 1 flagged again
         // (the hash stays the old one).
         set(content[at] ^ 0x40);
-        assert_eq!(run(&mut warp, 1), [0, 1, 0]);
-        assert_eq!(run(&mut warp, 1), [0, 1, 0]);
+        assert_eq!(flags(run(&mut warp, 1)), [0, 1, 0]);
+        assert_eq!(flags(run(&mut warp, 1)), [0, 1, 0]);
         // Changed back: with 1 the piece looks untouched.
         set(content[at]);
-        assert_eq!(run(&mut warp, 1), [0, 0, 0]);
+        assert_eq!(flags(run(&mut warp, 1)), [0, 0, 0]);
         // With 2 the change is flagged once, and the hash is the new one.
         set(content[at] ^ 0x40);
-        assert_eq!(run(&mut warp, 2), [0, 1, 0]);
-        assert_eq!(run(&mut warp, 2), [0, 0, 0]);
+        assert_eq!(flags(run(&mut warp, 2)), [0, 1, 0]);
+        assert_eq!(flags(run(&mut warp, 2)), [0, 0, 0]);
         // Changed back: flagged, where 1 saw nothing.
         set(content[at]);
-        assert_eq!(run(&mut warp, 2), [0, 1, 0]);
-        assert_eq!(run(&mut warp, 2), [0, 0, 0]);
+        assert_eq!(flags(run(&mut warp, 2)), [0, 1, 0]);
+        assert_eq!(flags(run(&mut warp, 2)), [0, 0, 0]);
     }
 
     /// The clamp compiles with the system's compiler and the host takes it.

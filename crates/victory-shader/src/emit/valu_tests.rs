@@ -1920,296 +1920,70 @@ fn m0_constant_masked_and_unbounded_fallback() {
 }
 
 #[test]
-fn vectorized_smem_coalesced_loads_and_legacy_mul_match_on_gpu() {
-    use super::host::Stride;
-    // End-to-end live-GPU + WARP test verifying:
-    // 1. Dynamic `s_buffer_load_dwordx16` unified single-diamond stride dispatch
-    //    on BOTH a raw SRV (`stride != 0`, 4x 128-bit `rawBufferLoad`) and a CBV
-    //    (`stride == 0`, 4x `cbufferLoadLegacy` row-cached).
-    // 2. 4 adjacent scalar `buffer_load_dword` reads on a read-only raw SRV
-    //    coalescing into a single 128-bit `rawBufferLoad` (`mask = 15`).
-    // 3. `v_mul_legacy_f32` exact semantics for `x * x` (incl. -0.0, Inf, NaN),
-    //    finite constant * x, 0.0 * NaN = +0.0, and dynamic 0.0 * Inf = +0.0.
-    const fn s_buffer_load_dwordx16(dst: u8, base: u8, off: u32) -> [u32; 2] {
-        [
-            0x3D << 26 | 0x0C << 18 | (dst as u32) << 6 | (base as u32 >> 1),
-            125 << 25 | (off & 0x001F_FFFF),
-        ]
-    }
-    const fn s_load_dwordx4_off(dst: u8, base: u8, off: u32) -> [u32; 2] {
-        [
-            0x3D << 26 | 0x02 << 18 | (dst as u32) << 6 | (base as u32 >> 1),
-            125 << 25 | (off & 0x001F_FFFF),
-        ]
-    }
-    const fn buffer_load_dword(vdst: u8, srsrc: u8, byte_off: u16) -> [u32; 2] {
-        [
-            0x38 << 26 | 0x0C << 18 | (byte_off as u32 & 0xFFF),
-            0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdst as u32) << 8,
-        ]
-    }
+fn legacy_mul_exact_zero_and_square_semantics_on_gpu() {
+    // End-to-end live-GPU + WARP test verifying `v_mul_legacy_f32` matches
+    // console RDNA2 bit-for-bit across all sign-of-zero, Inf, NaN, and square
+    // cases — including `-2.5 * +0.0 == +0.0` and `+2.5 * -0.0 == +0.0`!
     let v_mov_imm = |dst: u8, lit: u32| [0x7E00_02FF | ((dst as u32) << 17), lit];
-
-    // Descriptor layout:
-    //   slot 0: RootType::Constants (4 dwords: s0..s3)
-    //   slot 1: RootType::ResourceHeap (s4 -> heap[0] dynamic input buffer/CBV)
-    //   slot 2: RootType::Table (s6 -> heap[1] read-only raw SRV, heap[2] output raw UAV)
     let mut w: Vec<u32> = Vec::new();
-    w.push(s_mov_b32(5, 0x80)); // s[4:5] = ResourceHeap base (heap[0])
-    w.push(s_mov_b32(7, 0x80)); // s[6:7] = Table base (heap[1], heap[2])
-    // Load descriptors: s[8:11] = heap[0] (dynamic), s[12:15] = heap[1] (RO SRV), s[16:19] = heap[2] (out UAV)
-    w.extend_from_slice(&s_load_dwordx4_off(8, 4, 0));
-    w.extend_from_slice(&s_load_dwordx4_off(12, 6, 0));
-    w.extend_from_slice(&s_load_dwordx4_off(16, 6, 32));
-    // 1. 16-dword scalar buffer load from heap[0] -> s[20..36], store to out[0..16].
-    w.extend_from_slice(&s_buffer_load_dwordx16(20, 8, 0));
-    for k in 0..16u8 {
-        w.push(vop1(0x001, 4, sgpr(20 + k)));
-        w.extend_from_slice(&buffer_store_dword(4, 16, u16::from(k) * 4));
-    }
-    // 2. 4 adjacent scalar MUBUF loads from heap[1] at offsets 8, 0, 12, 4 -> out[16..20].
-    w.extend_from_slice(&buffer_load_dword(6, 12, 8));
-    w.extend_from_slice(&buffer_load_dword(4, 12, 0));
-    w.extend_from_slice(&buffer_load_dword(7, 12, 12));
-    w.extend_from_slice(&buffer_load_dword(5, 12, 4));
-    for k in 0..4u8 {
-        w.extend_from_slice(&buffer_store_dword(4 + k, 16, 64 + u16::from(k) * 4));
-    }
-    // 3. v_mul_legacy_f32 cases using root constants s0..s3 -> out[20..24]:
-    //    out[20] = s0 * s0 (x * x exact path, tested with -0.0 and -3.5)
-    //    out[21] = 2.5 * s1 (finite constant path)
-    //    out[22] = 0.0 * s2 (constant zero path, tested with NaN)
-    //    out[23] = s2 * s3 (dynamic path, tested with Inf * 0.0 and NaN * 0.0)
+    w.push(s_mov_b32(5, 0x80)); // s[4:5] = Table base (heap[0] = out UAV)
+    w.extend_from_slice(&s_load_dwordx4(8, 4));
     for i in 0..4u8 {
-        w.push(vop1(0x001, 8 + i, sgpr(i)));
+        w.push(vop1(0x001, 4 + i, sgpr(i))); // v4..v7 = s0..s3
     }
-    w.extend_from_slice(&vop3(0x107, 12, vgpr(8), vgpr(8), 0)); // v8 * v8
+    // out[0] = v4 * v4 (x * x fast path)
+    // out[1] = -2.5 * v5 (negative finite constant: MUST yield +0.0 for v5 = +0.0!)
+    // out[2] = +2.5 * v5 (positive finite constant: MUST yield +0.0 for v5 = -0.0!)
+    // out[3] = 0.0 * v6 (constant zero fast path: MUST yield +0.0 for NaN/Inf!)
+    // out[4] = v6 * v7 (dynamic path: NaN * 0.0 = +0.0, Inf * -0.0 = +0.0)
+    w.extend_from_slice(&vop3(0x107, 10, vgpr(4), vgpr(4), 0));
+    w.extend_from_slice(&v_mov_imm(11, (-2.5f32).to_bits()));
+    w.extend_from_slice(&vop3(0x107, 12, vgpr(11), vgpr(5), 0));
     w.extend_from_slice(&v_mov_imm(13, 2.5f32.to_bits()));
-    w.extend_from_slice(&vop3(0x107, 14, vgpr(13), vgpr(9), 0)); // 2.5 * v9
+    w.extend_from_slice(&vop3(0x107, 14, vgpr(13), vgpr(5), 0));
     w.extend_from_slice(&v_mov_imm(15, 0.0f32.to_bits()));
-    w.extend_from_slice(&vop3(0x107, 16, vgpr(15), vgpr(10), 0)); // 0.0 * v10
-    w.extend_from_slice(&vop3(0x107, 17, vgpr(10), vgpr(11), 0)); // v10 * v11
-    w.extend_from_slice(&buffer_store_dword(12, 16, 80));
-    w.extend_from_slice(&buffer_store_dword(14, 16, 84));
-    w.extend_from_slice(&buffer_store_dword(16, 16, 88));
-    w.extend_from_slice(&buffer_store_dword(17, 16, 92));
+    w.extend_from_slice(&vop3(0x107, 16, vgpr(15), vgpr(6), 0));
+    w.extend_from_slice(&vop3(0x107, 17, vgpr(6), vgpr(7), 0));
+    w.extend_from_slice(&buffer_store_dword(10, 8, 0));
+    w.extend_from_slice(&buffer_store_dword(12, 8, 4));
+    w.extend_from_slice(&buffer_store_dword(14, 8, 8));
+    w.extend_from_slice(&buffer_store_dword(16, 8, 12));
+    w.extend_from_slice(&buffer_store_dword(17, 8, 16));
     w.push(S_ENDPGM);
 
-    let code: Vec<u8> = w.iter().flat_map(|x| x.to_le_bytes()).collect();
-    let native = NativeProgram {
-        stage: HwStage::Cs,
-        wave64: false,
-        vgprs: 20,
-        layout: vec![
-            RootParam {
-                root: RootType::Constants,
-                table_offset_dwords: 0,
-                sgprs: 4,
-                base_register: 0,
-                user_data: 0,
-                slot: 0,
-            },
-            RootParam {
-                root: RootType::ResourceHeap,
-                table_offset_dwords: 0,
-                sgprs: 1,
-                base_register: 0,
-                user_data: 4,
-                slot: 1,
-            },
-            RootParam {
-                root: RootType::Table,
-                table_offset_dwords: 0,
-                sgprs: 1,
-                base_register: 0,
-                user_data: 6,
-                slot: 2,
-            },
-        ],
-        used: vec![
-            // Table slot 2 offset 0 (heap[1]) is a known read-only SRV (coalescing target)
-            UsedResource {
-                kind: ResourceType::Srv,
-                root: RootType::Table,
-                table_offset_dwords: 0,
-                lower_bound: 0,
-                stride: 0,
-                dwords: 4,
-                user_data: 6,
-                slot: 2,
-            },
-            // Table slot 2 offset 32 B = 8 dwords (heap[2]) is the output raw UAV
-            UsedResource {
-                kind: ResourceType::Uav,
-                root: RootType::Table,
-                table_offset_dwords: 8,
-                lower_bound: 0,
-                stride: 0,
-                dwords: 4,
-                user_data: 6,
-                slot: 2,
-            },
-        ],
-        io: StageIo::Cs(ComputeIo {
-            rsrc2: 7 << 1,
-            threads: [1, 1, 1],
-        }),
-        code,
-    };
-    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    let st = structure::structure(&p).expect("structure");
-    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource");
-    let io = io::raise(&p, &native).expect("io::raise");
-    let lowered = lower::lower(&lower::Parts {
-        native: &native,
-        p: &p,
-        st: &st,
-        io: &io,
-        res: &res,
-        inputs: Vec::new(),
-        outputs: Vec::new(),
-        prims: Vec::new(),
-        mesh_stride: 0,
-    })
-    .expect("lower");
-
-    let mut shader = HostShader {
-        stage: HwStage::Cs,
-        dxil: lowered.dxil,
-        user_data: lowered.user_data,
-        samplers: lowered.samplers,
-        static_samplers: Vec::new(),
-        root_cbvs: lowered.root_cbvs,
-        root_srvs: lowered.root_srvs,
-        root_uavs: lowered.root_uavs,
-        root_indexed_views: Vec::new(),
-    };
-    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
-        v.validate(&mut shader.dxil).expect("DXIL validation failed");
-    }
-    assert!(
-        shader.root_srvs.contains(&super::SLOT_STRIDES),
-        "dynamic heap[0] s_buffer_load_dwordx16 must use SLOT_STRIDES unified diamond"
+    let (shader, _) = lower_m0_test_cs(&w, 20);
+    let pos_zero = 0.0f32.to_bits();
+    let neg_zero = (-0.0f32).to_bits();
+    let nan = 0x7FC0_0000u32;
+    let inf = f32::INFINITY.to_bits();
+    // Case 1: s0=-0.0, s1=+0.0, s2=NaN, s3=0.0 -> all zero results MUST be +0.0 (0x0000_0000)!
+    let out1 = run_m0_test_cs(&shader, [neg_zero, pos_zero, nan, pos_zero], 5);
+    assert_eq!(out1, [pos_zero, pos_zero, pos_zero, pos_zero, pos_zero]);
+    // Case 2: s0=-3.5, s1=-0.0, s2=Inf, s3=-0.0 -> (-3.5)^2 = 12.25; all zero results MUST be +0.0!
+    let out2 = run_m0_test_cs(&shader, [(-3.5f32).to_bits(), neg_zero, inf, neg_zero], 5);
+    assert_eq!(
+        out2,
+        [12.25f32.to_bits(), pos_zero, pos_zero, pos_zero, pos_zero]
     );
-
-    let smem_data: [u32; 16] = std::array::from_fn(|i| 0x1000_0000 + (i as u32) * 0x0101_0101);
-    let srv_data: [u32; 4] = [0xDEAD_0001, 0xDEAD_0002, 0xDEAD_0003, 0xDEAD_0004];
-    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-    let mut ran_any = false;
-    for (label, warp) in [("hardware", false), ("warp", true)] {
-        let Ok(host) = Host::new(warp) else {
-            continue;
-        };
-        let (root, pso) = match host.compute_pipeline(&shader) {
-            Ok(p) => p,
-            Err(e) if warp => {
-                eprintln!("{label}: compute_pipeline skipped ({e})");
-                continue;
-            }
-            Err(e) => panic!("{label}: compute_pipeline failed: {e}"),
-        };
-        ran_any = true;
-        // Case A: heap[0] is a Raw Buffer SRV (stride != 0), s0=-0.0, s1=-4.0, s2=NaN, s3=0.0
-        // Case B: heap[0] is a CBV (stride == 0), s0=-3.5, s1=3.0, s2=Inf, s3=-0.0
-        for (mode, use_cbv, inputs, exp_mul) in [
-            (
-                "raw-srv",
-                false,
-                [
-                    (-0.0f32).to_bits(),
-                    (-4.0f32).to_bits(),
-                    0x7FC0_0000,
-                    0.0f32.to_bits(),
-                ],
-                [
-                    0.0f32.to_bits(), // (-0.0)^2 = +0.0 (exact sign!)
-                    (-10.0f32).to_bits(),
-                    0.0f32.to_bits(), // 0.0 * NaN = +0.0
-                    0.0f32.to_bits(), // NaN * 0.0 = +0.0
-                ],
-            ),
-            (
-                "cbv",
-                true,
-                [
-                    (-3.5f32).to_bits(),
-                    3.0f32.to_bits(),
-                    f32::INFINITY.to_bits(),
-                    (-0.0f32).to_bits(),
-                ],
-                [
-                    12.25f32.to_bits(), // (-3.5)^2 = 12.25
-                    7.5f32.to_bits(),
-                    0.0f32.to_bits(), // 0.0 * Inf = +0.0
-                    0.0f32.to_bits(), // Inf * -0.0 = +0.0
-                ],
-            ),
-        ] {
-            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
-            for u in &shader.user_data {
-                ud[u.index as usize] = match (u.root, u.slot) {
-                    (RootType::Constants, 0) => inputs[u.dword as usize],
-                    (RootType::ResourceHeap, 1) => 0,
-                    (RootType::Table, 2) => 32,
-                    other => panic!("unexpected user data {other:?}"),
-                };
-            }
-            let v0 = if use_cbv {
-                View::Cbv(&smem_data)
-            } else {
-                View::Buffer {
-                    data: &smem_data,
-                    stride: Stride::Raw,
-                }
-            };
-            let views = [
-                v0,
-                View::Buffer {
-                    data: &srv_data,
-                    stride: Stride::Raw,
-                },
-                View::RawUav(24),
-            ];
-            let strides = vec![if use_cbv { 0 } else { 4 }, 4, 4, 0];
-            let out = host
-                .dispatch(
-                    &root,
-                    &pso,
-                    &Dispatch {
-                        roots: vec![
-                            (0, Root::Constants(ud.clone())),
-                            (
-                                1,
-                                Root::View {
-                                    srv: true,
-                                    data: strides,
-                                },
-                            ),
-                        ],
-                        views: &views,
-                        samplers: &[],
-                        groups: [1, 1, 1],
-                    },
-                )
-                .unwrap_or_else(|e| panic!("{label}/{mode}: dispatch failed: {e}"));
-            assert_eq!(
-                &out[0][0..16],
-                &smem_data,
-                "{label}/{mode}: s_buffer_load_dwordx16 mismatch (full out={:08X?}, ud={ud:?}, root_srvs={:?})",
-                out[0],
-                shader.root_srvs
-            );
-            assert_eq!(
-                &out[0][16..20],
-                &srv_data,
-                "{label}/{mode}: coalesced 4x buffer_load_dword mismatch"
-            );
-            assert_eq!(
-                &out[0][20..24],
-                &exp_mul,
-                "{label}/{mode}: v_mul_legacy_f32 mismatch"
-            );
-        }
-    }
-    assert!(ran_any, "need hardware GPU or WARP to execute test");
+    // Case 3: s0=2.0, s1=3.0, s2=-4.0, s3=1.5 -> ordinary products match.
+    let out3 = run_m0_test_cs(
+        &shader,
+        [
+            2.0f32.to_bits(),
+            3.0f32.to_bits(),
+            (-4.0f32).to_bits(),
+            1.5f32.to_bits(),
+        ],
+        5,
+    );
+    assert_eq!(
+        out3,
+        [
+            4.0f32.to_bits(),
+            (-7.5f32).to_bits(),
+            7.5f32.to_bits(),
+            pos_zero,
+            (-6.0f32).to_bits(),
+        ]
+    );
 }

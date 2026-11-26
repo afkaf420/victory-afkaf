@@ -27,6 +27,7 @@ pub mod lifecycle;
 pub mod media;
 #[cfg(windows)]
 pub mod net;
+pub mod rpcrt4;
 pub mod speech;
 pub mod storage;
 pub mod xasync;
@@ -53,6 +54,7 @@ pub(crate) fn all() -> Vec<HleModule> {
         d3d12x::module(),
         audio::module(),
         dsp::module(),
+        rpcrt4::module(),
         xg::module(),
     ];
     #[cfg(windows)]
