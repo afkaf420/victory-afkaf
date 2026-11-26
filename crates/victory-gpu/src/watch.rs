@@ -1790,16 +1790,44 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
 /// does.
 static MAPPING: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
+/// Counts entries and exits of [`title_memory_remapping`]: odd while a remap
+/// is in progress, even when idle (used by [`change_over`]).
+static CHANGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Waits briefly (up to 2 ms) for an in-progress title memory remapping to
+/// finish so a `VICTORY_TEXTURE_NO_WAIT` / `VICTORY_TEXTURE_FILL` kernel read
+/// sees re-mapped pages instead of the transient unmap gap.
+pub(crate) fn change_over() {
+    let now = CHANGES.load(std::sync::atomic::Ordering::SeqCst);
+    if now.is_multiple_of(2) {
+        return;
+    }
+    let started = std::time::Instant::now();
+    while CHANGES.load(std::sync::atomic::Ordering::SeqCst) == now && started.elapsed().as_millis() < 2 {
+        for _ in 0..50 {
+            std::hint::spin_loop();
+        }
+    }
+}
+
 /// What the runtime holds while it changes what title memory shows
 /// ([`title_memory_remapping`]).
 pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>);
+
+impl Drop for Remapping {
+    fn drop(&mut self) {
+        CHANGES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
 
 /// The runtime is about to map, unmap or move physical pages of title
 /// memory: until what it returns is dropped, no read of title memory in
 /// place is under way and none begins ([`title_memory_reading`]). Taken
 /// around the whole change, the unmapping and the mapping again.
 pub fn title_memory_remapping() -> Remapping {
-    Remapping(MAPPING.write().unwrap_or_else(|e| e.into_inner()))
+    let changing = MAPPING.write().unwrap_or_else(|e| e.into_inner());
+    CHANGES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    Remapping(changing)
 }
 
 /// What a read of title memory in place holds ([`title_memory_reading`]).

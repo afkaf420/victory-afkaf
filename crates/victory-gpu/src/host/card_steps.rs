@@ -8,22 +8,22 @@ use std::sync::Arc;
 use super::*;
 use crate::shadow::Shadow;
 
-/// Resolves `VICTORY_CARD_STEPS` (default `2`: constant buffers and buffer
-/// copies; `1`: constant buffers only; `0`: disabled).
+/// Resolves `VICTORY_CARD_STEPS` (default `1`: constant buffers only;
+/// `2`: constant buffers and buffer copies; `0`: disabled).
 pub(super) fn resolve_stage(env: Option<&str>) -> u32 {
     match env.map(str::trim) {
         Some("0") => 0,
         Some("1") => 1,
         Some("2") => 2,
-        _ => 2,
+        _ => 1,
     }
 }
 
-/// The stage (`VICTORY_CARD_STEPS`; default `2`): `1` constant buffers of
-/// descriptor tables (`Step::Fill` with a slot of its own), `2` the title's
-/// buffer copies (`Step::Copy`) and upload-buffer fills too, with the steps
-/// of the same submission that depend on them. Only with the relay's second
-/// stage (`relay_exact`). `0` disables.
+/// The stage (`VICTORY_CARD_STEPS`; default `1`): `1` constant buffers of
+/// descriptor tables (`Step::Fill` with a slot of its own), `2` (opt-in) the
+/// title's buffer copies (`Step::Copy`) and upload-buffer fills too, with the
+/// steps of the same submission that depend on them. Only with the relay's
+/// second stage (`relay_exact`). `0` disables.
 pub(super) fn stage() -> u32 {
     static STAGE: OnceLock<u32> = OnceLock::new();
     *STAGE.get_or_init(|| {
@@ -799,9 +799,9 @@ mod tests {
     }
 
     #[test]
-    fn card_steps_defaults_to_stage_2_and_honors_overrides() {
-        assert_eq!(resolve_stage(None), 2);
-        assert_eq!(resolve_stage(Some("")), 2);
+    fn card_steps_defaults_to_stage_1_and_honors_overrides() {
+        assert_eq!(resolve_stage(None), 1);
+        assert_eq!(resolve_stage(Some("")), 1);
         assert_eq!(resolve_stage(Some("0")), 0);
         assert_eq!(resolve_stage(Some("1")), 1);
         assert_eq!(resolve_stage(Some("2")), 2);

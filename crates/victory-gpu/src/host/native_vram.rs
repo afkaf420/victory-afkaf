@@ -1,16 +1,16 @@
-//! PC-Native VRAM Promotion — Move 1 (`VICTORY_NATIVE_VRAM`, default ON).
+//! PC-Native VRAM Promotion — Move 1 (`VICTORY_NATIVE_VRAM`, default safe mode `1`).
 //!
 //! Queries [`crate::watch::console_mem_class_ranges`] for every declared UAV
 //! write range on a card-backed [`crate::shadow::Shadow`] in
-//! [`super::Host::card_before`], dropping sub-ranges classified as:
-//! - [`ConsoleMemClass::GpuReadOnly`] (`0x1004` / `0x1404` / `0x8404`)
-//! - [`ConsoleMemClass::WriteCombinedGpuRw`] (`0x2404`)
-//!
-//! Pure `GpuReadOnly` and `WriteCombinedGpuRw` card buffers therefore never
-//! allocate `Card::before`, never run GPU rehash/compare passes, and never
-//! read back over PCIe. Mixed super-buffers (such as a Low-4GB `Z3+Z4+Z5`
-//! heap) clip GPU compare and PCIe readback strictly to Zone 5
-//! (`CachedGpuRw`), `CoherentGpuRw`, and any unclassified (`Unknown`) spans.
+//! [`super::Host::card_before`]:
+//! - Mode `1` (default when unset/empty/`1`/`true`): drops **ONLY**
+//!   [`ConsoleMemClass::GpuReadOnly`] (`0x1004` / `0x1404` / `0x8404`) sub-ranges,
+//!   keeping `WriteCombinedGpuRw` (`0x2404`) intact to avoid partial 4 KiB page
+//!   CPU-write clobber and stale CPU-side reads (`Step::Texture`, `ValueWait`, etc.).
+//! - Mode `2` (opt-in `VICTORY_NATIVE_VRAM=2` or `wc`): drops both
+//!   [`ConsoleMemClass::GpuReadOnly`] and [`ConsoleMemClass::WriteCombinedGpuRw`].
+//! - Mode `0` (`0` / `off` / `false`): disabled (all declared card UAV ranges
+//!   are compared and read back).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -18,29 +18,51 @@ use std::sync::{Arc, OnceLock};
 use crate::shadow::Shadow;
 use crate::watch::ConsoleMemClass;
 
-/// Resolves `VICTORY_NATIVE_VRAM`: enabled by default; `0`, `off`, or `false`
-/// disables it.
-fn resolve_on(env: Option<&str>) -> bool {
-    match env.map(|v| v.trim().to_ascii_lowercase()) {
-        Some(ref s) if s == "0" || s == "off" || s == "false" => false,
-        _ => true,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mode {
+    /// Disabled (`0` / `off` / `false`).
+    Off,
+    /// Safe default (`1` / unset): drop `GpuReadOnly` only.
+    ReadOnly,
+    /// Aggressive opt-in (`2` / `wc`): drop `GpuReadOnly` + `WriteCombinedGpuRw`.
+    ReadOnlyAndWc,
+}
+
+impl Mode {
+    fn code(self) -> u32 {
+        match self {
+            Mode::Off => 0,
+            Mode::ReadOnly => 1,
+            Mode::ReadOnlyAndWc => 2,
+        }
     }
 }
 
-/// Whether Move 1 (`VICTORY_NATIVE_VRAM`) is enabled. Logs a startup summary
-/// on first evaluation.
-pub(super) fn on() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
+/// Resolves `VICTORY_NATIVE_VRAM`: default safe mode `1` (`ReadOnly`);
+/// `2` / `wc` opts into dropping `WriteCombinedGpuRw` too; `0` / `off` / `false`
+/// disables.
+fn resolve_mode(env: Option<&str>) -> Mode {
+    match env.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        Some("0" | "off" | "false") => Mode::Off,
+        Some("2" | "wc") => Mode::ReadOnlyAndWc,
+        _ => Mode::ReadOnly,
+    }
+}
+
+/// Active `VICTORY_NATIVE_VRAM` mode. Logs a startup summary on first query.
+fn mode() -> Mode {
+    static MODE: OnceLock<Mode> = OnceLock::new();
+    *MODE.get_or_init(|| {
         let env = std::env::var("VICTORY_NATIVE_VRAM").ok();
-        let active = resolve_on(env.as_deref());
+        let active = resolve_mode(env.as_deref());
         tracing::info!(
-            active,
-            "PC-native VRAM promotion (VICTORY_NATIVE_VRAM): {}",
-            if active {
-                "ON (dropping GpuReadOnly and WriteCombinedGpuRw sub-ranges from Card::before, GPU compare, and PCIe readback)"
-            } else {
-                "OFF (comparing and reading back all declared card UAV ranges)"
+            mode = active.code(),
+            "PC-native VRAM promotion (VICTORY_NATIVE_VRAM={}): {}",
+            active.code(),
+            match active {
+                Mode::Off => "OFF (comparing and reading back all declared card UAV ranges)",
+                Mode::ReadOnly => "SAFE (dropping GpuReadOnly sub-ranges only; WriteCombinedGpuRw kept intact)",
+                Mode::ReadOnlyAndWc => "AGGRESSIVE (dropping GpuReadOnly and WriteCombinedGpuRw sub-ranges from Card::before, GPU compare, and PCIe readback)",
             }
         );
         active
@@ -48,8 +70,15 @@ pub(super) fn on() -> bool {
 }
 
 #[inline]
-fn drop_readback(class: ConsoleMemClass) -> bool {
-    matches!(class, ConsoleMemClass::GpuReadOnly | ConsoleMemClass::WriteCombinedGpuRw)
+fn drop_readback(class: ConsoleMemClass, mode: Mode) -> bool {
+    match mode {
+        Mode::Off => false,
+        Mode::ReadOnly => class == ConsoleMemClass::GpuReadOnly,
+        Mode::ReadOnlyAndWc => matches!(
+            class,
+            ConsoleMemClass::GpuReadOnly | ConsoleMemClass::WriteCombinedGpuRw
+        ),
+    }
 }
 
 /// Per-interval counters reset on each periodic summary log:
@@ -62,14 +91,13 @@ static PERIOD: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 /// `[0]` total dropped ranges, `[1]` total dropped bytes, `[2]` total shadows skipped.
 static TOTAL: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
-/// Filters `[from, to)` against console memory classifications. When `enabled`
-/// is true, sub-ranges classified as `GpuReadOnly` or `WriteCombinedGpuRw` are
-/// dropped; adjacent kept sub-ranges are coalesced.
-fn filter_range(from: usize, to: usize, enabled: bool, record_stats: bool) -> Vec<(usize, usize)> {
+/// Filters `[from, to)` against console memory classifications under `mode`.
+/// Adjacent kept sub-ranges are coalesced.
+fn filter_range(from: usize, to: usize, active: Mode, record_stats: bool) -> Vec<(usize, usize)> {
     if from >= to {
         return Vec::new();
     }
-    if !enabled {
+    if active == Mode::Off {
         return vec![(from, to)];
     }
     let parts = crate::watch::console_mem_class_ranges(from, to);
@@ -79,7 +107,7 @@ fn filter_range(from: usize, to: usize, enabled: bool, record_stats: bool) -> Ve
     let mut kept_b = 0u64;
     for (lo, hi, class) in parts {
         let len = (hi - lo) as u64;
-        if drop_readback(class) {
+        if drop_readback(class, active) {
             if class == ConsoleMemClass::GpuReadOnly {
                 drop_ro_n += 1;
                 drop_ro_b += len;
@@ -121,13 +149,13 @@ fn filter_range(from: usize, to: usize, enabled: bool, record_stats: bool) -> Ve
     kept
 }
 
-/// Coalesces each shadow's declared UAV write ranges and, when
-/// `VICTORY_NATIVE_VRAM` is enabled, drops `GpuReadOnly` and
-/// `WriteCombinedGpuRw` sub-ranges. Shadows whose ranges drop completely are
-/// removed from `declared` so they never allocate `Card::before`, never run
-/// GPU compare, and never read back over PCIe.
+/// Coalesces each shadow's declared UAV write ranges and filters them under
+/// `VICTORY_NATIVE_VRAM`. Shadows whose ranges drop completely are removed
+/// from `declared` so they never allocate `Card::before`, never run GPU
+/// compare, and never read back over PCIe.
 pub(super) fn filter_declared(declared: &mut Vec<(Arc<Shadow>, Vec<(usize, usize)>)>) {
-    if declared.is_empty() || !on() {
+    let active = mode();
+    if declared.is_empty() || active == Mode::Off {
         return;
     }
     let mut skipped_shadows = 0u64;
@@ -135,7 +163,7 @@ pub(super) fn filter_declared(declared: &mut Vec<(Arc<Shadow>, Vec<(usize, usize
         super::join_ranges(ranges, std::iter::empty());
         let mut filtered = Vec::new();
         for &(from, to) in ranges.iter() {
-            filtered.extend(filter_range(from, to, true, true));
+            filtered.extend(filter_range(from, to, active, true));
         }
         *ranges = filtered;
         if ranges.is_empty() {
@@ -152,7 +180,8 @@ pub(super) fn filter_declared(declared: &mut Vec<(Arc<Shadow>, Vec<(usize, usize
 /// Logs the periodic summary of native-VRAM skipped bytes and ranges (called
 /// from `Meter` every 5 seconds).
 pub(super) fn log_periodic() {
-    if !on() {
+    let active = mode();
+    if active == Mode::Off {
         return;
     }
     let p: [u64; 7] = std::array::from_fn(|i| PERIOD[i].swap(0, Ordering::Relaxed));
@@ -163,9 +192,10 @@ pub(super) fn log_periodic() {
         return;
     }
     tracing::info!(
-        "PC-native VRAM promotion (VICTORY_NATIVE_VRAM=1): skipped {:.1} MB across {} ranges \
+        "PC-native VRAM promotion (VICTORY_NATIVE_VRAM={}): skipped {:.1} MB across {} ranges \
          (GpuReadOnly {:.1} MB / {}, WriteCombinedGpuRw {:.1} MB / {}, {} pure buffers omitted), \
          kept {:.1} MB / {} ranges; cumulative skipped {:.1} MB ({} ranges, {} pure buffers)",
+        active.code(),
         (p[1] + p[3]) as f64 / (1024.0 * 1024.0),
         p[0] + p[2],
         p[1] as f64 / (1024.0 * 1024.0),
@@ -195,20 +225,22 @@ mod tests {
     const PAGE_GRAPHICS_NOACCESS: u32 = 0x800;
 
     #[test]
-    fn native_vram_defaults_on_and_honors_overrides() {
-        assert!(resolve_on(None));
-        assert!(resolve_on(Some("")));
-        assert!(resolve_on(Some("1")));
-        assert!(resolve_on(Some("true")));
-        assert!(!resolve_on(Some("0")));
-        assert!(!resolve_on(Some("off")));
-        assert!(!resolve_on(Some("OFF")));
-        assert!(!resolve_on(Some("false")));
+    fn native_vram_mode_defaults_safe_and_honors_overrides() {
+        assert_eq!(resolve_mode(None), Mode::ReadOnly);
+        assert_eq!(resolve_mode(Some("")), Mode::ReadOnly);
+        assert_eq!(resolve_mode(Some("1")), Mode::ReadOnly);
+        assert_eq!(resolve_mode(Some("true")), Mode::ReadOnly);
+        assert_eq!(resolve_mode(Some("2")), Mode::ReadOnlyAndWc);
+        assert_eq!(resolve_mode(Some("wc")), Mode::ReadOnlyAndWc);
+        assert_eq!(resolve_mode(Some("WC")), Mode::ReadOnlyAndWc);
+        assert_eq!(resolve_mode(Some("0")), Mode::Off);
+        assert_eq!(resolve_mode(Some("off")), Mode::Off);
+        assert_eq!(resolve_mode(Some("OFF")), Mode::Off);
+        assert_eq!(resolve_mode(Some("false")), Mode::Off);
     }
 
     #[test]
-    fn pure_gpu_read_only_and_wc_gpu_rw_drop_completely() {
-        // High synthetic addresses isolated from other tests.
+    fn mode_1_drops_only_gpu_read_only_and_mode_2_also_drops_wc_gpu_rw() {
         let base = 0x0000_5100_0000_0000usize;
         let m = 1usize << 20;
         // 0x1004 (RO), 0x1404 (WC+RO), 0x8404 (WC+ExecRead), 0x2404 (WC+RW).
@@ -232,14 +264,26 @@ mod tests {
             PAGE_GRAPHICS_READWRITE | PAGE_WRITECOMBINE | PAGE_READWRITE,
         );
 
-        assert!(filter_range(base, base + 16 * m, true, false).is_empty());
-        assert_eq!(filter_range(base, base + 16 * m, false, false), vec![(base, base + 16 * m)]);
+        // Mode 0 (Off): keeps everything.
+        assert_eq!(
+            filter_range(base, base + 16 * m, Mode::Off, false),
+            vec![(base, base + 16 * m)]
+        );
+        // Mode 1 (Safe default): drops the 3 GpuReadOnly ranges [0..12M), keeps WC+RW [12M..16M).
+        assert_eq!(
+            filter_range(base, base + 16 * m, Mode::ReadOnly, false),
+            vec![(base + 12 * m, base + 16 * m)]
+        );
+        // Pure GpuReadOnly drops completely in Mode 1.
+        assert!(filter_range(base, base + 12 * m, Mode::ReadOnly, false).is_empty());
+        // Mode 2 (Aggressive opt-in): drops both GpuReadOnly and WriteCombinedGpuRw.
+        assert!(filter_range(base, base + 16 * m, Mode::ReadOnlyAndWc, false).is_empty());
 
         crate::watch::clear_console_memory(base, 16 * m);
     }
 
     #[test]
-    fn mixed_174mb_super_buffer_clips_strictly_to_zone_5() {
+    fn mixed_174mb_super_buffer_clips_by_mode() {
         let base = 0x0000_5200_0000_0000usize;
         let m = 1usize << 20;
         let z3_len = 60 * m;
@@ -269,10 +313,21 @@ mod tests {
             PAGE_GRAPHICS_READWRITE | PAGE_READWRITE,
         );
 
-        let kept = filter_range(base, base + total, true, false);
-        assert_eq!(kept, vec![(base + z3_len + z4_len, base + total)]);
-        // Disabled: keeps the entire 174 MiB span untouched.
-        assert_eq!(filter_range(base, base + total, false, false), vec![(base, base + total)]);
+        // Mode 1 (Safe default): drops Z3, keeps coalesced Z4+Z5.
+        assert_eq!(
+            filter_range(base, base + total, Mode::ReadOnly, false),
+            vec![(base + z3_len, base + total)]
+        );
+        // Mode 2 (Aggressive opt-in): drops Z3+Z4, clips strictly to Z5.
+        assert_eq!(
+            filter_range(base, base + total, Mode::ReadOnlyAndWc, false),
+            vec![(base + z3_len + z4_len, base + total)]
+        );
+        // Mode 0 (Off): keeps the entire 174 MiB span untouched.
+        assert_eq!(
+            filter_range(base, base + total, Mode::Off, false),
+            vec![(base, base + total)]
+        );
 
         crate::watch::clear_console_memory(base, total);
     }
@@ -292,7 +347,7 @@ mod tests {
             PAGE_GRAPHICS_COHERENT | PAGE_GRAPHICS_READWRITE | PAGE_READWRITE,
         );
         // [4M..6M): Unknown gap (unregistered -> keep, merges into [0..6M))
-        // [6M..8M): WriteCombinedGpuRw (DROP!)
+        // [6M..8M): WriteCombinedGpuRw (kept in Mode 1, dropped in Mode 2)
         crate::watch::note_console_memory(
             base + 6 * m,
             2 * m,
@@ -307,8 +362,14 @@ mod tests {
             PAGE_GRAPHICS_NOACCESS | PAGE_READWRITE,
         );
 
-        let kept = filter_range(base, base + 10 * m, true, false);
-        assert_eq!(kept, vec![(base, base + 6 * m), (base + 8 * m, base + 10 * m)]);
+        assert_eq!(
+            filter_range(base, base + 10 * m, Mode::ReadOnly, false),
+            vec![(base, base + 10 * m)]
+        );
+        assert_eq!(
+            filter_range(base, base + 10 * m, Mode::ReadOnlyAndWc, false),
+            vec![(base, base + 6 * m), (base + 8 * m, base + 10 * m)]
+        );
 
         crate::watch::clear_console_memory(base, 10 * m);
     }

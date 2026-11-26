@@ -153,9 +153,9 @@ fn resolve_card_buffers_bytes(env: Option<&str>, high_vram: bool) -> u64 {
 
 /// Resolves the minimum title buffer size (in bytes) promoted to card VRAM:
 /// explicit `VICTORY_CARD_BUFFERS_MIN_KB` wins, else explicit
-/// `VICTORY_CARD_BUFFERS_MIN_MB`, else 64 KiB on high-VRAM GPUs (>= 16 GiB)
-/// so small 64 KiB–1 MiB buffers live in GDDR6X instead of crossing PCIe, or
-/// 1 MiB on smaller GPUs.
+/// `VICTORY_CARD_BUFFERS_MIN_MB`, else 512 KiB on high-VRAM GPUs (>= 16 GiB)
+/// (keeping card buffer count ~1,000 while promoting medium buffers; `=64`
+/// remains opt-in), or 1 MiB on smaller GPUs.
 fn resolve_card_buffers_min_bytes(min_kb_env: Option<&str>, min_mb_env: Option<&str>, high_vram: bool) -> u64 {
     if let Some(kb) = min_kb_env.and_then(|v| v.trim().parse::<u64>().ok())
         && kb > 0
@@ -167,13 +167,13 @@ fn resolve_card_buffers_min_bytes(min_kb_env: Option<&str>, min_mb_env: Option<&
     {
         return mb << 20;
     }
-    if high_vram { 64 << 10 } else { 1 << 20 }
+    if high_vram { 512 << 10 } else { 1 << 20 }
 }
 
 /// The smallest title buffer whose copy goes to the card's memory, and the
 /// most bytes of such copies (their "before" twins not counted: a copy
 /// shaders write takes its size twice), both in bytes:
-/// `VICTORY_CARD_BUFFERS_MIN_KB` (default 64 on >= 16 GiB GPUs),
+/// `VICTORY_CARD_BUFFERS_MIN_KB` (default 512 on >= 16 GiB GPUs),
 /// `VICTORY_CARD_BUFFERS_MIN_MB` (default 1 on smaller GPUs), and
 /// `VICTORY_CARD_BUFFERS_MB` (default 1024, or 4096 on >= 16 GiB GPUs).
 fn card_limits() -> (u64, u64) {
@@ -3992,21 +3992,26 @@ mod window_tests {
     #[test]
     fn high_vram_smart_defaults_respect_overrides() {
         use super::{
-            resolve_card_buffers_bytes, resolve_card_room_kept, resolve_card_windows_bytes,
+            resolve_card_buffers_bytes, resolve_card_buffers_min_bytes, resolve_card_room_kept,
+            resolve_card_windows_bytes,
         };
         // Default < 16 GiB (12 GB card behavior preserved)
         assert_eq!(resolve_card_buffers_bytes(None, false), 1024 << 20);
+        assert_eq!(resolve_card_buffers_min_bytes(None, None, false), 1 << 20);
         assert_eq!(resolve_card_windows_bytes(None, false), 0);
         assert!(!resolve_card_room_kept(None, false));
 
         // Default >= 16 GiB (24 GB GPU smart defaults)
         assert_eq!(resolve_card_buffers_bytes(None, true), 4096 << 20);
+        assert_eq!(resolve_card_buffers_min_bytes(None, None, true), 512 << 10);
         assert_eq!(resolve_card_windows_bytes(None, true), 4096 << 20);
         assert!(resolve_card_room_kept(None, true));
 
         // Explicit overrides always win in both directions
         assert_eq!(resolve_card_buffers_bytes(Some("2048"), true), 2048 << 20);
         assert_eq!(resolve_card_buffers_bytes(Some(" 512 "), false), 512 << 20);
+        assert_eq!(resolve_card_buffers_min_bytes(Some("64"), None, true), 64 << 10);
+        assert_eq!(resolve_card_buffers_min_bytes(None, Some("2"), true), 2 << 20);
         assert_eq!(resolve_card_windows_bytes(Some("0"), true), 0);
         assert_eq!(resolve_card_windows_bytes(Some("1024"), false), 1024 << 20);
         assert!(!resolve_card_room_kept(Some("0"), true));

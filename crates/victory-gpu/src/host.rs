@@ -3203,6 +3203,58 @@ mod relay_tests {
         assert!(fetch.contains(&(b, 9)));
         assert_eq!(fetch.len(), 2);
     }
+
+    /// Regression test for Phase 8A `relay_land` / `settle_stale` lost-wakeup
+    /// deadlock: clearing pending ranges BEFORE updating `LINE` and notifying
+    /// `LINE_LANDED`, combined with the `(line.is_empty() && !settling)` guard,
+    /// ensures `relay_wait` always wakes cleanly and terminates in bounded time.
+    #[test]
+    fn settle_stale_predicate_and_copy_back_done_order_never_deadlock() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Condvar, Mutex};
+        use std::time::Duration;
+
+        // 1. Verify happens-before ordering: `pending` cleared BEFORE lock + notify.
+        let state = Arc::new((Mutex::new((true, true)), Condvar::new(), AtomicBool::new(true)));
+        let s2 = state.clone();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(5));
+            // Mirrors fixed `relay_land`: clear pending FIRST, then lock `LINE`
+            // and clear `settling`/`line`, then `notify_all()`.
+            s2.2.store(false, Ordering::Release);
+            {
+                let mut line = s2.0.lock().unwrap();
+                *line = (false, false);
+            }
+            s2.1.notify_all();
+        });
+        {
+            let mut line = state.0.lock().unwrap();
+            let (guard, timeout) = state
+                .1
+                .wait_timeout_while(line, Duration::from_secs(2), |&mut (has_flights, settling)| {
+                    !((!has_flights && !settling) || !state.2.load(Ordering::Acquire))
+                })
+                .unwrap();
+            line = guard;
+            assert!(!timeout.timed_out(), "waiter must wake without lost-wakeup deadlock");
+            assert!(!state.2.load(Ordering::Acquire));
+            drop(line);
+        }
+        releaser.join().unwrap();
+
+        // 2. Verify belt-and-suspenders guard: if `line` is drained (`!has_flights && !settling`),
+        //    the `settle_stale` predicate returns true even if `pending` is still set,
+        //    preventing an infinite sleep when no flights remain to wake `LINE_LANDED`.
+        let drained = |has_flights: bool, settling: bool, writes_pending: bool| -> bool {
+            (!has_flights && !settling) || !writes_pending
+        };
+        assert!(!drained(true, false, true));
+        assert!(!drained(false, true, true));
+        assert!(drained(true, false, false));
+        assert!(drained(false, false, true));
+        assert!(drained(false, false, false));
+    }
 }
 
 /// The most host lists in the air before the flights are settled
@@ -5734,6 +5786,14 @@ impl Host {
         }
         self.log_messages();
         RELAY_STATS[4].fetch_add(landing.elapsed().as_micros() as u64, Ordering::Relaxed);
+        // Release declared ranges from `shadow.pending` flight by flight BEFORE
+        // locking `LINE` and notifying `LINE_LANDED`, so any `relay_wait` waiter
+        // checking `!shadow.writes_pending_in(...)` (e.g. `settle_stale`) is
+        // guaranteed to observe the cleared pending state on wakeup without a
+        // lost-wakeup deadlock.
+        for (shadow, ranges) in &backs {
+            shadow.copy_back_done(ranges);
+        }
         {
             let mut line = line();
             let Line {
@@ -5768,11 +5828,6 @@ impl Host {
         }
         LINE_MOVED.notify_all();
         LINE_LANDED.notify_all();
-        // Only now, flight by flight: release declared ranges from `pending`,
-        // after `line.written` no longer names them and waiters have been woken.
-        for (shadow, ranges) in &backs {
-            shadow.copy_back_done(ranges);
-        }
     }
 
     /// After a submission ran, for copies in the card's memory: the pieces
@@ -6180,8 +6235,11 @@ impl Host {
     ) {
         if relay_exact() && card_steps::stage() > 0 {
             for _ in 0..3 {
-                relay_wait(WHY_STALE, |_| {
-                    stale.iter().all(|(shadow, from, to)| !shadow.writes_pending_in(*from, *to))
+                relay_wait(WHY_STALE, |line| {
+                    (line.line.is_empty() && !line.settling)
+                        || stale
+                            .iter()
+                            .all(|(shadow, from, to)| !shadow.writes_pending_in(*from, *to))
                 });
                 if !ranges.is_empty() {
                     crate::watch::ask_once(ranges);
@@ -8076,6 +8134,41 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
     read(src, dst.as_mut_ptr(), dst.len())
 }
 
+/// Reads what is mapped of the `dst.len()` bytes of title memory at `src`,
+/// leaving zeros for unmapped pages; returns how many bytes were read. Safe
+/// while the runtime remaps title memory (uses kernel `ReadProcessMemory` by
+/// whole range, falling back to 64 KiB and then 4 KiB pieces).
+pub(crate) fn read_there(src: *const u8, dst: &mut [u8]) -> usize {
+    dst.fill(0);
+    let (start, len) = (src as usize, dst.len());
+    if len == 0 {
+        return 0;
+    }
+    if read_into(src, dst) {
+        return len;
+    }
+    // A failed `ReadProcessMemory` may have written its leading readable pages.
+    dst.fill(0);
+    let mut got = 0usize;
+    for_pieces(start, len, 64 << 10, |from, n| {
+        let piece = &mut dst[from - start..from - start + n];
+        if read_into(from as *const u8, piece) {
+            got += n;
+            return;
+        }
+        piece.fill(0);
+        for_pieces(from, n, 4 << 10, |from, n| {
+            let piece = &mut dst[from - start..from - start + n];
+            if read_into(from as *const u8, piece) {
+                got += n;
+            } else {
+                piece.fill(0);
+            }
+        });
+    });
+    got
+}
+
 /// Copies `len` bytes from `src` to `dst` unless a source page is not
 /// readable.
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
@@ -8456,11 +8549,13 @@ impl Meter {
                      hold still (the runtime remapping it); the rest is reading, hashing and detiling"
                 );
             }
-            let [through, left] = [0, 1].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
-            if through + left > 0.0 {
+            let [through, left, filled, short] =
+                [0, 1, 2, 3].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            if through + left + filled > 0.0 {
                 tracing::info!(
                     "texture refreshes that did not wait for title memory to hold still, per frame (VICTORY_TEXTURE_NO_WAIT=1): \
-                     {through:.1} read through the kernel, {left:.1} left for the next refresh (a page was not there)"
+                     {through:.1} read through the kernel, {left:.1} left for the next refresh (a page was not there), \
+                     {filled:.1} filled from the pages there ({short:.1} short, looked at again)"
                 );
             }
         }

@@ -207,16 +207,39 @@ fn windows() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_none_or(|v| v != "0"))
 }
 
+/// Resolves `VICTORY_INDIRECT_BATCH`: default `1` (compute dispatches close
+/// the active batch, matching `cool_fox`); `2` (opt-in) keeps the batch open
+/// across dispatches until a barrier/sync or draw; `0` disables batching.
+fn resolve_batches(env: Option<&str>) -> u8 {
+    match env.map(str::trim) {
+        Some("0") => 0,
+        Some("2") => 2,
+        _ => 1,
+    }
+}
+
 /// Whether single-record indirect executions are clamped in batched passes
-/// (`VICTORY_INDIRECT_BATCH`; default `2`: dispatches do not end a batch until
-/// a barrier/sync or draw; `=1`: dispatches end the batch; `=0`: disabled).
+/// (`VICTORY_INDIRECT_BATCH`; default `1`, `=2` opt-in, `=0` disabled).
 fn batches() -> u8 {
     static ON: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| match std::env::var("VICTORY_INDIRECT_BATCH").ok().as_deref().map(str::trim) {
-        Some("0") => 0,
-        Some("1") => 1,
-        _ => 2,
+    *ON.get_or_init(|| {
+        let env = std::env::var("VICTORY_INDIRECT_BATCH").ok();
+        resolve_batches(env.as_deref())
     })
+}
+
+#[cfg(test)]
+mod batch_env_tests {
+    use super::resolve_batches;
+
+    #[test]
+    fn indirect_batch_defaults_to_stage_1_and_honors_overrides() {
+        assert_eq!(resolve_batches(None), 1);
+        assert_eq!(resolve_batches(Some("")), 1);
+        assert_eq!(resolve_batches(Some("1")), 1);
+        assert_eq!(resolve_batches(Some("2")), 2);
+        assert_eq!(resolve_batches(Some("0")), 0);
+    }
 }
 
 /// Active batched indirect clamp pass on this list (`batches()`).
@@ -2028,6 +2051,7 @@ impl State {
         if room {
             host.texture_slots_waiting(frame);
         }
+        host.texture_slots_short(frame);
         let (due, census) = host.texture_slots_due(frame, 4096);
         HEAP_TEXTURES_WAITING.store(census[0], Ordering::Relaxed);
         for (count, now) in HEAP_TEXTURES_QUEUE.iter().zip(census) {

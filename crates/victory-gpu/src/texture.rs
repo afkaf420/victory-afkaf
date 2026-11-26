@@ -54,6 +54,9 @@ pub(crate) struct Staging {
     /// of 1,120 textures in one frame of run 18.)
     dirty: std::sync::atomic::AtomicBool,
     uploaded: std::sync::atomic::AtomicBool,
+    /// How many bytes of the texture's memory were mapped when a list last
+    /// recorded an upload of it (`fill_unlocked`; 0: not asked).
+    expected: std::sync::atomic::AtomicU64,
     /// When a list last recorded a use of it (`crate::host::moment`).
     used: std::sync::atomic::AtomicU64,
     /// Levels on demand (`crate::tiles`): the texture's host copy was made
@@ -315,17 +318,75 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
 /// left as it is and read at its next refresh, a frame later. A read
 /// through the kernel costs about 0.6 ms a megabyte against 0.3 in place.
 ///
+/// Resolves `VICTORY_TEXTURE_NO_WAIT`: ON by default so texture refreshes do
+/// not stall on `watch::MAPPING.read()` during streaming; `0`/`off`/`false`
+/// disables it.
+fn resolve_no_wait(env: Option<&str>) -> bool {
+    !matches!(
+        env.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("0" | "off" | "false")
+    )
+}
+
+/// Resolves `VICTORY_TEXTURE_FILL`: ON by default so first-time unlocked
+/// refreshes fill available pages instead of uploading all zeros; `0`/`off`
+/// disables it.
+fn resolve_fill_unlocked(env: Option<&str>) -> bool {
+    !matches!(
+        env.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("0" | "off" | "false")
+    )
+}
+
 /// What changes for the picture: a texture that arrives while the runtime
-/// is remapping may show a frame later. It never shows partly read.
+/// is remapping reads through the kernel instead of waiting on `MAPPING.read()`,
+/// filling any partial pages via [`fill_unlocked`].
 fn no_wait() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| {
+        let env = std::env::var("VICTORY_TEXTURE_NO_WAIT").ok();
+        resolve_no_wait(env.as_deref())
+    })
+}
+
+/// Whether an unlocked refresh ([`no_wait`]) that finds a page missing fills
+/// a never-filled staging buffer from the pages that are mapped
+/// (`VICTORY_TEXTURE_FILL=0` disables; ON by default).
+fn fill_unlocked() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let env = std::env::var("VICTORY_TEXTURE_FILL").ok();
+        resolve_fill_unlocked(env.as_deref())
+    })
+}
+
+#[cfg(test)]
+mod unlocked_env_tests {
+    use super::{resolve_fill_unlocked, resolve_no_wait};
+
+    #[test]
+    fn texture_no_wait_and_fill_default_on_and_honor_overrides() {
+        assert!(resolve_no_wait(None));
+        assert!(resolve_no_wait(Some("")));
+        assert!(resolve_no_wait(Some("1")));
+        assert!(!resolve_no_wait(Some("0")));
+        assert!(!resolve_no_wait(Some("off")));
+        assert!(!resolve_no_wait(Some("false")));
+
+        assert!(resolve_fill_unlocked(None));
+        assert!(resolve_fill_unlocked(Some("1")));
+        assert!(!resolve_fill_unlocked(Some("0")));
+        assert!(!resolve_fill_unlocked(Some("off")));
+    }
 }
 
 /// Since the last frame-rate line, with [`no_wait`]: refreshes that read
-/// through the kernel because title memory was being remapped, and those
-/// left for the next refresh because a page was not there.
-pub(crate) static UNLOCKED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+/// through the kernel because title memory was being remapped, those left
+/// for the next refresh because a page was not there, staging buffers filled
+/// from the pages there ([`fill_unlocked`]), and of them those that got less
+/// than was mapped (their slots are looked at again).
+pub(crate) static UNLOCKED: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// Since the last frame-rate line, of texture refreshes on every thread, in
 /// microseconds: waiting for the texture's own lock (another thread is
@@ -630,6 +691,10 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::TexUploads, 1);
+    if no_wait() && fill_unlocked() {
+        let there = mapped_bytes(staging.memory, staging.layout.size as usize);
+        staging.expected.store(there, Relaxed);
+    }
     const COPY_DEST: u32 = 0x400;
     crate::list::ensure_state(list, resource, COPY_DEST);
     // The staging buffer lives as long as `staging`, which the deferred
@@ -1072,10 +1137,11 @@ impl Staging {
 
     /// A refresh while the runtime is remapping title memory ([`no_wait`]):
     /// the texture is read through the kernel, which fails if a page of it
-    /// is not there at this moment. Then nothing is taken and the texture
-    /// is looked at again at its next refresh (what was learnt about writes
-    /// to it is forgotten, so that it is not passed over as unwritten).
-    /// Returns the bytes read.
+    /// is not there at this moment. Then a staging buffer that was filled
+    /// before keeps what it holds and the texture is looked at again at its
+    /// next refresh (what was learnt about writes to it is forgotten, so
+    /// that it is not passed over as unwritten); one never filled takes the
+    /// pages that are there ([`Staging::fill`]). Returns the bytes read.
     fn refresh_unlocked(&self, last: &mut Last, size: usize) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
         let read = with_read(size, |read| {
@@ -1092,11 +1158,51 @@ impl Staging {
         if read {
             UNLOCKED[0].fetch_add(1, Relaxed);
             size
+        } else if last.hash.is_none() && fill_unlocked() {
+            self.fill(last, size)
         } else {
             UNLOCKED[1].fetch_add(1, Relaxed);
             last.asked = 0;
             0
         }
+    }
+
+    /// The first filling of the staging buffer while the runtime is remapping
+    /// title memory, for a texture not all of which can be read at once:
+    /// reads whatever pages are mapped (zeros for unmapped pages), waiting up
+    /// to 4 brief `change_over()` rounds if a transient unmap hid pages. If
+    /// fewer bytes were read than were mapped, schedules the texture's slots
+    /// to be checked again (`descriptor::host::read_short`).
+    fn fill(&self, last: &mut Last, size: usize) -> usize {
+        use std::sync::atomic::Ordering::Relaxed;
+        let start = self.memory as u64;
+        let mut there = 0u64;
+        let got = with_read(size, |read| {
+            let mut got = 0u64;
+            for _ in 0..4 {
+                got = crate::host::read_there(self.memory, read) as u64;
+                there = mapped_bytes(self.memory, size);
+                if got >= there.max(self.expected.load(Relaxed)) {
+                    break;
+                }
+                crate::watch::change_over();
+            }
+            if got != 0 {
+                last.hash = Some(blake3::hash(read));
+                self.detile(read);
+            }
+            got
+        });
+        last.partial = Some(crate::frame::current());
+        UNLOCKED[2].fetch_add(1, Relaxed);
+        if got < there.max(self.expected.load(Relaxed)) {
+            UNLOCKED[3].fetch_add(1, Relaxed);
+            last.asked = 0;
+            crate::descriptor::host::read_short(start);
+        } else {
+            crate::descriptor::host::read_all(start);
+        }
+        size
     }
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
@@ -1450,6 +1556,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         last: Mutex::default(),
         dirty: std::sync::atomic::AtomicBool::new(true),
         uploaded: std::sync::atomic::AtomicBool::new(false),
+        expected: std::sync::atomic::AtomicU64::new(0),
         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
         on_demand,
         detiled: std::sync::atomic::AtomicU32::new(0),
