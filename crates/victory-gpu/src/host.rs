@@ -1475,10 +1475,17 @@ pub(crate) struct HostList {
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
     /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
-    /// grown to the largest indirect execution recorded on the list.
-    indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
+    /// grown to the largest indirect execution recorded on the list, along with
+    /// its current host D3D12 resource state (`COMMON` or `INDIRECT_ARGUMENT`).
+    indirect_args: Mutex<Option<(ID3D12Resource, u64, D3D12_RESOURCE_STATES)>>,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
+    /// Whether an earlier UAV-writing command (or prior command list on the
+    /// queue) may have written GPU memory without a subsequent global UAV
+    /// barrier yet. Starts `true` on list creation/reset so the first consumer
+    /// or barrier always flushes prior queue work; cleared once a global
+    /// `UAV(NULL)` executes and re-armed on compute/storing-draw/copy writes.
+    uav_dirty: std::sync::atomic::AtomicBool,
     /// Whether this list recorded a shader pass writing through Stage M3 sparse
     /// GDDR6X window UAVs (triggers global UAV barriers between passes & at close).
     sparse_uma_wrote: std::sync::atomic::AtomicBool,
@@ -2268,7 +2275,15 @@ static CARD_PASSES: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atom
 /// frame, each compared with the copy's CPU side byte by byte and put into
 /// title memory through the kernel. A piece is its own bytes of its copy
 /// and of title memory, so up to eight threads share them in parallel.
-fn wide_merge() -> bool {
+/// Whether per-list UAV barrier deduplication is enabled
+/// (`VICTORY_BARRIER_DEDUP`; on by default, `=0` forces every indirect clamp
+/// and barrier group to emit a global `UAV(NULL)` flush).
+pub(crate) fn barrier_dedup() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| resolve_default_on(std::env::var("VICTORY_BARRIER_DEDUP").ok().as_deref()))
+}
+
+pub(crate) fn wide_merge() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| resolve_default_on(std::env::var("VICTORY_WIDE_MERGE").ok().as_deref()))
 }
@@ -3732,6 +3747,7 @@ impl Host {
                 budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
                 _alive: Counted::new(),
+                uav_dirty: std::sync::atomic::AtomicBool::new(true),
                 sparse_uma_wrote: std::sync::atomic::AtomicBool::new(false),
                 ops: std::sync::atomic::AtomicU32::new(0),
                 #[cfg(feature = "diagnostics")]
@@ -4421,6 +4437,7 @@ impl Host {
                     (|| -> windows::core::Result<()> {
                         allocator.Reset()?;
                         list.Reset(allocator, None)?;
+                        let mut hash_bound = false;
                         for (shadow, ranges) in &dirty {
                             let Some((staging, before, size)) = shadow.card_sides() else {
                                 continue;
@@ -4446,21 +4463,26 @@ impl Host {
                                     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                                 )]);
                             }
-                            list.SetComputeRootSignature(&work.root);
-                            list.SetPipelineState(&work.pso);
+                            if !hash_bound {
+                                list.SetComputeRootSignature(&work.root);
+                                list.SetPipelineState(&work.pso);
+                                list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
+                                hash_bound = true;
+                            }
                             list.SetComputeRootShaderResourceView(1, shadow.buffer.GetGPUVirtualAddress());
                             list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
-                            list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
                             let runs: Vec<crate::shadow::CardSpan> = if whole.iter().any(|s| Arc::ptr_eq(s, shadow)) {
                                 vec![shadow.card_run(0, usize::MAX)]
                             } else {
                                 ranges.iter().map(|&(a, b)| shadow.card_run(a, b)).collect()
                             };
-                            // Always deduplicate overlapping 64 KiB pieces when
-                            // 64-byte diffing emits multiple small runs in one piece
-                            // (or when `VICTORY_CARD_REHASH_RUNS=1`).
+                            // Each rehash workgroup runs 64 threads (64 pieces = 4 MiB)
+                            // in parallel for the cost of 1 piece. When no in-flight
+                            // shader write targets this shadow, bridge small piece gaps
+                            // (<= 16) to cut redundant tiny compute dispatches 3-4x.
                             let runs = if runs.len() > 1 || rehash_runs() {
-                                crate::shadow::joined_piece_runs(runs)
+                                let gap = if !shadow.writes_pending() && rehash_runs() { 16 } else { 0 };
+                                crate::shadow::joined_piece_runs_with_gap(runs, gap)
                             } else {
                                 runs
                             };
@@ -5906,6 +5928,23 @@ impl HostList {
         self.ops.load(Ordering::Relaxed)
     }
 
+    /// Marks that a shader or copy command on this list may have written GPU
+    /// UAV/buffer memory, so the next consumer or barrier emits a `UAV(NULL)`.
+    pub(crate) fn mark_uav_write(&self) {
+        self.uav_dirty.store(true, Ordering::Relaxed);
+    }
+
+    /// Consumes and returns whether a global `UAV(NULL)` barrier is currently
+    /// required before reading GPU-written buffers on this list.
+    pub(crate) fn take_uav_dirty(&self) -> bool {
+        self.uav_dirty.swap(false, Ordering::Relaxed)
+    }
+
+    /// Clears `uav_dirty` after a global `UAV(NULL)` barrier has been emitted.
+    pub(crate) fn clear_uav_dirty(&self) {
+        self.uav_dirty.store(false, Ordering::Relaxed);
+    }
+
     /// Emits a global UAV barrier (`pResource = NULL`) on `self.list` so all
     /// prior UAV writes across window-backed buffers finish before later reads
     /// or writes.
@@ -5921,11 +5960,30 @@ impl HostList {
         };
         // SAFETY: an open command list and a valid global UAV barrier.
         unsafe { self.list.ResourceBarrier(&[barrier]) };
+        self.clear_uav_dirty();
     }
 
     pub(crate) fn close(&self) {
         if self.sparse_uma_wrote.load(Ordering::Relaxed) {
             self.uav_barrier_all();
+        }
+        // Return the indirect scratch buffer to COMMON once at list close
+        // (instead of after every single ExecuteIndirect call).
+        {
+            let mut slot = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((buf, _, state)) = slot.as_mut()
+                && *state == D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT
+            {
+                // SAFETY: open command list and live scratch buffer in INDIRECT_ARGUMENT.
+                unsafe {
+                    self.list.ResourceBarrier(&[transition(
+                        buf,
+                        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                        D3D12_RESOURCE_STATE_COMMON,
+                    )]);
+                }
+                *state = D3D12_RESOURCE_STATE_COMMON;
+            }
         }
         self.twins_to_depth();
         #[cfg(feature = "diagnostics")]
@@ -5951,8 +6009,12 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         self._alive.used();
+        self.uav_dirty.store(true, Ordering::Relaxed);
         self.sparse_uma_wrote.store(false, Ordering::Relaxed);
         self.ops.store(0, Ordering::Relaxed);
+        if let Some((_, _, state)) = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            *state = D3D12_RESOURCE_STATE_COMMON;
+        }
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -6629,27 +6691,44 @@ impl HostList {
     /// clamped indirect arguments, reused across executions and resets of the
     /// list. Smaller buffers replaced mid-list stay alive until
     /// [`HostList::reset`].
-    pub(crate) fn indirect_scratch(&self, size: u64) -> Option<ID3D12Resource> {
+    pub(crate) fn indirect_scratch(&self, size: u64) -> Option<(ID3D12Resource, D3D12_RESOURCE_STATES)> {
         let needed = size.max(64 << 10);
         let mut slot = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((buffer, cap)) = &*slot
+        if let Some((buffer, cap, state)) = &*slot
             && *cap >= needed
         {
-            return Some(buffer.clone());
+            return Some((buffer.clone(), *state));
         }
-        let prev = slot.as_ref().map_or(0, |(_, cap)| *cap);
+        let prev = slot.as_ref().map_or(0, |(_, cap, _)| *cap);
         let alloc = prev
             .saturating_mul(2)
             .max(needed)
             .next_multiple_of(64 << 10);
         let buffer = host()?.uav_buffer(alloc)?;
         name(&buffer, || format!("indirect arguments {alloc:#x}"));
-        let old = slot.replace((buffer.clone(), alloc));
+        let old = slot.replace((buffer.clone(), alloc, D3D12_RESOURCE_STATE_COMMON));
         drop(slot);
-        if let Some((old_buf, _)) = old {
+        if let Some((old_buf, _, old_state)) = old {
+            if old_state == D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT {
+                // SAFETY: open command list and live previous scratch buffer.
+                unsafe {
+                    self.list.ResourceBarrier(&[transition(
+                        &old_buf,
+                        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                        D3D12_RESOURCE_STATE_COMMON,
+                    )]);
+                }
+            }
             self.keep(&old_buf);
         }
-        Some(buffer)
+        Some((buffer, D3D12_RESOURCE_STATE_COMMON))
+    }
+
+    /// Updates the tracked D3D12 state of this list's indirect scratch buffer.
+    pub(crate) fn set_indirect_state(&self, new_state: D3D12_RESOURCE_STATES) {
+        if let Some((_, _, state)) = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            *state = new_state;
+        }
     }
 
     /// Keeps `object` alive until the list is reset.
@@ -6770,7 +6849,7 @@ impl HostList {
 }
 
 /// Whether a submission's refreshes of host copies run on several threads,
-/// a copy to a thread (`VICTORY_WIDE_REFRESH=1`; off by default).
+/// a copy to a thread (`VICTORY_WIDE_REFRESH`; on by default, `=0` disables).
 ///
 /// A submission brings some sixty copies up to date, one after the other
 /// on the submitting thread: for each, the pages the title wrote are asked
@@ -6783,7 +6862,7 @@ impl HostList {
 /// they are for the title's threads.
 fn wide_refresh() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_REFRESH").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| resolve_default_on(std::env::var("VICTORY_WIDE_REFRESH").ok().as_deref()))
 }
 
 /// A submission's refreshes not done yet, merged per buffer copy into the
@@ -7093,6 +7172,88 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
             });
         }
     });
+}
+
+/// Copies many scattered `(off, len)` slices from `data` into title memory at
+/// `base + off`, preserving exact per-run granularity (never writing bytes
+/// between runs). Probes each touched 4 KiB page ONCE via a 1-byte
+/// `NtWriteVirtualMemory` while holding `title_memory_reading()` (preventing
+/// concurrent unmaps without `VirtualQuery`'s multi-ms VAD walk), then copies
+/// all remaining runs on that page directly in user space — eliminating tens
+/// of thousands of ring-0 syscalls per frame on scattered GPU write-backs.
+pub(crate) fn write_mapped_runs(base: usize, data: &[u8], runs: &[(usize, usize)]) -> usize {
+    const PAGE: usize = 4096;
+    if runs.is_empty() {
+        return 0;
+    }
+    if runs.len() <= 2 || !direct_writes() {
+        let mut written = 0usize;
+        for &(off, len) in runs {
+            if len > 0 && off + len <= data.len() {
+                write_mapped((base + off) as *mut u8, data[off..].as_ptr(), len);
+                written += len;
+            }
+        }
+        return written;
+    }
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    // Block concurrent xmem unmaps/remaps while we write verified pages directly.
+    let _mapped = crate::watch::title_memory_reading();
+    // SAFETY: pseudo-handle to current process.
+    let proc = unsafe { GetCurrentProcess() };
+    let mut last_page: Option<(usize, bool)> = None;
+    let mut written = 0usize;
+    for &(off, len) in runs {
+        if len == 0 || off + len > data.len() {
+            continue;
+        }
+        let mut cur_off = off;
+        let end_off = off + len;
+        while cur_off < end_off {
+            let dst_addr = base + cur_off;
+            let page = dst_addr / PAGE;
+            let page_end_off = ((page + 1) * PAGE - base).min(end_off);
+            let chunk_len = page_end_off - cur_off;
+            let src_ptr = data[cur_off..].as_ptr();
+            match last_page {
+                Some((p, true)) if p == page => {
+                    // SAFETY: page was verified committed & writable by
+                    // `NtWriteVirtualMemory` while `_mapped` prevents unmapping.
+                    unsafe { std::ptr::copy_nonoverlapping(src_ptr, dst_addr as *mut u8, chunk_len) };
+                    written += chunk_len;
+                }
+                Some((p, false)) if p == page => {
+                    // Page already proved unwritable/unmapped: skip cleanly.
+                }
+                _ => {
+                    let mut done = 0usize;
+                    // SAFETY: kernel validates writability of `dst_addr` and
+                    // writes the first byte cleanly without raising AV.
+                    let ok = unsafe {
+                        NtWriteVirtualMemory(proc, dst_addr as _, src_ptr.cast(), 1, &mut done) >= 0
+                    };
+                    last_page = Some((page, ok));
+                    if ok {
+                        written += 1;
+                        if chunk_len > 1 {
+                            // SAFETY: same 4 KiB page verified writable above,
+                            // `_mapped` holds remap lock.
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(
+                                    src_ptr.add(1),
+                                    (dst_addr + 1) as *mut u8,
+                                    chunk_len - 1,
+                                );
+                            }
+                            written += chunk_len - 1;
+                        }
+                    }
+                }
+            }
+            cur_off = page_end_off;
+        }
+    }
+    written
 }
 
 /// Calls `f` with the pieces of `[start, start + len)` cut at multiples of
@@ -8308,5 +8469,68 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(resolve_merge_runs_limit(Some("10")), 64);
         assert_eq!(resolve_merge_runs_limit(Some("999999")), 65_536);
         assert_eq!(resolve_merge_runs_limit(Some("bogus")), 8192);
+    }
+
+    #[test]
+    fn write_mapped_runs_updates_only_specified_runs_across_pages_and_skips_readonly() {
+        use super::write_mapped_runs;
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READONLY, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree, VirtualProtect,
+        };
+        const PAGE: usize = 4096;
+        // Allocate 3 pages: pages 0 & 1 writable, page 2 read-only.
+        // SAFETY: fresh private 3-page test allocation freed before return.
+        let base = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                3 * PAGE,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            ) as usize
+        };
+        assert_ne!(base, 0);
+        // SAFETY: pages 0..3 are committed and writable.
+        unsafe { std::ptr::write_bytes(base as *mut u8, 0xAA, 3 * PAGE) };
+        let mut old_prot = 0u32;
+        // SAFETY: marking page 2 read-only.
+        assert_ne!(
+            unsafe { VirtualProtect((base + 2 * PAGE) as *const _, PAGE, PAGE_READONLY, &mut old_prot) },
+            0
+        );
+
+        let mut src = vec![0xAAu8; 3 * PAGE];
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        // 40 scattered 4-byte runs across page 0, a run straddling page 0->1,
+        // 40 runs across page 1, plus 2 runs inside read-only page 2.
+        for i in 0..40 {
+            let off = i * 96 + 4;
+            src[off..off + 4].copy_from_slice(&[0x11, 0x22, 0x33, 0x44]);
+            runs.push((off, 4));
+        }
+        // Straddles page 0 -> page 1 boundary.
+        src[PAGE - 2..PAGE + 6].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        runs.push((PAGE - 2, 8));
+        for i in 0..40 {
+            let off = PAGE + 32 + i * 96;
+            src[off..off + 4].copy_from_slice(&[0x55, 0x66, 0x77, 0x88]);
+            runs.push((off, 4));
+        }
+        // Runs into read-only page 2 must be skipped cleanly without AV.
+        src[2 * PAGE + 16..2 * PAGE + 24].copy_from_slice(&[0xDE; 8]);
+        runs.push((2 * PAGE + 16, 8));
+        src[2 * PAGE + 128..2 * PAGE + 132].copy_from_slice(&[0xAD; 4]);
+        runs.push((2 * PAGE + 128, 4));
+
+        let written = write_mapped_runs(base, &src, &runs);
+        assert_eq!(written, 40 * 4 + 8 + 40 * 4);
+
+        // SAFETY: all 3 pages are readable.
+        let dst = unsafe { std::slice::from_raw_parts(base as *const u8, 3 * PAGE) };
+        assert_eq!(&dst[..2 * PAGE], &src[..2 * PAGE], "writable pages must match src exactly");
+        assert!(dst[2 * PAGE..].iter().all(|&b| b == 0xAA), "read-only page must stay untouched");
+
+        // SAFETY: freeing test allocation.
+        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
     }
 }

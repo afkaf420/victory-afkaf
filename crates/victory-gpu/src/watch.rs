@@ -207,9 +207,24 @@ pub(crate) fn once() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_ASK_ONCE").is_none_or(|v| v != "0"))
 }
 
+/// Returns true if every 64 KiB block covering `[start, end)` is currently
+/// held clean in `GUARDS.clean` (hardware `PAGE_READONLY`), proving zero writes,
+/// maps, or unmaps occurred there without calling `GetWriteWatch` or `VirtualQuery`.
+fn all_blocks_clean(start: usize, end: usize) -> bool {
+    if guard_ask() || start >= end {
+        return false;
+    }
+    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
+    let g = guards();
+    first < last && g.clean.range(first..last).count() == last - first
+}
+
 /// With [`once`]: asks about `ranges` (everything a submission's lists
 /// refresh) as [`ask_ahead`] does, and lets that asking stand until
-/// [`ask_once_end`].
+/// [`ask_once_end`]. Covers both `MEM_PRIVATE` write-watched ranges AND
+/// `MEM_MAPPED` guarded views (`writes_mixed`) so repeated `flush_one`/
+/// `flush` refreshes of large mapped pools (e.g. 182 MiB buffers refreshed
+/// 20x/frame) hit the submission journal in O(1) with zero extra kernel calls.
 pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     if !once() {
         return;
@@ -219,21 +234,48 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
     if j.ahead.is_empty() {
-        // `ask_ahead` asked nothing (fewer than two ranges).
+        // `ask_ahead` asked nothing (fewer than two ranges, or all mapped).
         j.asked += 1;
         j.ahead_asked = j.asked;
     }
-    // `ask_ahead` leaves a range that lies alone to `writes`, which asks
-    // once per flush: with one asking for the submission that was every
-    // such range asked again at each of its 70 flushes (run 76: 2,300
-    // askings a frame with the switch on, as without it). They are asked
-    // here, once; what is not write-watched stays with `writes`.
+    // `ask_ahead` leaves a range that lies alone (or is `MEM_MAPPED`/mixed) to
+    // `writes`, which asks once per flush: ask each remaining range ONCE here
+    // and record it in `j.ahead` so every subsequent refresh in this submission
+    // hits the journal directly.
     for &(start, end) in ranges {
         if start >= end {
             continue;
         }
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-        if !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) && ask_kernel(j, first, last) {
+        if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+            continue;
+        }
+        if all_blocks_clean(first * PAGE, last * PAGE) {
+            j.ahead.push((first, last));
+            continue;
+        }
+        if ask_kernel(j, first, last) {
+            j.ahead.push((first, last));
+            continue;
+        }
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        if let Some(guarded_pages) = writes_mixed(j, first * PAGE, last * PAGE, true) {
+            #[cfg(feature = "diagnostics")]
+            {
+                use crate::copystat::{C, add};
+                add(C::Watches, 1);
+                add(C::WatchUs, started.elapsed().as_micros() as u64);
+                slow(started.elapsed().as_micros() as u64);
+            }
+            let now = j.ahead_asked;
+            let any_guarded = !guarded_pages.is_empty();
+            for page in guarded_pages {
+                j.written.insert(page, now);
+            }
+            if any_guarded {
+                bump_guard_epoch();
+            }
             j.ahead.push((first, last));
         }
     }
@@ -359,6 +401,19 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
         return Some((
             j.ahead_asked,
+            j.written
+                .range(first..last)
+                .map(|(&p, &w)| (p, w))
+                .collect(),
+        ));
+    }
+    // Fast path for clean guarded `MEM_MAPPED` views: avoids a guaranteed-
+    // failing `GetWriteWatch` syscall AND `writes_mixed`'s `VirtualQuery`.
+    if guarded && all_blocks_clean(first * PAGE, last * PAGE) {
+        j.asked += 1;
+        let now = j.asked;
+        return Some((
+            now,
             j.written
                 .range(first..last)
                 .map(|(&p, &w)| (p, w))
@@ -2080,5 +2135,60 @@ mod mapping_tests {
         drop(changing);
         reader.join().unwrap();
         assert!(read.load(Ordering::SeqCst));
+    }
+
+    /// `ask_once` caches `MEM_MAPPED` guarded views in `j.ahead` so repeated
+    /// `writes()` refreshes within one submission do 0 extra `VirtualQuery`
+    /// probes while still immediately surfacing `wrote()` mutations.
+    #[test]
+    fn ask_once_caches_mapped_views_and_respects_wrote() {
+        use super::{BLOCK, PAGE, THREAD_MIXED_VQS, ask_once, ask_once_end, writes, writing, wrote};
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_ALL_ACCESS, MapViewOfFile, PAGE_READWRITE, UnmapViewOfFile,
+        };
+        const LEN: usize = 2 * BLOCK;
+        // SAFETY: anonymous page-file-backed section mapped and unmapped within test.
+        let sec = unsafe {
+            CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                LEN as u32,
+                std::ptr::null(),
+            )
+        };
+        assert!(!sec.is_null());
+        // SAFETY: mapping 2 blocks of anonymous section.
+        let view = unsafe { MapViewOfFile(sec, FILE_MAP_ALL_ACCESS, 0, 0, LEN) };
+        assert!(!view.Value.is_null());
+        let start = view.Value as usize;
+        let end = start + LEN;
+
+        // Prime guards on the mapped view, then verify ask_once caches it.
+        assert!(writes(start, end, true).is_some());
+        ask_once(&[(start, end)]);
+        let vq_before = THREAD_MIXED_VQS.with(|c| c.get());
+        let (now1, w1) = writes(start, end, true).expect("cached in ask_once");
+        let (now2, w2) = writes(start, end, true).expect("cached in ask_once");
+        let vq_after = THREAD_MIXED_VQS.with(|c| c.get());
+        assert_eq!(vq_before, vq_after, "repeated writes() under ask_once must do 0 VirtualQuery probes");
+        assert_eq!(now1, now2);
+        assert_eq!(w1, w2);
+
+        // `wrote()` while ask_once stands must surface the written page immediately.
+        wrote(start + PAGE, PAGE);
+        let (now3, w3) = writes(start, end, true).expect("still cached after wrote");
+        assert!(now3 > now2);
+        assert!(w3.iter().any(|&(p, a)| p == (start + PAGE) / PAGE && a == now3));
+
+        ask_once_end();
+        writing(start, LEN);
+        // SAFETY: releasing test mapping & handle.
+        unsafe {
+            UnmapViewOfFile(view);
+            CloseHandle(sec);
+        }
     }
 }

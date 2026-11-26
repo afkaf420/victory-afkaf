@@ -175,11 +175,12 @@ fn card_limits() -> (u64, u64) {
 }
 
 /// Whether card-backed read-only window refreshes diff 64-byte cachelines
-/// against last-sent bytes (`VICTORY_DIFF64`; on by default, `=0` uploads whole
-/// dirty pages).
+/// against last-sent bytes (`VICTORY_DIFF64`; off by default since Phase 7B
+/// because 64-byte diffing fragmented uploads 4.2x in the 3D world; set `=1`
+/// to opt in).
 fn diff64_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_DIFF64").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DIFF64").is_some_and(|v| v == "1"))
 }
 
 /// Pure eligibility rule for `Shadow::copy_diff64`: ONLY strictly read-only
@@ -483,12 +484,20 @@ fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
 /// and no other piece is. Ranges sent up lie close together (514 a frame
 /// for 87 MB in run 102), and each had a pass of its own over its pieces,
 /// so a piece that held several ranges was hashed once for each.
-pub(crate) fn joined_piece_runs(mut runs: Vec<CardSpan>) -> Vec<CardSpan> {
+#[cfg(test)]
+pub(crate) fn joined_piece_runs(runs: Vec<CardSpan>) -> Vec<CardSpan> {
+    joined_piece_runs_with_gap(runs, 0)
+}
+
+/// Joins overlapping/touching (and optionally nearby, separated by at most
+/// `max_gap` 64 KiB pieces) [`CardSpan`] runs so each 64-lane rehash workgroup
+/// covers more dirty pieces per `Dispatch` call.
+pub(crate) fn joined_piece_runs_with_gap(mut runs: Vec<CardSpan>, max_gap: u32) -> Vec<CardSpan> {
     runs.sort_unstable_by_key(|r| r.first);
     let mut out: Vec<CardSpan> = Vec::with_capacity(runs.len());
     for run in runs {
         match out.last_mut() {
-            Some(last) if run.first <= last.first + last.pieces => {
+            Some(last) if run.first <= last.first.saturating_add(last.pieces).saturating_add(max_gap) => {
                 last.pieces = last.pieces.max(run.first + run.pieces - last.first);
                 last.to = last.to.max(run.to);
             }
@@ -2444,25 +2453,60 @@ impl Shadow {
             }
             // Sized to each stretch read (`back_piece`): a zeroed 64 KiB per
             // range, most of whose ranges differ nowhere, was most of the
-            // work for small ranges.
-            let (mut title, mut mask, mut runs) = (Vec::new(), Vec::new(), Vec::new());
-            for (at, n) in differing {
-                // SAFETY: inside the mapping; only the submitting thread
-                // writes it.
-                let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                let old = &before[at - from..at - from + n];
-                let read = |first: usize, title: &mut [u8]| crate::host::read_into((start + at + first) as *const u8, title);
-                let Some((first, n)) = back_piece(host, old, &mut title, &mut mask, &mut runs, read) else {
-                    continue;
-                };
-                let at = at + first;
-                crate::watch::writing(start + at, n);
-                // Only the GPU's bytes (upstream #2009): the rest of the
-                // stretch is the title's as read, and a title write landing
-                // there since stays.
-                for &(off, len) in &runs {
-                    crate::host::write_mapped((start + at + off) as *mut u8, title[off..].as_ptr(), len);
-                    written += len;
+            // work for small ranges. Parallelize across disjoint 64 KiB pieces
+            // and use `write_mapped_runs` to avoid per-tiny-run kernel syscalls.
+            if crate::host::wide_merge() && differing.len() >= 8 {
+                let data_base = self.data as usize;
+                let before_base = before.as_ptr() as usize;
+                let total_written = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let each = differing.len().div_ceil(8);
+                let jobs: Vec<Box<dyn FnOnce() + Send>> = differing
+                    .chunks(each)
+                    .map(|chunk| {
+                        let chunk = chunk.to_vec();
+                        let total_written = total_written.clone();
+                        Box::new(move || {
+                            let (mut title, mut mask, mut runs) = (Vec::new(), Vec::new(), Vec::new());
+                            let mut local = 0usize;
+                            for (at, n) in chunk {
+                                // SAFETY: each `(at, n)` 64 KiB piece is disjoint
+                                // inside `self.data` and `before`, and `wide_run`
+                                // joins before `snapshot` is released.
+                                let host = unsafe { std::slice::from_raw_parts_mut((data_base + at) as *mut u8, n) };
+                                let old = unsafe { std::slice::from_raw_parts((before_base + at - from) as *const u8, n) };
+                                let read = |first: usize, title: &mut [u8]| {
+                                    crate::host::read_into((start + at + first) as *const u8, title)
+                                };
+                                let Some((first, n)) = back_piece(host, old, &mut title, &mut mask, &mut runs, read) else {
+                                    continue;
+                                };
+                                let at = at + first;
+                                crate::watch::writing(start + at, n);
+                                local += crate::host::write_mapped_runs(start + at, &title, &runs);
+                            }
+                            total_written.fetch_add(local, Ordering::Relaxed);
+                        }) as Box<dyn FnOnce() + Send>
+                    })
+                    .collect();
+                wide_run(jobs);
+                written += total_written.load(Ordering::Relaxed);
+            } else {
+                let (mut title, mut mask, mut runs) = (Vec::new(), Vec::new(), Vec::new());
+                for (at, n) in differing {
+                    // SAFETY: inside the mapping; only the submitting thread
+                    // writes it.
+                    let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
+                    let old = &before[at - from..at - from + n];
+                    let read = |first: usize, title: &mut [u8]| crate::host::read_into((start + at + first) as *const u8, title);
+                    let Some((first, n)) = back_piece(host, old, &mut title, &mut mask, &mut runs, read) else {
+                        continue;
+                    };
+                    let at = at + first;
+                    crate::watch::writing(start + at, n);
+                    // Only the GPU's bytes (upstream #2009): the rest of the
+                    // stretch is the title's as read, and a title write landing
+                    // there since stays.
+                    written += crate::host::write_mapped_runs(start + at, &title, &runs);
                 }
             }
             // Our write shows as a title write at the copy's next refresh,
@@ -3933,6 +3977,28 @@ mod window_tests {
         assert_eq!(resolve_card_room_kept_bytes(4096 * mib, 0, false), 0);
     }
 
+    #[test]
+    fn joined_piece_runs_with_gap_bridges_sparse_rehash_spans() {
+        use super::{CardSpan, joined_piece_runs, joined_piece_runs_with_gap};
+        let span = |first: u32, pieces: u32| CardSpan {
+            from: first * 65_536,
+            to: (first + pieces) * 65_536,
+            first,
+            pieces,
+            skew: 0,
+        };
+        let runs = vec![span(10, 2), span(2, 1), span(6, 1), span(40, 2)];
+        // max_gap = 0 keeps disjoint runs separate.
+        let tight = joined_piece_runs(runs.clone());
+        assert_eq!(tight.len(), 4);
+        // max_gap = 16 bridges [2..3), [6..7), [10..12) into [2..12) (10 pieces)
+        // while keeping [40..42) (gap 28 > 16) separate.
+        let bridged = joined_piece_runs_with_gap(runs, 16);
+        assert_eq!(bridged.len(), 2);
+        assert_eq!((bridged[0].first, bridged[0].pieces), (2, 10));
+        assert_eq!((bridged[1].first, bridged[1].pieces), (40, 2));
+    }
+
     /// 64-byte cacheline diffing updates only changed cachelines, coalesces
     /// adjacent runs, respects unaligned start/end offsets, and leaves
     /// untouched cachelines (e.g. adjacent GPU counters) intact.
@@ -4037,15 +4103,20 @@ mod window_tests {
             std::mem::take(&mut *dirty)
         };
 
-        // 2. Read-only card-backed window uses `copy_diff64` on repeat writes.
+        // 2. `VICTORY_DIFF64` defaults off (opt-in via `=1`); when off, even a
+        //    read-only window uploads full dirty pages without cacheline fragmentation.
         let ro_win = make_card_shadow(true);
         assert_eq!(ro_win.update(mem, PAGE), PAGE);
         assert_eq!(take_dirty(&ro_win), vec![(0, PAGE)]);
-        // CPU modifies 4 bytes at offset 128 -> only cacheline [128..192) uploaded.
         // SAFETY: committed write-watched page.
         unsafe { ((mem + 128) as *mut u32).write_volatile(0x1234_5678) };
-        assert_eq!(ro_win.update(mem, PAGE), 64);
-        assert_eq!(take_dirty(&ro_win), vec![(128, 192)]);
+        if ro_win.can_diff64() {
+            assert_eq!(ro_win.update(mem, PAGE), 64);
+            assert_eq!(take_dirty(&ro_win), vec![(128, 192)]);
+        } else {
+            assert_eq!(ro_win.update(mem, PAGE), PAGE);
+            assert_eq!(take_dirty(&ro_win), vec![(0, PAGE)]);
+        }
 
         // 3. Once the window has been marked GPU-written (`writing()` -> `copy_back_done`),
         //    a CPU reset back to `0` (matching `self.data == 0` at offset 0 where

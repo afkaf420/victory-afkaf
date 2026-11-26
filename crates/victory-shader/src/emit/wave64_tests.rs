@@ -1179,18 +1179,19 @@ fn per_lane_self_loop_and_latch_are_not_all_lanes_and_emit_no_loop_sync() {
 }
 
 /// A 64-thread Wave64 CS with an LDS write and LDS read inside the same
-/// per-lane branch region cannot lower to Wave32 without widening (all
-/// non-widened retries keep `WaveSize=64`, which Wave32 hosts refuse with
-/// `E_INVALIDARG`). Last-resort widening in `emit::emit()` rescues it cleanly
-/// to `WaveSize=32`, validates with `dxil.dll`, builds a live PSO, and runs
-/// accurately on the RTX 3090 without setting `VICTORY_WAVE_WIDE=1`.
+/// per-lane branch region stays un-widened (`WaveSize=64`) by default when
+/// `VICTORY_WAVE_WIDE` is unset, and widens cleanly to `WaveSize=32` when
+/// explicitly opted in via `VICTORY_WAVE_WIDE=1`, passing `dxil.dll`
+/// validation and executing accurately on a Wave32 RTX 3090.
 #[test]
 fn last_resort_widen_rescues_wave64_lds_conflict_on_wave32() {
     let words = [
-        // Divergent branch: lanes with v0 < s0 enter and do LDS write + LDS read.
+        // Real `if (v0 < s0) { ds_write; s_barrier; ds_read; store } else { v5 = 99 }`
+        // so `without_skips` cannot flatten the branch and `lds_meetings` sees
+        // both an LDS write and read inside one per-lane branch region.
         0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
         0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
-        0xBF88_000B, // s_cbranch_execz +11 dwords (to restore exec)
+        0xBF88_000C, // s_cbranch_execz +12 dwords (to else block)
         0x3404_0082, // v_lshlrev_b32 v2, 2, v0 (byte offset = t * 4)
         0x4A06_0001, // v_add_nc_u32 v3, s1, v0 (val = s1 + t)
         0xD834_0000,
@@ -1203,6 +1204,10 @@ fn last_resort_widen_rescues_wave64_lds_conflict_on_wave32() {
         0x0500_0004, // ds_read_b32 v5, v4
         (0x38 << 26) | (0x1C << 18) | (1 << 12),
         (128 << 24) | (2 << 16) | (5 << 8) | 2, // buffer_store_dword v5, v2, s[8:11], 0 offen
+        0xBF82_0002, // s_branch +2 dwords (skip 2-dword else block)
+        // else block (keeps branch from being a plain skip):
+        0x7E0A_02FF,
+        99,          // v_mov_b32 v5, 99
         0xBEFE_040C, // s_mov_b64 exec, s[12:13]
     ];
     let mut native = native_of(&words, true, 64);
@@ -1217,11 +1222,22 @@ fn last_resort_widen_rescues_wave64_lds_conflict_on_wave32() {
     let empty_dxbc = super::container::build(&[]);
     let container = crate::dxbc::Container::parse(&empty_dxbc).expect("empty container");
 
-    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    // 1. Default (`VICTORY_WAVE_WIDE` off): does NOT widen (remains WaveSize=64).
+    let was_wave = lower::TEST_HOST_WAVE.replace(Some(32));
+    let was_wide = super::TEST_WAVE_WIDE.replace(Some(false));
+    let default_shader = super::emit(&container, &native, &p, &st, &io, &res)
+        .expect("default emit succeeds with WaveSize=64");
+    // 2. Opt-in (`VICTORY_WAVE_WIDE=1`): widens cleanly to WaveSize=32.
+    super::TEST_WAVE_WIDE.set(Some(true));
     let shader = super::emit(&container, &native, &p, &st, &io, &res)
-        .expect("last-resort widen should rescue Wave64 LDS conflict on Wave32");
-    lower::TEST_HOST_WAVE.set(was);
+        .expect("opt-in VICTORY_WAVE_WIDE=1 should rescue Wave64 LDS conflict on Wave32");
+    super::TEST_WAVE_WIDE.set(was_wide);
+    lower::TEST_HOST_WAVE.set(was_wave);
 
+    assert_ne!(
+        default_shader.dxil, shader.dxil,
+        "opt-in VICTORY_WAVE_WIDE=1 must produce distinct widened Wave32 DXIL"
+    );
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();
         v.validate(&mut copy)
@@ -1231,9 +1247,13 @@ fn last_resort_widen_rescues_wave64_lds_conflict_on_wave32() {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let Ok(host) = Host::new(false) else { return };
+    assert!(
+        host.compute_pipeline(&default_shader).is_err(),
+        "default (non-widened) WaveSize=64 shader must remain un-widened on Wave32 host"
+    );
     let (root, pso) = host
         .compute_pipeline(&shader)
-        .expect("Wave32 host must accept rescued shader (WaveSize <= 32)");
+        .expect("Wave32 host must accept opt-in widened shader (WaveSize <= 32)");
     let ud = [64u32, 100, 0, 0];
     let out = host
         .dispatch(

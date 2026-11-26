@@ -157,11 +157,11 @@ struct Window {
 }
 
 /// The most records clamped in one pass ([`windows`]).
-const WINDOW_MOST: u64 = 64;
+const WINDOW_MOST: u64 = 256;
 
 /// Whether indirect draws that read record after record of one argument
-/// buffer are clamped a window at a time (`VICTORY_INDIRECT_WINDOW=1`; off
-/// by default).
+/// buffer are clamped a window at a time (`VICTORY_INDIRECT_WINDOW`; on by
+/// default, set `=0` to disable).
 ///
 /// The title issues its mesh draws one record per call, each from the next
 /// slot of the same argument buffer: 3,460 a frame in gameplay, and before
@@ -176,9 +176,9 @@ const WINDOW_MOST: u64 = 64;
 /// most, never past the buffer) into
 /// the list's scratch buffer in one pass, and the draws that follow read
 /// their record there with no pass of ours, until one of these: a compute
-/// dispatch, a direct draw, an indirect call with a count buffer or more
-/// than one record, a draw whose shaders can store to buffers, a record
-/// outside the window, another host list.
+/// dispatch, a draw whose shaders can store to buffers, an indirect call
+/// with a count buffer or more than one record, a record outside the window,
+/// another host list.
 ///
 /// The step is the one the title is seen to take, not the stride its
 /// command signature names: it draws one record a call, for which the
@@ -201,7 +201,7 @@ const WINDOW_MOST: u64 = 64;
 /// before, at the next submission.
 fn windows() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_none_or(|v| v != "0"))
 }
 
 /// What one title list has set, and what its host list was last given.
@@ -2343,6 +2343,7 @@ impl State {
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        list.mark_uav_write();
         list.record_op();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
     }
@@ -2598,10 +2599,19 @@ impl State {
         }
     }
 
+    /// Returns whether the currently bound pipeline can store to UAV buffers.
+    fn bound_stores(&self) -> bool {
+        crate::pipeline::host_pipeline(self.pipeline as This)
+            .is_some_and(|p| p.stages.iter().any(|s| s.translated().stores))
+    }
+
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
-        self.window = None;
+        let stores = self.bound_stores();
+        if stores {
+            self.window = None;
+        }
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
         let ran = mesh_test() != 1
@@ -2615,6 +2625,9 @@ impl State {
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
                     self.mesh_scissor(list, false);
+                    if stores {
+                        list.mark_uav_write();
+                    }
                     list.record_op();
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true
@@ -2993,7 +3006,10 @@ impl State {
         first: u32,
         first_instance: u32,
     ) {
-        self.window = None;
+        let stores = self.bound_stores();
+        if stores {
+            self.window = None;
+        }
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         let ready = self.prepare(list, false);
@@ -3015,6 +3031,9 @@ impl State {
                 list.list
                     .DrawInstanced(count, instances, from, first_instance)
             };
+            if stores {
+                list.mark_uav_write();
+            }
             list.record_op();
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
@@ -3099,7 +3118,10 @@ impl State {
         base: i32,
         first_instance: u32,
     ) {
-        self.window = None;
+        let stores = self.bound_stores();
+        if stores {
+            self.window = None;
+        }
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
         // Indexed rectangles are drawn by the rectangle geometry stage
@@ -3117,6 +3139,9 @@ impl State {
                 list.list
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
+            if stores {
+                list.mark_uav_write();
+            }
             list.record_op();
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
@@ -3301,6 +3326,7 @@ impl State {
                 (bounded, 0)
             }
         };
+        let stores = kind == DISPATCH || p.stages.iter().any(|stage| stage.translated().stores);
         let ran = match kind {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
@@ -3308,7 +3334,6 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &bounded);
             why("prepare failed");
             return false;
         }
@@ -3321,6 +3346,9 @@ impl State {
         }
         // SAFETY: an open list with everything set; the scratch buffer and
         // host copies are kept alive by the list, and the signature is cached.
+        // The scratch buffer remains in `INDIRECT_ARGUMENT` across window hits
+        // and transitions back to `COMMON` once at `HostList::close()` (or
+        // directly `INDIRECT_ARGUMENT -> UNORDERED_ACCESS` on the next clamp).
         unsafe {
             list.list.ExecuteIndirect(
                 &signature,
@@ -3334,8 +3362,10 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, false);
         }
+        if stores {
+            list.mark_uav_write();
+        }
         list.record_op();
-        crate::indirect::done(list, &bounded);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {

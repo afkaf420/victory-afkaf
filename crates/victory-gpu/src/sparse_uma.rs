@@ -103,11 +103,20 @@ fn diff_shadow_cap_bytes() -> u64 {
     })
 }
 
+fn resolve_diff64_enabled(env: Option<&str>) -> bool {
+    env.map(str::trim) == Some("1")
+}
+
 /// Whether Stage M2 64-byte cacheline diffing is enabled for sparse uploads
-/// (`VICTORY_DIFF64`, on by default; `"0"` disables).
+/// (`VICTORY_DIFF64`, opt-in `"1"`; off by default in production to avoid 4x
+/// range fragmentation in the 3D world; enabled under `cfg!(test)` when unset
+/// so the Stage M2 diff64 integration tests exercise the cacheline path).
 fn diff64_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_DIFF64").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| match std::env::var("VICTORY_DIFF64").ok() {
+        Some(v) => resolve_diff64_enabled(Some(&v)),
+        None => cfg!(test),
+    })
 }
 
 /// Probes a 32 GiB-aligned 24 GiB contiguous free VA range strictly inside the

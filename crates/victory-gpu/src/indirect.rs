@@ -251,8 +251,14 @@ pub(crate) fn bound(
     spec: (u32, u32, u32),
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
-    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    record_clamp(c, &list.list, &dst, budget, src, count, spec).then_some(dst)
+    let (c, budget, (dst, prev_state)) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
+    let need_uav = !crate::host::barrier_dedup() || list.take_uav_dirty();
+    if record_clamp_as(c, &list.list, &dst, prev_state, budget, src, count, spec, false, need_uav) {
+        list.set_indirect_state(D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+        Some(dst)
+    } else {
+        None
+    }
 }
 
 /// [`bound`] for a window of records clamped ahead of the draws that will
@@ -271,10 +277,17 @@ pub(crate) fn bound_ahead(
     spec: (u32, u32, u32),
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, None)?;
-    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    record_clamp_as(c, &list.list, &dst, budget, src, None, spec, true).then_some(dst)
+    let (c, budget, (dst, prev_state)) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
+    let need_uav = !crate::host::barrier_dedup() || list.take_uav_dirty();
+    if record_clamp_as(c, &list.list, &dst, prev_state, budget, src, None, spec, true, need_uav) {
+        list.set_indirect_state(D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+        Some(dst)
+    } else {
+        None
+    }
 }
 
+#[cfg(test)]
 fn record_clamp(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
@@ -284,21 +297,37 @@ fn record_clamp(
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
 ) -> bool {
-    record_clamp_as(c, l, dst, budget, src, count, spec, false)
+    record_clamp_as(
+        c,
+        l,
+        dst,
+        D3D12_RESOURCE_STATE_COMMON,
+        budget,
+        src,
+        count,
+        spec,
+        false,
+        true,
+    )
 }
 
 /// [`record_clamp`]; `ahead`: the records are a window clamped ahead of
-/// their draws ([`bound_ahead`]).
+/// their draws ([`bound_ahead`]). `prev_state` is `dst`'s current state on
+/// `l` (`COMMON` or `INDIRECT_ARGUMENT`); `need_uav` indicates whether an
+/// earlier UAV-writing command may have written `src`/`count` without a
+/// subsequent `UAV(NULL)` barrier yet.
 #[allow(clippy::too_many_arguments)]
 fn record_clamp_as(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
     dst: &ID3D12Resource,
+    prev_state: D3D12_RESOURCE_STATES,
     budget: u64,
     (src, src_offset): (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
     (kind, stride, records): (u32, u32, u32),
     ahead: bool,
+    need_uav: bool,
 ) -> bool {
     let Some(bytes) = validate_layout(
         (kind, stride, records),
@@ -347,9 +376,11 @@ fn record_clamp_as(
     // SAFETY: an open list; our root signature and pipeline; live source,
     // count, scratch destination, and budget buffers. `src` and `count` stay
     // in `COMMON` / `GENERIC_READ` via implicit buffer promotion while `dst`
-    // transitions `COMMON -> UNORDERED_ACCESS -> INDIRECT_ARGUMENT`.
-    // Diagnostics: counted; `VICTORY_BARRIER_TEST=indirect` leaves the two
-    // waits for every earlier shader write out (the state changes stay).
+    // transitions `prev_state -> UNORDERED_ACCESS -> INDIRECT_ARGUMENT`.
+    // The `UNORDERED_ACCESS -> INDIRECT_ARGUMENT` transition on `dst` itself
+    // synchronizes all clamp CS UAV writes to `dst` for `ExecuteIndirect`,
+    // eliminating the redundant post-clamp global `UAV(NULL)` flush; the
+    // pre-clamp `UAV(NULL)` is emitted only when `need_uav` is true.
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
     #[cfg(feature = "diagnostics")]
@@ -358,24 +389,18 @@ fn record_clamp_as(
     let waits = true;
     let first = [
         uav_barrier(),
-        transition(
-            dst,
-            D3D12_RESOURCE_STATE_COMMON,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-        ),
+        transition(dst, prev_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
     ];
-    let second = [
-        uav_barrier(),
-        transition(
-            dst,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-        ),
-    ];
-    let skip = usize::from(!waits);
+    let second = [transition(
+        dst,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+    )];
+    let skip_first_uav = usize::from(!(waits && need_uav));
     unsafe {
-        // Earlier shader writes (the title's argument and count passes) first.
-        l.ResourceBarrier(&first[skip..]);
+        // Earlier shader writes (the title's argument and count passes) first,
+        // only when a UAV writer may have executed since the last UAV barrier.
+        l.ResourceBarrier(&first[skip_first_uav..]);
         if records > 0 {
             l.SetComputeRootSignature(&c.root);
             l.SetPipelineState(&c.pso);
@@ -386,17 +411,18 @@ fn record_clamp_as(
             l.SetComputeRootUnorderedAccessView(4, budget);
             l.Dispatch(records.div_ceil(64), 1, 1);
         }
-        l.ResourceBarrier(&second[skip..]);
+        l.ResourceBarrier(&second);
     }
     true
 }
 
-/// After indirect execution (or if preparation failed after [`bound`]):
-/// returns the scratch buffer to the common state for the next call.
-pub(crate) fn done(list: &HostList, scratch: &ID3D12Resource) {
+#[cfg(test)]
+fn done(list: &HostList, scratch: &ID3D12Resource) {
     done_on(&list.list, scratch);
+    list.set_indirect_state(D3D12_RESOURCE_STATE_COMMON);
 }
 
+#[cfg(test)]
 fn done_on(list: &ID3D12GraphicsCommandList, scratch: &ID3D12Resource) {
     // SAFETY: an open list and a live scratch buffer in INDIRECT_ARGUMENT.
     unsafe {
@@ -999,11 +1025,13 @@ void main() {
                 &warp.clamp,
                 &warp.list,
                 &dst_buf,
+                D3D12_RESOURCE_STATE_COMMON,
                 budget_gpu,
                 (&src_buf, 0),
                 None,
                 (KIND_MESH, STRIDE, RECORDS),
                 ahead,
+                true,
             ));
             done_on(&warp.list, &dst_buf);
             // SAFETY: an open list; the scratch buffer is copied for the check.
@@ -1212,6 +1240,234 @@ void main() {
         list.close();
         host.execute(&[&list]);
         list.reset();
+    }
+
+    /// Live RTX 3090 D3D12 Debug Layer validation of Phase 7B indirect clamping:
+    /// verifies (1) eliminating the post-clamp global `UAV(NULL)` barrier,
+    /// (2) keeping `dst` in `INDIRECT_ARGUMENT` across consecutive windowed
+    /// `ExecuteIndirect` hits (0 barriers/dispatches), (3) direct
+    /// `INDIRECT_ARGUMENT -> UNORDERED_ACCESS` transition with `need_uav=false`
+    /// on subsequent clamps, and (4) single `INDIRECT_ARGUMENT -> COMMON` on
+    /// list close produce exact GPU results and ZERO D3D12 Debug Layer errors.
+    #[test]
+    #[ignore = "enables D3D12 Debug Layer (must run alone, not alongside shared host::host() tests)"]
+    fn live_rtx3090_indirect_clamp_debug_layer() {
+        // SAFETY: live hardware D3D12 Debug Layer bring-up and command list execution.
+        unsafe {
+            let mut debug: Option<ID3D12Debug> = None;
+            D3D12GetDebugInterface(&mut debug).expect("D3D12 Debug Layer must be available");
+            debug.unwrap().EnableDebugLayer();
+
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
+            let mut hw_adapter: Option<IDXGIAdapter1> = None;
+            for i in 0.. {
+                let Ok(a) = factory.EnumAdapters1(i) else { break };
+                let desc = a.GetDesc1().unwrap();
+                if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
+                    hw_adapter = Some(a);
+                    break;
+                }
+            }
+            let adapter = hw_adapter.expect("hardware DXGI adapter required");
+            let mut device: Option<ID3D12Device> = None;
+            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).unwrap();
+            let device = device.unwrap();
+            let info_queue: ID3D12InfoQueue = device.cast().expect("ID3D12InfoQueue");
+            info_queue.ClearStoredMessages();
+
+            let queue: ID3D12CommandQueue = device
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    ..Default::default()
+                })
+                .unwrap();
+            let allocator: ID3D12CommandAllocator = device
+                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                .unwrap();
+            let list: ID3D12GraphicsCommandList = device
+                .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)
+                .unwrap();
+            let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let event = CreateEventW(None, false, false, None).unwrap();
+
+            let clamp = make_for(&device).expect("clamp CS");
+            let worker = compile_cs(&device, WORKER_CS).expect("worker CS");
+
+            let make_shared = |size: u64| -> (ID3D12Resource, *mut u32, u64) {
+                let heap = D3D12_HEAP_PROPERTIES {
+                    Type: D3D12_HEAP_TYPE_CUSTOM,
+                    CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+                    MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+                    ..Default::default()
+                };
+                let desc = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: size.max(64),
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                    ..Default::default()
+                };
+                let mut res: Option<ID3D12Resource> = None;
+                device
+                    .CreateCommittedResource(
+                        &heap,
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        D3D12_RESOURCE_STATE_COMMON,
+                        None,
+                        &mut res,
+                    )
+                    .unwrap();
+                let res = res.unwrap();
+                let mut ptr = std::ptr::null_mut();
+                res.Map(0, None, Some(&mut ptr)).unwrap();
+                std::ptr::write_bytes(ptr.cast::<u8>(), 0, size.max(64) as usize);
+                let gpu = res.GetGPUVirtualAddress();
+                (res, ptr.cast::<u32>(), gpu)
+            };
+
+            let (src, src_ptr, _) = make_shared(256);
+            let (_budget_buf, _budget_ptr, budget_gpu) = make_shared(64);
+            let (_hits_buf, hits_ptr, hits_gpu) = make_shared(64);
+
+            // Window 1: two 12-byte dispatch records: (2,1,1) and (3,1,1)
+            std::slice::from_raw_parts_mut(src_ptr, 6).copy_from_slice(&[2, 1, 1, 3, 1, 1]);
+            // Window 2 at byte offset 64: one record (5,1,1) + garbage tail (0xFFFF_FFFF, 1, 1)
+            std::slice::from_raw_parts_mut(src_ptr.add(16), 6)
+                .copy_from_slice(&[5, 1, 1, u32::MAX, 1, 1]);
+
+            let dst_heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_DEFAULT,
+                ..Default::default()
+            };
+            let dst_desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: 64 << 10,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                ..Default::default()
+            };
+            let mut dst: Option<ID3D12Resource> = None;
+            device
+                .CreateCommittedResource(
+                    &dst_heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &dst_desc,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut dst,
+                )
+                .unwrap();
+            let dst = dst.unwrap();
+
+            let arg = D3D12_INDIRECT_ARGUMENT_DESC {
+                Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH,
+                ..Default::default()
+            };
+            let sig_desc = D3D12_COMMAND_SIGNATURE_DESC {
+                ByteStride: 12,
+                NumArgumentDescs: 1,
+                pArgumentDescs: &arg,
+                NodeMask: 0,
+            };
+            let mut sig: Option<ID3D12CommandSignature> = None;
+            device
+                .CreateCommandSignature(&sig_desc, None::<&ID3D12RootSignature>, &mut sig)
+                .unwrap();
+            let sig = sig.unwrap();
+
+            // 1. First clamp: COMMON -> UAV (with initial UAV barrier), clamp 2 records, UAV -> INDIRECT_ARGUMENT (NO second UAV barrier!).
+            assert!(record_clamp_as(
+                &clamp,
+                &list,
+                &dst,
+                D3D12_RESOURCE_STATE_COMMON,
+                budget_gpu,
+                (&src, 0),
+                None,
+                (2, 12, 2),
+                true,
+                true,
+            ));
+            list.SetComputeRootSignature(&worker.root);
+            list.SetPipelineState(&worker.pso);
+            list.SetComputeRootUnorderedAccessView(0, hits_gpu);
+            // Draw 1 from window offset 0 -> 2 groups
+            list.ExecuteIndirect(&sig, 1, &dst, 0, None, 0);
+            // 2. Window hit from offset 12 -> 3 groups (ZERO clamp, ZERO barriers; dst stays in INDIRECT_ARGUMENT!)
+            list.ExecuteIndirect(&sig, 1, &dst, 12, None, 0);
+
+            // 3. Second clamp: direct INDIRECT_ARGUMENT -> UAV with need_uav=false (ZERO UAV barriers before OR after!).
+            assert!(record_clamp_as(
+                &clamp,
+                &list,
+                &dst,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                budget_gpu,
+                (&src, 64),
+                None,
+                (2, 12, 2),
+                true,
+                false,
+            ));
+            list.SetComputeRootSignature(&worker.root);
+            list.SetPipelineState(&worker.pso);
+            list.SetComputeRootUnorderedAccessView(0, hits_gpu);
+            // Draw 3 from offset 0 -> 5 groups (garbage slot 1 stays clamped/empty)
+            list.ExecuteIndirect(&sig, 1, &dst, 0, None, 0);
+
+            // 4. List close returns scratch buffer once: INDIRECT_ARGUMENT -> COMMON.
+            done_on(&list, &dst);
+
+            list.Close().unwrap();
+            let cmd: ID3D12CommandList = list.cast().unwrap();
+            queue.ExecuteCommandLists(&[Some(cmd)]);
+            queue.Signal(&fence, 1).unwrap();
+            fence.SetEventOnCompletion(1, event).unwrap();
+            WaitForSingleObject(event, INFINITE);
+
+            let hits = hits_ptr.read_volatile();
+            assert_eq!(hits, 2 + 3 + 5, "all three indirect dispatches must execute exact counts");
+
+            let count = info_queue.GetNumStoredMessages();
+            let mut errors = Vec::new();
+            for i in 0..count {
+                let mut len = 0usize;
+                let _ = info_queue.GetMessage(i, None, &mut len);
+                if len == 0 {
+                    continue;
+                }
+                let mut buf = vec![0u8; len];
+                if info_queue
+                    .GetMessage(i, Some(buf.as_mut_ptr().cast()), &mut len)
+                    .is_ok()
+                {
+                    let msg = &*buf.as_ptr().cast::<D3D12_MESSAGE>();
+                    if matches!(
+                        msg.Severity,
+                        D3D12_MESSAGE_SEVERITY_CORRUPTION | D3D12_MESSAGE_SEVERITY_ERROR
+                    ) {
+                        let text = std::ffi::CStr::from_ptr(msg.pDescription as *const i8)
+                            .to_string_lossy()
+                            .into_owned();
+                        errors.push(text);
+                    }
+                }
+            }
+            assert!(
+                errors.is_empty(),
+                "D3D12 Debug Layer reported {} error(s): {errors:?}",
+                errors.len()
+            );
+        }
     }
 }
 
