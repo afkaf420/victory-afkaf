@@ -5391,10 +5391,15 @@ impl Host {
     /// `flown`: the submission is sent ahead with [`relay`]. Its compare
     /// then stores the hashes it makes (see [`flagged_pieces`] and
     /// `relay`).
-    fn card_before(&self, runs: &[&HostList], flown: bool, prev_graphics_fence: u64) -> Option<CardPlan> {
+    fn card_before(
+        &self,
+        runs: &[&HostList],
+        flown: bool,
+        prev_graphics_fence: u64,
+    ) -> (Option<CardPlan>, Vec<lazy_readback::PendingClaim>) {
         use std::sync::Arc;
         if !crate::shadow::cards() {
-            return None;
+            return (None, Vec::new());
         }
         // The ranges this submission's shaders may write, per copy.
         let mut declared: Vec<(Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
@@ -5415,20 +5420,13 @@ impl Host {
                 }
             }
         }
-        // PC-Native VRAM Promotion (Move 1 + Move 2): drop `GpuReadOnly`
-        // outright, and claim `WriteCombinedGpuRw` (and `CachedGpuRw` in mode 2)
-        // blocks as `GpuResident` up to THIS submission's fence so pure GPU/WC
-        // buffers never allocate `Card::before`, never run `CARD_COMPARE`, and
-        // never read back over PCIe unless the CPU touches them.
-        #[cfg(feature = "diagnostics")]
-        let flight_fence = if timing() {
-            prev_graphics_fence.saturating_add(runs.len().max(1) as u64)
-        } else {
-            prev_graphics_fence.saturating_add(1)
-        };
-        #[cfg(not(feature = "diagnostics"))]
-        let flight_fence = prev_graphics_fence.saturating_add(1);
-        native_vram::filter_declared(&mut declared, flight_fence);
+        // PC-Native VRAM Promotion (Move 1 + Move 2 Phase 1): drop `GpuReadOnly`
+        // outright, and PLAN eligible `WriteCombinedGpuRw` (and `CachedGpuRw` in
+        // mode 2) blocks WITHOUT arming `PAGE_NOACCESS` or mutating `last_fence`
+        // yet! Phase 2 (`commit_lazy_claims`) runs in `submit()` ONLY AFTER
+        // `self.queue.Signal(&self.fence, *submitted)` succeeds, preventing any
+        // self-deadlock with `card_dirty` -> `Shadow::copy_dirty_to_ring`.
+        let pending_claims = native_vram::filter_declared(&mut declared);
         // With the relay: the order of the queue is held from here until
         // what is taken is on the queue, and the taking is numbered.
         let mut order = relay().then(|| QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
@@ -5441,10 +5439,12 @@ impl Host {
         };
         let mut dirty = crate::shadow::card_dirty(sent_as);
         if declared.is_empty() && dirty.is_empty() {
-            return None;
+            return (None, pending_claims);
         }
         let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
-        let work = work.as_mut()?;
+        let Some(work) = work.as_mut() else {
+            return (None, pending_claims);
+        };
         // A copy whose shader writes are declared for the first time gets
         // its bytes from before, whole. Buffers/windows with 0 declared UAV
         // writes never allocate `Card::before` or run GPU hashing.
@@ -5616,7 +5616,7 @@ impl Host {
         // Fast path: all uploads ran asynchronously on `upload_queue` with
         // 0 declared UAV writes and no graphics-queue rehash/compare work.
         if declared.is_empty() && used.is_empty() {
-            return None;
+            return (None, pending_claims);
         }
         let mut plan = CardPlan {
             ranges: Vec::new(),
@@ -5702,7 +5702,7 @@ impl Host {
             plan.lists.push((true, check));
         }
         work.out += 1;
-        Some(plan)
+        (Some(plan), pending_claims)
     }
 
     /// With [`relay`]: whether the compare's result area is half taken by
@@ -6293,6 +6293,7 @@ impl Host {
                     self.card_sent();
                     *submitted += 1;
                     self.queue.Signal(&self.fence, *submitted)?;
+                    lazy_readback::note_signaled_fence(*submitted);
                     self.fence.SetEventOnCompletion(*submitted, self.event)?;
                     let was_working = working(false);
                     WaitForSingleObject(self.event, INFINITE);
@@ -6873,7 +6874,7 @@ impl Host {
             settled += settling.elapsed();
         }
         let t_card = std::time::Instant::now();
-        let card = self.card_before(runs, flown, *submitted);
+        let (card, pending_claims) = self.card_before(runs, flown, *submitted);
         // Dirty sends are taken: from here on the references hold what the
         // placed copies in the lists put.
         for (shadow, at, bytes) in batch.placed.drain(..) {
@@ -6904,6 +6905,11 @@ impl Host {
             if let Err(e) = signalled {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
             }
+            // Phase 2 commit: `*submitted` is now guaranteed queued & signaled on
+            // `self.queue`, so arming `PAGE_NOACCESS` / `last_fence = *submitted`
+            // can NEVER deadlock `victory-lazy-fetch` on an unsignaled fence.
+            lazy_readback::note_signaled_fence(*submitted);
+            native_vram::commit_lazy_claims(pending_claims, *submitted);
             let back = declared_writes(runs);
             let mut texture_back_ranges = Vec::new();
             for list in runs {
@@ -6955,7 +6961,10 @@ impl Host {
                 let waited = self
                     .queue
                     .Signal(&self.fence, *submitted)
-                    .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
+                    .and_then(|()| {
+                        lazy_readback::note_signaled_fence(*submitted);
+                        self.fence.SetEventOnCompletion(*submitted, self.event)
+                    });
                 match waited {
                     Ok(()) => {
                         working(false);
@@ -6992,6 +7001,7 @@ impl Host {
             }
             let _ = (i, started);
         }
+        native_vram::commit_lazy_claims(pending_claims, *submitted);
         let _ = &firsts;
         FINISHED.store(this_submission, Ordering::Release);
         bury(this_submission);

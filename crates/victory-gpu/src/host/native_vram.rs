@@ -177,27 +177,20 @@ pub(crate) fn is_lazy_owner(block: usize, shadow_id: u64) -> bool {
         == Some(shadow_id)
 }
 
-/// Records `shadow_id` as the owner of every 64 KiB block in `before` that
-/// `lazy_readback::claim_gpu_resident` promoted (i.e. now `is_gpu_resident` and
-/// no longer present in `remaining`).
-fn record_lazy_owners(shadow_id: u64, before: &[(usize, usize)], remaining: &[(usize, usize)]) {
-    let block_sz = super::lazy_readback::BLOCK;
-    let mut claimed = Vec::new();
-    for &(from, to) in before {
-        if from >= to {
-            continue;
-        }
-        for block in from / block_sz..to.div_ceil(block_sz) {
-            let b_lo = block * block_sz;
-            let b_hi = b_lo.saturating_add(block_sz);
-            if !super::touches(remaining, b_lo, b_hi) && super::lazy_readback::is_gpu_resident(block) {
-                claimed.push(block);
-            }
-        }
+/// Commits Phase 1 [`super::lazy_readback::PendingClaim`]s IMMEDIATELY AFTER
+/// `Host::queue.Signal(&Host::fence, signaled_fence)` succeeds, arming
+/// `PAGE_NOACCESS` / `last_fence` and recording per-block shadow ownership.
+pub(super) fn commit_lazy_claims(
+    claims: Vec<super::lazy_readback::PendingClaim>,
+    signaled_fence: u64,
+) {
+    if claims.is_empty() {
+        return;
     }
-    if !claimed.is_empty() {
+    let committed = super::lazy_readback::commit_gpu_resident(claims, signaled_fence);
+    if !committed.is_empty() {
         let mut map = lazy_owners().write().unwrap_or_else(|e| e.into_inner());
-        for block in claimed {
+        for (block, shadow_id) in committed {
             map.insert(block, shadow_id);
         }
     }
@@ -215,22 +208,23 @@ pub(crate) fn forget_lazy_owner(shadow_id: u64) {
 
 /// Coalesces each shadow's declared UAV write ranges and filters them under
 /// Move 1 (`VICTORY_NATIVE_VRAM`, dropping `GpuReadOnly` outright) and Move 2
-/// (`VICTORY_LAZY_READBACK`, claiming eligible `WriteCombinedGpuRw` /
-/// `CachedGpuRw` blocks as `GpuResident` up to `flight_fence`). Shadows whose
-/// ranges drop/claim completely are removed from `declared` so they never
-/// allocate `Card::before`, never run GPU compare, and never read back over PCIe.
+/// Phase 1 (`lazy_readback::plan_gpu_resident`, validating eligible
+/// `WriteCombinedGpuRw` / `CachedGpuRw` blocks WITHOUT arming `PAGE_NOACCESS`
+/// or touching `last_fence` until `Host::queue.Signal` succeeds!).
+///
+/// Returns the pending Move 2 claims for [`commit_lazy_claims`] after `Signal`.
 pub(super) fn filter_declared(
     declared: &mut Vec<(Arc<Shadow>, Vec<(usize, usize)>)>,
-    flight_fence: u64,
-) {
+) -> Vec<super::lazy_readback::PendingClaim> {
     if declared.is_empty() {
-        return;
+        return Vec::new();
     }
     let active = mode();
     let lazy_on = super::lazy_readback::on();
     if active == Mode::Off && !lazy_on {
-        return;
+        return Vec::new();
     }
+    let mut pending_claims = Vec::new();
     let mut skipped_shadows = 0u64;
     for (shadow, ranges) in declared.iter_mut() {
         super::join_ranges(ranges, std::iter::empty());
@@ -243,8 +237,8 @@ pub(super) fn filter_declared(
         }
         if lazy_on && !ranges.is_empty() {
             let before = std::mem::take(ranges);
-            let remaining = super::lazy_readback::claim_gpu_resident(shadow, &before, flight_fence);
-            record_lazy_owners(shadow.id(), &before, &remaining);
+            let (claims, remaining) = super::lazy_readback::plan_gpu_resident(shadow, &before);
+            pending_claims.extend(claims);
             *ranges = remaining;
         }
         if ranges.is_empty() {
@@ -256,6 +250,7 @@ pub(super) fn filter_declared(
         TOTAL[2].fetch_add(skipped_shadows, Ordering::Relaxed);
         declared.retain(|(_, ranges)| !ranges.is_empty());
     }
+    pending_claims
 }
 
 /// Logs the periodic summary of native-VRAM skipped bytes and ranges (called
@@ -534,6 +529,7 @@ mod tests {
                 host.queue.ExecuteCommandLists(&[Some(cmd)]);
                 host.queue.Signal(&host.fence, val).expect("signal main fence");
             }
+            super::super::lazy_readback::note_signaled_fence(val);
             val
         };
 
@@ -591,6 +587,141 @@ mod tests {
             assert!(std::slice::from_raw_parts(ptr_b, 256).iter().all(|&b| b == 0xB2));
             assert!(std::slice::from_raw_parts(ptr_b2, 256).iter().all(|&b| b == 0xC3));
         }
+
+        if let Some(err) = host.log_messages() {
+            panic!("D3D12 Debug Layer reported error: {err}");
+        }
+    }
+
+    /// Live RTX 3090 D3D12 Debug Layer regression test for the Frame-5785
+    /// self-deadlock (`victory-submit` <-> `victory-lazy-fetch`):
+    /// a dirty `0x2404` `Shadow` (`VICTORY_REBAR_STREAM=1`, mirror-free) with
+    /// BOTH pending CPU dirty bytes AND a UAV write in the SAME submission:
+    ///   Phase 1 `plan_gpu_resident` (no `PAGE_NOACCESS`, no unsignaled `last_fence`)
+    ///   -> `stage_dirty_into_ring` / `Shadow::copy_dirty_to_ring` (zero deadlock!)
+    ///   -> `ExecuteCommandLists` + `Signal(F)`
+    ///   -> `note_signaled_fence(F)` + Phase 2 `commit_lazy_claims(claims, F)`
+    ///   -> real Windows VEH read fault pulls exact GPU bytes (0x7E) over private COPY queue
+    ///   -> ZERO deadlock and ZERO D3D12 Debug Layer errors.
+    #[test]
+    #[ignore]
+    fn debug_layer_lazy_readback_dirty_upload_same_submission_no_deadlock() {
+        use windows::Win32::Graphics::Direct3D12::ID3D12CommandList;
+        use windows::core::Interface;
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        const BLOCK: usize = super::super::lazy_readback::BLOCK;
+
+        let Some(host) = super::super::host() else {
+            panic!("host D3D12 device required for live Debug Layer test");
+        };
+        let _ = host.log_messages();
+
+        // SAFETY: fresh 64 KiB write-watched title allocation freed at test end.
+        let mem = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                BLOCK,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(mem, 0);
+        struct MemGuard(usize);
+        impl Drop for MemGuard {
+            fn drop(&mut self) {
+                crate::watch::title_memory_remapped(self.0, BLOCK);
+                crate::watch::clear_console_memory(self.0, BLOCK);
+                // SAFETY: owned VirtualAlloc region.
+                unsafe { VirtualFree(self.0 as *mut _, 0, MEM_RELEASE) };
+            }
+        }
+        let _mem_guard = MemGuard(mem);
+        crate::watch::note_console_memory(
+            mem,
+            BLOCK,
+            MEM_GRAPHICS,
+            PAGE_GRAPHICS_READWRITE | PAGE_WRITECOMBINE | PAGE_READWRITE,
+        );
+        // SAFETY: committed 64 KiB title memory holding initial dirty CPU data.
+        unsafe { std::ptr::write_bytes(mem as *mut u8, 0x11, BLOCK) };
+
+        // Mirror-free ReBAR-streamed card shadow (`Card::staging == None`), dirty from `update`.
+        let shadow = crate::shadow::test_card_shadow_at(mem as u64, BLOCK as u64)
+            .expect("mirror-free card shadow");
+        assert!(shadow.is_rebar_streaming());
+        assert_eq!(shadow.update(mem, BLOCK), BLOCK);
+
+        // Phase 1 (as in `Host::card_before` BEFORE `card_dirty`): plan without arming!
+        let mut declared = vec![(shadow.clone(), vec![(mem, mem + BLOCK)])];
+        let pending_claims = filter_declared(&mut declared);
+        assert!(declared.is_empty(), "0x2404 block must be planned out of Card::before");
+        assert_eq!(pending_claims.len(), 1);
+        assert!(
+            !super::super::lazy_readback::is_gpu_resident(mem / BLOCK),
+            "Phase 1 plan must NOT set RESIDENT/PAGE_NOACCESS before card_dirty + queue.Signal"
+        );
+
+        // Same-submission `stage_dirty_into_ring` -> `Shadow::copy_dirty_to_ring` -> `ensure_cpu_resident`:
+        // previously deadlocked forever against unsignaled `flight_fence`!
+        let dirty = vec![(shadow.clone(), vec![(0usize, BLOCK)])];
+        let (ring_val, copies) = host
+            .stage_dirty_into_ring(&dirty)
+            .expect("direct ring staging")
+            .expect("non-empty dirty copy");
+        let ring_buf = host.with_upload_ring(|r| r.buffer.clone()).expect("ring buf");
+
+        // Record the dirty upload AND a subsequent GPU write (0x7E) on the same main queue submission.
+        let (gpu_write_src, gpu_write_ptr) = host.upload_buffer(BLOCK as u64).expect("gpu write src");
+        // SAFETY: mapped `BLOCK` upload bytes.
+        unsafe { std::ptr::write_bytes(gpu_write_ptr, 0x7E, BLOCK) };
+        let cmd_list = host.new_list().expect("host list");
+        // SAFETY: open command list and live D3D12 buffers.
+        unsafe {
+            for &(_, dst_off, ring_off, chunk) in &copies {
+                cmd_list
+                    .list
+                    .CopyBufferRegion(&shadow.buffer, dst_off, &ring_buf, ring_off, chunk);
+            }
+            cmd_list
+                .list
+                .CopyBufferRegion(&shadow.buffer, 0, &gpu_write_src, 0, BLOCK as u64);
+        }
+        cmd_list.close();
+
+        // Execute + Signal main fence, THEN note_signaled_fence + Phase 2 commit_lazy_claims!
+        let signaled_fence = {
+            let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+            *submitted += 1;
+            let val = *submitted;
+            let cmd: ID3D12CommandList = cmd_list.list.cast().expect("cast cmd list");
+            // SAFETY: closed list, live queue & fences.
+            unsafe {
+                host.queue.ExecuteCommandLists(&[Some(cmd)]);
+                if let Some(df) = &host.direct_ring_fence {
+                    host.queue.Signal(df, ring_val).expect("signal direct ring fence");
+                }
+                host.queue.Signal(&host.fence, val).expect("signal main fence");
+            }
+            super::super::lazy_readback::note_signaled_fence(val);
+            commit_lazy_claims(pending_claims, val);
+            val
+        };
+        assert!(signaled_fence > 0);
+        assert!(super::super::lazy_readback::is_gpu_resident(mem / BLOCK));
+        assert!(is_lazy_owner(mem / BLOCK, shadow.id()));
+
+        // Real CPU read faults into VEH -> `victory-lazy-fetch` waits on already-signaled `signaled_fence`
+        // -> fetches 64 KiB `0x7E` cleanly with 0 deadlock!
+        // SAFETY: committed 64 KiB block guarded by `lazy_readback` VEH.
+        let first = unsafe { (mem as *const u8).read_volatile() };
+        assert_eq!(first, 0x7E);
+        // SAFETY: block restored to `PAGE_READWRITE`.
+        let all = unsafe { std::slice::from_raw_parts(mem as *const u8, BLOCK) };
+        assert!(all.iter().all(|&b| b == 0x7E), "all 64 KiB must reflect GPU 0x7E bytes");
+        assert!(!super::super::lazy_readback::is_gpu_resident(mem / BLOCK));
 
         if let Some(err) = host.log_messages() {
             panic!("D3D12 Debug Layer reported error: {err}");

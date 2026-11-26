@@ -220,6 +220,17 @@ static RESIDENT: Bits = Bits::new();
 /// O(1) lock-free no-ops in `evict_range` / `flush_shadow` when idle.
 static TRACKED_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+/// Highest fence value confirmed signaled on `Host::queue` (`Host::fence`).
+/// Defense-in-depth guard ensuring `victory-lazy-fetch` can never issue
+/// `rb_queue.Wait(&main_fence, F)` for an unsignaled future fence `F`.
+static SIGNALED_FENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Records that `val` has been signaled on `Host::queue` (`Host::fence`).
+#[inline]
+pub(crate) fn note_signaled_fence(val: u64) {
+    SIGNALED_FENCE.fetch_max(val, Ordering::Release);
+}
+
 /// Fast O(1) lock-free check: true if 64 KiB block `block = va >> 16` is
 /// currently `GpuResident` (or mid-fetch transitioning back to CPU).
 #[inline]
@@ -499,8 +510,26 @@ fn spawn_worker(device: &ID3D12Device, main_fence: ID3D12Fence) -> windows::core
                     // SAFETY: `rb_queue` is privately owned by this thread; `req.buffer`
                     // is kept alive by `req` until after `WaitForSingleObject` completes.
                     unsafe {
-                        if req.last_fence > 0 && main_fence.GetCompletedValue() < req.last_fence {
-                            rb_queue.Wait(&main_fence, req.last_fence)?;
+                        let max_sig = SIGNALED_FENCE.load(Ordering::Acquire);
+                        let wait_fence = if req.last_fence > max_sig {
+                            tracing::error!(
+                                requested = req.last_fence,
+                                signaled = max_sig,
+                                offset = req.gpu_offset,
+                                "victory-lazy-fetch clamped unsignaled future fence to prevent self-deadlock"
+                            );
+                            debug_assert!(
+                                req.last_fence <= max_sig,
+                                "lazy_readback requested wait on unsignaled fence {} > {}",
+                                req.last_fence,
+                                max_sig
+                            );
+                            max_sig
+                        } else {
+                            req.last_fence
+                        };
+                        if wait_fence > 0 && main_fence.GetCompletedValue() < wait_fence {
+                            rb_queue.Wait(&main_fence, wait_fence)?;
                         }
                         rb_alloc.Reset()?;
                         rb_list.Reset(&rb_alloc, None)?;
@@ -584,13 +613,11 @@ fn block_class_eligible(block_va: usize, m: Mode) -> bool {
     !parts.is_empty() && parts.iter().all(|&(_, _, c)| class_eligible_in(c, m))
 }
 
-/// Checks whether `[block_va, block_va + BLOCK)` is a committed read-write or
-/// read-only title page (not uncommitted/free/noaccess) and flips it to
-/// `PAGE_NOACCESS`. Returns `true` on success.
-fn protect_noaccess(block_va: usize) -> bool {
+/// Checks (read-only) whether `[block_va, block_va + BLOCK)` is a committed
+/// read-write or read-only 64 KiB title block eligible for `PAGE_NOACCESS`.
+fn is_committable_block(block_va: usize) -> bool {
     use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
-        VirtualProtect, VirtualQuery,
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READONLY, PAGE_READWRITE, VirtualQuery,
     };
     // SAFETY: plain out struct for `VirtualQuery`.
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
@@ -600,10 +627,16 @@ fn protect_noaccess(block_va: usize) -> bool {
         return false;
     }
     let region_end = (info.BaseAddress as usize).saturating_add(info.RegionSize);
-    if region_end < block_va.saturating_add(BLOCK) {
-        return false;
-    }
-    if !matches!(info.Protect, PAGE_READWRITE | PAGE_READONLY) {
+    region_end >= block_va.saturating_add(BLOCK)
+        && matches!(info.Protect, PAGE_READWRITE | PAGE_READONLY)
+}
+
+/// Checks whether `[block_va, block_va + BLOCK)` is a committed read-write or
+/// read-only title page (not uncommitted/free/noaccess) and flips it to
+/// `PAGE_NOACCESS`. Returns `true` on success.
+fn protect_noaccess(block_va: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{PAGE_NOACCESS, VirtualProtect};
+    if !is_committable_block(block_va) {
         return false;
     }
     let mut old = 0u32;
@@ -618,23 +651,30 @@ fn protect_readwrite(block_va: usize) -> bool {
     unsafe { VirtualProtect(block_va as *const _, BLOCK, PAGE_READWRITE, &mut old) != 0 }
 }
 
-/// Claims eligible 64 KiB blocks in `ranges` on carded `shadow` as
-/// `GpuResident` up to `fence`, returning any non-claimed sub-ranges that must
-/// still go through `Card::before` / `relay_card_back`.
+/// A 64 KiB block validated in Phase 1 ([`plan_gpu_resident`], inside
+/// `Host::card_before`) and ready to be armed/updated in Phase 2
+/// ([`commit_gpu_resident`]) once `Host::queue.Signal(&Host::fence, F)` has
+/// succeeded.
+pub(crate) struct PendingClaim {
+    pub(crate) block: usize,
+    pub(crate) shadow: Arc<Shadow>,
+    pub(crate) gpu_offset: u64,
+}
+
+/// **Phase 1 (plan)** of 2-phase lazy readback claiming, called inside
+/// `Host::card_before()` BEFORE `card_dirty()` / `copy_dirty_to_ring()` and
+/// BEFORE `Host::queue.Signal(&Host::fence, F)`.
 ///
-/// Safety filters (any failing block stays in the returned `Vec`):
-/// - `VICTORY_LAZY_READBACK` disabled or `victory-lazy-fetch` not initialized.
-/// - `!shadow.carded()` or `shadow.in_place()`.
-/// - 64 KiB block extends outside `[shadow.start, shadow.start + shadow.len)`.
-/// - Block is not uniformly an eligible `ConsoleMemClass` (`0x2404`, or `+ 0x2004` in mode `2`).
-/// - Physical page is aliased at `>= 2` title views (`inplace::pages_of.len() >= 2`).
-/// - Block was previously demoted to `CpuHot` (`>= 2` CPU faults).
-/// - Block is currently mid-fetch (`Fetching`) or fails `VirtualProtect(PAGE_NOACCESS)`.
-pub(crate) fn claim_gpu_resident(
+/// Validates every 64 KiB block in `ranges` against all safety filters and
+/// returns `(pending_claims, remaining_ranges)` WITHOUT mutating `RESIDENT`,
+/// WITHOUT calling `VirtualProtect(PAGE_NOACCESS)`, and WITHOUT storing an
+/// unsignaled future fence in `last_fence` — eliminating any possibility of
+/// self-deadlock when `card_dirty` uploads pending CPU bytes of the same block
+/// in the same submission.
+pub(crate) fn plan_gpu_resident(
     shadow: &Arc<Shadow>,
     ranges: &[(usize, usize)],
-    fence: u64,
-) -> Vec<(usize, usize)> {
+) -> (Vec<PendingClaim>, Vec<(usize, usize)>) {
     let m = active_mode();
     if m == Mode::Off
         || ranges.is_empty()
@@ -642,17 +682,14 @@ pub(crate) fn claim_gpu_resident(
         || shadow.in_place()
         || !has_live_fetcher()
     {
-        return ranges.to_vec();
+        return (Vec::new(), ranges.to_vec());
     }
     let (span_start_u64, span_len_u64) = shadow.span();
     let span_start = span_start_u64 as usize;
     let span_end = span_start.saturating_add(span_len_u64 as usize);
-    let shadow_id = shadow.id();
-
-    // Ensure `watch::on_write` VEH is installed ahead of any `PAGE_NOACCESS`.
-    crate::watch::install();
 
     let (lock, _cv) = state();
+    let mut pending: Vec<PendingClaim> = Vec::new();
     let mut remaining: Vec<(usize, usize)> = Vec::new();
     let push_rem = |out: &mut Vec<(usize, usize)>, lo: usize, hi: usize| {
         if lo >= hi {
@@ -693,54 +730,126 @@ pub(crate) fn claim_gpu_resident(
                 continue;
             }
             let gpu_offset = (b_lo - span_start) as u64;
-            let mut s = lock.lock().unwrap_or_else(|e| e.into_inner());
-            match s.blocks.get_mut(&block) {
-                Some(BlockState::GpuResident(info)) => {
-                    // O(1) steady-state fast path: 0 `VirtualProtect` syscalls!
-                    info.shadow_id = shadow_id;
-                    info.shadow = Some(Arc::downgrade(shadow));
-                    info.gpu_offset = gpu_offset;
-                    info.last_fence = info.last_fence.max(fence);
-                    stat(1, 1);
-                }
-                Some(BlockState::CpuHot) | Some(BlockState::Fetching { .. }) => {
-                    push_rem(&mut remaining, sub_lo, sub_hi);
-                }
-                None => {
-                    if s.fault_counts.get(&block).copied().unwrap_or(0) >= DEMOTE_THRESHOLD {
-                        s.blocks.insert(block, BlockState::CpuHot);
-                        s.sync_tracked();
-                        push_rem(&mut remaining, sub_lo, sub_hi);
-                        continue;
+            let eligible = {
+                let mut s = lock.lock().unwrap_or_else(|e| e.into_inner());
+                match s.blocks.get(&block) {
+                    Some(BlockState::GpuResident(_)) => Some(true),
+                    Some(BlockState::CpuHot) | Some(BlockState::Fetching { .. }) => Some(false),
+                    None => {
+                        if s.fault_counts.get(&block).copied().unwrap_or(0) >= DEMOTE_THRESHOLD {
+                            s.blocks.insert(block, BlockState::CpuHot);
+                            s.sync_tracked();
+                            Some(false)
+                        } else {
+                            None
+                        }
                     }
-                    // Release any `watch` read-only guard on `block` before
-                    // setting `PAGE_NOACCESS` (strict lock order: `STATE -> GUARDS`
-                    // never reverses because `GUARDS` never locks `STATE`).
-                    crate::watch::release_guard_for_lazy(block);
-                    // Mark `RESIDENT` BEFORE `VirtualProtect(PAGE_NOACCESS)` so any
-                    // racing VEH fault on another thread sees `RESIDENT == 1`.
-                    RESIDENT.set(block);
-                    if protect_noaccess(b_lo) {
-                        s.blocks.insert(
-                            block,
-                            BlockState::GpuResident(ResidentInfo {
-                                shadow_id,
-                                shadow: Some(Arc::downgrade(shadow)),
-                                gpu_offset,
-                                last_fence: fence,
-                            }),
-                        );
-                        s.sync_tracked();
-                        LIVE_BLOCKS.fetch_add(1, Ordering::Relaxed);
-                        stat(0, 1);
-                    } else {
-                        RESIDENT.clear(block);
-                        push_rem(&mut remaining, sub_lo, sub_hi);
-                    }
+                }
+            };
+            let take = match eligible {
+                Some(v) => v,
+                None => is_committable_block(b_lo),
+            };
+            if take {
+                if pending.last().is_none_or(|c| c.block != block) {
+                    pending.push(PendingClaim {
+                        block,
+                        shadow: shadow.clone(),
+                        gpu_offset,
+                    });
+                }
+            } else {
+                push_rem(&mut remaining, sub_lo, sub_hi);
+            }
+        }
+    }
+    (pending, remaining)
+}
+
+/// **Phase 2 (commit)** of 2-phase lazy readback claiming, called IMMEDIATELY
+/// AFTER `Host::queue.Signal(&Host::fence, signaled_fence)` succeeds (and after
+/// [`note_signaled_fence`]). Arms `PAGE_NOACCESS` / `RESIDENT` on newly
+/// promoted blocks and advances `last_fence` in O(1) on already-`GpuResident`
+/// blocks. Returns `(block, shadow_id)` for every committed block.
+pub(crate) fn commit_gpu_resident(
+    claims: Vec<PendingClaim>,
+    signaled_fence: u64,
+) -> Vec<(usize, u64)> {
+    if claims.is_empty() {
+        return Vec::new();
+    }
+    // Ensure `watch::on_write` VEH is installed ahead of any `PAGE_NOACCESS`.
+    crate::watch::install();
+
+    let (lock, _cv) = state();
+    let mut committed = Vec::with_capacity(claims.len());
+    for claim in claims {
+        let PendingClaim {
+            block,
+            shadow,
+            gpu_offset,
+        } = claim;
+        let shadow_id = shadow.id();
+        let b_lo = block * BLOCK;
+        let mut s = lock.lock().unwrap_or_else(|e| e.into_inner());
+        match s.blocks.get_mut(&block) {
+            Some(BlockState::GpuResident(info)) => {
+                // O(1) steady-state fast path: 0 `VirtualProtect` syscalls!
+                info.shadow_id = shadow_id;
+                info.shadow = Some(Arc::downgrade(&shadow));
+                info.gpu_offset = gpu_offset;
+                info.last_fence = info.last_fence.max(signaled_fence);
+                stat(1, 1);
+                committed.push((block, shadow_id));
+            }
+            Some(BlockState::CpuHot) | Some(BlockState::Fetching { .. }) => {
+                // Racing thread faulted/demoted between plan and commit; leave intact.
+            }
+            None => {
+                if s.fault_counts.get(&block).copied().unwrap_or(0) >= DEMOTE_THRESHOLD {
+                    s.blocks.insert(block, BlockState::CpuHot);
+                    s.sync_tracked();
+                    continue;
+                }
+                // Release any `watch` read-only guard on `block` before
+                // setting `PAGE_NOACCESS` (strict lock order: `STATE -> GUARDS`
+                // never reverses because `GUARDS` never locks `STATE`).
+                crate::watch::release_guard_for_lazy(block);
+                // Mark `RESIDENT` BEFORE `VirtualProtect(PAGE_NOACCESS)` so any
+                // racing VEH fault on another thread sees `RESIDENT == 1`.
+                RESIDENT.set(block);
+                if protect_noaccess(b_lo) {
+                    s.blocks.insert(
+                        block,
+                        BlockState::GpuResident(ResidentInfo {
+                            shadow_id,
+                            shadow: Some(Arc::downgrade(&shadow)),
+                            gpu_offset,
+                            last_fence: signaled_fence,
+                        }),
+                    );
+                    s.sync_tracked();
+                    LIVE_BLOCKS.fetch_add(1, Ordering::Relaxed);
+                    stat(0, 1);
+                    committed.push((block, shadow_id));
+                } else {
+                    RESIDENT.clear(block);
                 }
             }
         }
     }
+    committed
+}
+
+/// Convenience wrapper for unit tests that have already signaled `fence`.
+#[cfg(test)]
+pub(crate) fn claim_gpu_resident(
+    shadow: &Arc<Shadow>,
+    ranges: &[(usize, usize)],
+    fence: u64,
+) -> Vec<(usize, usize)> {
+    let (claims, remaining) = plan_gpu_resident(shadow, ranges);
+    let _ = commit_gpu_resident(claims, fence);
     remaining
 }
 
