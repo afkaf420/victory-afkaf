@@ -1032,12 +1032,38 @@ fn per_lane_self_loop_and_latch_are_not_all_lanes_and_emit_no_loop_sync() {
                     "Mode A must not inject barriers into per-lane loop (multi_block={multi_block})"
                 );
             } else {
-                // Mode B: 1 `wave_base` atomic + 5 atomics from the single top-level
-                // `v_readlane_b32` exchange (arrival Add, volatile Or(0) loads of
-                // partner/dead in spin_enter and spin_hdr, timeout Xchg) = 6 total;
-                // 0 Mode B spins injected into the per-lane loop!
+                // Default `VICTORY_ALL_GROUP_BARRIER=1`: the single top-level `all_group`
+                // `v_readlane_b32` uses Mode A `BAR.SYNC` (0 Mode B spin atomics, only the
+                // 1 entry `wave_base` atomic, and 2 hardware barriers total), and 0 barriers
+                // or Mode B spins are injected into the per-lane loop!
                 assert_eq!(
-                    l.atomic_rmws, 6,
+                    l.atomic_rmws, 1,
+                    "all_group Mode A must emit 0 spin atomics (multi_block={multi_block})"
+                );
+                assert_eq!(
+                    l.barriers, 2,
+                    "all_group Mode A must not inject barriers into per-lane loop (multi_block={multi_block})"
+                );
+                // With `VICTORY_ALL_GROUP_BARRIER=0`, Mode B still injects 0 spin loops
+                // into the per-lane loop (1 `wave_base` + 5 from the top-level readlane = 6).
+                let was_wave_b = lower::TEST_HOST_WAVE.replace(Some(32));
+                let was_agb = lower::TEST_ALL_GROUP_BARRIER.replace(Some(false));
+                let lb = lower::lower(&lower::Parts {
+                    native: &native,
+                    p: &p,
+                    st: &st,
+                    io: &io,
+                    res: &res,
+                    inputs: Vec::new(),
+                    outputs: Vec::new(),
+                    prims: Vec::new(),
+                    mesh_stride: 0,
+                })
+                .expect("lower paired loop (Mode B)");
+                lower::TEST_ALL_GROUP_BARRIER.set(was_agb);
+                lower::TEST_HOST_WAVE.set(was_wave_b);
+                assert_eq!(
+                    lb.atomic_rmws, 6,
                     "Mode B must not inject a spin loop into per-lane loop (multi_block={multi_block})"
                 );
             }
@@ -1269,5 +1295,196 @@ fn last_resort_widen_rescues_wave64_lds_conflict_on_wave32() {
         .expect("dispatch rescued shader");
     for t in 0..64u32 {
         assert_eq!(out[0][t as usize], 100 + (t ^ 32), "lane {t}");
+    }
+}
+
+/// Phase 8C-2 Killer #1 live RTX 3090 test (`thr=(8, 16, 1)` = 128 threads,
+/// 2 independent console Wave64s):
+/// - Part A: all-group cross-half `v_readlane_b32` + `ds_bpermute_b32` use
+///   hardware Mode A `BAR.SYNC` (`barrier(9)`), emitting ZERO Mode B spin-loop
+///   atomics (`atomic_rmws == 1`, only the entry `wave_base` atomic) vs
+///   `VICTORY_ALL_GROUP_BARRIER=0` (`atomic_rmws > 1`), with bit-exact results
+///   for all 128 lanes (console wave 0 and console wave 1 disjoint in LDS).
+/// - Part B: mixed `all_group` Mode A -> divergent wave-wide `!all_group`
+///   Mode B (Console Wave 0 enters, Console Wave 1 skips!) -> reconverged
+///   `all_group` Mode A (`ds_bpermute_b32`): monotonic per-wave `seq` keeps
+///   both halves of each console wave synchronized with zero deadlock and
+///   bit-exact results across all 128 lanes.
+#[test]
+fn all_group_128_thread_uses_mode_a_barrier_and_divergent_uses_mode_b() {
+    let build_8x16 = |body: &[u32]| {
+        let mut native = native_of(body, true, 128);
+        // Set 2D thread group `(8, 16, 1)` = 128 threads (2 console Wave64s).
+        if let StageIo::Cs(ref mut cs) = native.io {
+            cs.threads = [8, 16, 1];
+            // Enable `tid_y` in `v1` (`rsrc2` bit 11 = 1) alongside `tid_x` in `v0`,
+            // or compute flat `v10 = v0 + (v1 << 3)` in the body.
+            cs.rsrc2 = (5 << 1) | (1 << 11);
+        }
+        native
+    };
+    let lower_with_flag = |native: &NativeProgram, flag: bool| {
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let st = structure::structure(&p).expect("structure");
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+        let io = io::raise(&p, native).expect("io::raise");
+        let was_wave = lower::TEST_HOST_WAVE.replace(Some(32));
+        let was_flag = lower::TEST_ALL_GROUP_BARRIER.replace(Some(flag));
+        let out = lower::lower(&lower::Parts {
+            native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        })
+        .expect("lower 8x16 Wave64");
+        lower::TEST_ALL_GROUP_BARRIER.set(was_flag);
+        lower::TEST_HOST_WAVE.set(was_wave);
+        let mut shader = HostShader {
+            stage: HwStage::Cs,
+            dxil: out.dxil.clone(),
+            user_data: out.user_data.clone(),
+            samplers: out.samplers.clone(),
+            static_samplers: Vec::new(),
+            root_cbvs: out.root_cbvs.clone(),
+            root_srvs: out.root_srvs.clone(),
+            root_uavs: out.root_uavs.clone(),
+            root_indexed_views: res.root_indexed_views,
+        };
+        if let Ok(mut v) =
+            validator::Validator::load(validator::Validator::default_path().as_deref())
+        {
+            v.validate(&mut shader.dxil)
+                .expect("8x16 Wave64 DXIL validation failed");
+        }
+        (out, shader)
+    };
+
+    // Part A: pure `all_group` cross-half `v_readlane_b32` (lane 35) + `ds_bpermute_b32` (lane ^ 32).
+    // Flat tid: v3 = (v1 << 3) + v0  (0..127)
+    let words_a = [
+        0x3406_0283, // v_lshlrev_b32 v3, 3, v1
+        0x4A06_0103, // v_add_nc_u32 v3, v3, v0       (v3 = flat tid 0..127)
+        // v5 = v3 * 16 + 7 (unique per thread across both console waves)
+        0x340A_0684, // v_lshlrev_b32 v5, 4, v3
+        0x4A0A_0A87, // v_add_nc_u32 v5, 7, v5
+        // s6 = v_readlane_b32(v5, 35): lane 35 of THIS console wave (tid 35 or tid 99!)
+        0xD760_0006,
+        (163 << 9) | (256 + 5), // v_readlane_b32 s6, v5, 35 (128+35=163)
+        // v4 = (((v3 & 63) ^ 32) << 2)
+        0x3608_06BF, // v_and_b32 v4, 63, v3
+        0x3A08_08A0, // v_xor_b32 v4, 32, v4
+        0x3408_0882, // v_lshlrev_b32 v4, 2, v4
+        // ds_bpermute_b32 v6, v4, v5
+        (0x36 << 26) | (0xB3 << 18),
+        (6 << 24) | (5 << 8) | 4,
+        // v6 = v6 + s6
+        0x4A0C_0C06, // v_add_nc_u32 v6, s6, v6
+        // UAV[v3] = v6
+        0x3404_0682, // v_lshlrev_b32 v2, 2, v3
+        (0x38 << 26) | (0x1C << 18) | (1 << 12),
+        (128 << 24) | (2 << 16) | (6 << 8) | 2,
+    ];
+    let native_a = build_8x16(&words_a);
+    let (out_a_mode_a, shader_a_mode_a) = lower_with_flag(&native_a, true);
+    let (out_a_mode_b, shader_a_mode_b) = lower_with_flag(&native_a, false);
+    assert_eq!(
+        out_a_mode_a.atomic_rmws, 1,
+        "all_group 128-thread exchanges must use Mode A BAR.SYNC with 0 Mode B spin atomics (only 1 entry wave_base atomic)"
+    );
+    assert!(
+        out_a_mode_a.barriers >= 3,
+        "expected >= 3 hardware barriers (wave_base + readlane + bpermute), got {}",
+        out_a_mode_a.barriers
+    );
+    assert!(
+        out_a_mode_b.atomic_rmws > 1,
+        "VICTORY_ALL_GROUP_BARRIER=0 escape hatch must emit Mode B spin atomics"
+    );
+
+    // Part B: mixed `all_group` Mode A -> divergent wave-wide `!all_group` Mode B -> reconverged `all_group` Mode A.
+    let words_b = [
+        0x3406_0283, // v_lshlrev_b32 v3, 3, v1
+        0x4A06_0103, // v_add_nc_u32 v3, v3, v0       (v3 = flat tid 0..127)
+        0x340A_0684, // v_lshlrev_b32 v5, 4, v3
+        0x4A0A_0A87, // v_add_nc_u32 v5, 7, v5        (v5 = tid * 16 + 7)
+        // 1) all_group Mode A readlane (lane 35 of each console wave)
+        0xD760_0006,
+        (163 << 9) | (256 + 5), // s6 = v_readlane_b32(v5, 35)
+        // s7 = 0 (default if console wave skips divergent arm)
+        0xBE87_0380, // s_mov_b32 s7, 0
+        // Per-wave scalar divergent branch: Console Wave 0 (tid < 64) enters,
+        // Console Wave 1 (tid >= 64) skips! Because `s12` comes from
+        // `v_readfirstlane_b32(v3)`, every lane in each console wave agrees
+        // (`all_lanes == true`), while `all_group_barrier_blocks` proves `s12`
+        // is NOT workgroup-uniform (`all_group_barrier == false` -> Mode B!).
+        0x7E18_0503, // v_readfirstlane_b32 s12, v3 (0 in Wave 0, 64 in Wave 1)
+        0xBF0A_C00C, // s_cmp_lt_u32 s12, 64        (scc = 1 in Wave 0, 0 in Wave 1)
+        0xBF84_0002, // s_cbranch_scc0 +2           (skip 2-dword v_readlane_b32)
+        // 2) !all_group Mode B readlane (lane 40 of Console Wave 0 only!)
+        0xD760_0007,
+        (168 << 9) | (256 + 5), // s7 = v_readlane_b32(v5, 40) (128+40=168)
+        // 3) Reconverged all_group Mode A `ds_bpermute_b32` (lane ^ 32)
+        0x3608_06BF, // v_and_b32 v4, 63, v3
+        0x3A08_08A0, // v_xor_b32 v4, 32, v4
+        0x3408_0882, // v_lshlrev_b32 v4, 2, v4
+        (0x36 << 26) | (0xB3 << 18),
+        (6 << 24) | (5 << 8) | 4, // v6 = bpermute(v5, lane ^ 32)
+        // v6 = v6 + s6 + s7
+        0x4A0C_0C06, // v_add_nc_u32 v6, s6, v6
+        0x4A0C_0C07, // v_add_nc_u32 v6, s7, v6
+        // UAV[v3] = v6
+        0x3404_0682, // v_lshlrev_b32 v2, 2, v3
+        (0x38 << 26) | (0x1C << 18) | (1 << 12),
+        (128 << 24) | (2 << 16) | (6 << 8) | 2,
+    ];
+    let native_b = build_8x16(&words_b);
+    let (out_b, shader_b) = lower_with_flag(&native_b, true);
+    // Part B has 1 divergent Mode B exchange (5 atomics + 1 entry wave_base = 6 atomics)
+    // and 2 all_group Mode A exchanges (0 spin atomics!).
+    assert!(
+        out_b.atomic_rmws > 1 && out_b.atomic_rmws < 10,
+        "mixed all_group + divergent shader should emit Mode B ONLY for the 1 divergent exchange (got {} atomics)",
+        out_b.atomic_rmws
+    );
+
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else { return };
+
+    for (label, shader, has_div) in [
+        ("Part A (all_group Mode A)", &shader_a_mode_a, false),
+        ("Part A (escape hatch Mode B)", &shader_a_mode_b, false),
+        ("Part B (mixed Mode A + divergent Mode B + reconverged Mode A)", &shader_b, true),
+    ] {
+        let (root, pso) = host
+            .compute_pipeline(shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(128)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        for t in 0..128u32 {
+            let wave_base = t & !63;
+            let partner = wave_base | ((t & 63) ^ 32);
+            let lane35 = wave_base + 35;
+            let div_add = if has_div && t < 64 { 40 * 16 + 7 } else { 0 };
+            let want = (partner * 16 + 7) + (lane35 * 16 + 7) + div_add;
+            assert_eq!(out[0][t as usize], want, "{label}: lane {t}");
+        }
     }
 }

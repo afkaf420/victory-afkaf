@@ -2318,13 +2318,23 @@ impl State {
                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
                 let len = crate::resource::placed_bytes(&resource).unwrap_or(1);
                 let mapped = crate::texture::mapped_bytes(address as *const u8, len as usize);
+                let slot_key = (std::ptr::from_ref(host) as usize, index);
                 if mapped == 0 {
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
-                    // Streamed out: what the slot showed is let go.
-                    host.texture_slot_gone(index);
+                    // Only immediately unmake (clearing the slot to a solid-black
+                    // null SRV) if we lack VRAM headroom (`!room`) or the slot's
+                    // descriptor record changed from its currently-uploaded view.
+                    // Otherwise keep the existing host texture alive across
+                    // `UNMAPPED_GRACE_LOOKS` consecutive unmapped looks so transient
+                    // streaming remaps do not flash black.
+                    let same_view = heap.handle(index).is_some_and(|h| host.texture_slot_made_from(index, h));
+                    if unmapped_grace_should_evict(slot_key, write, same_view, room) {
+                        host.texture_slot_gone(index);
+                    }
                     host.texture_slot_later(index, write, frame, most);
                     continue;
                 }
+                unmapped_grace_clear(slot_key);
                 there = Some(mapped);
                 if mapped < len {
                     if mapped <= host.texture_slot_mapped(index) {
@@ -4260,9 +4270,97 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
     }
 }
 
+/// Consecutive `mapped == 0` looks tolerated before unmaking an already-uploaded
+/// placed texture slot (while VRAM has room and the descriptor record still
+/// matches the uploaded view). Prevents transient streaming remaps from flashing
+/// live slots to solid-black null SRVs.
+const UNMAPPED_GRACE_LOOKS: u8 = 16;
+
+#[derive(Default)]
+struct UnmappedGrace {
+    seen: std::collections::HashMap<(usize, u32), (u64, u8)>,
+}
+
+impl UnmappedGrace {
+    fn should_evict(&mut self, key: (usize, u32), write: u64, same_view: bool, room: bool) -> bool {
+        if !room || !same_view {
+            self.seen.remove(&key);
+            return true;
+        }
+        match self.seen.get_mut(&key) {
+            Some((prev_write, count)) if *prev_write == write => {
+                let next = count.saturating_add(1);
+                if next >= UNMAPPED_GRACE_LOOKS {
+                    self.seen.remove(&key);
+                    true
+                } else {
+                    *count = next;
+                    false
+                }
+            }
+            _ => {
+                self.seen.insert(key, (write, 1));
+                false
+            }
+        }
+    }
+
+    fn clear(&mut self, key: (usize, u32)) {
+        self.seen.remove(&key);
+    }
+}
+
+fn unmapped_grace() -> &'static std::sync::Mutex<UnmappedGrace> {
+    static GRACE: std::sync::OnceLock<std::sync::Mutex<UnmappedGrace>> = std::sync::OnceLock::new();
+    GRACE.get_or_init(|| std::sync::Mutex::new(UnmappedGrace::default()))
+}
+
+fn unmapped_grace_should_evict(key: (usize, u32), write: u64, same_view: bool, room: bool) -> bool {
+    unmapped_grace()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .should_evict(key, write, same_view, room)
+}
+
+fn unmapped_grace_clear(key: (usize, u32)) {
+    unmapped_grace()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear(key);
+}
+
 #[cfg(test)]
 mod state_tests {
     use super::*;
+
+    #[test]
+    fn unmapped_grace_holds_uploaded_slot_until_threshold_and_resets_on_remap() {
+        let mut grace = UnmappedGrace::default();
+        let key = (0x1000usize, 7u32);
+
+        // First 15 consecutive unmapped looks keep the existing uploaded SRV alive.
+        for _ in 1..UNMAPPED_GRACE_LOOKS {
+            assert!(!grace.should_evict(key, 42, true, true));
+        }
+        // Remapping (`mapped > 0`) resets the consecutive counter cleanly.
+        grace.clear(key);
+        for _ in 1..UNMAPPED_GRACE_LOOKS {
+            assert!(!grace.should_evict(key, 42, true, true));
+        }
+        // The 16th consecutive unmapped look evicts the stale slot and clears tracking.
+        assert!(grace.should_evict(key, 42, true, true));
+        assert!(grace.seen.is_empty());
+
+        // Losing VRAM headroom (`!room`) or changing descriptor record (`!same_view`)
+        // evicts immediately even mid-grace.
+        assert!(!grace.should_evict(key, 99, true, true));
+        assert!(grace.should_evict(key, 99, true, false));
+        assert!(grace.seen.is_empty());
+
+        assert!(!grace.should_evict(key, 100, true, true));
+        assert!(grace.should_evict(key, 100, false, true));
+        assert!(grace.seen.is_empty());
+    }
 
     #[test]
     fn replay_clears_fresh_tables_and_has_active_targets_tracks_unbind() {

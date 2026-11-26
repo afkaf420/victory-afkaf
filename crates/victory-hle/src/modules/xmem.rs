@@ -157,65 +157,70 @@ fn clear_va_protect(base: usize, len: usize) {
     }
 }
 
-/// Restores the console protection classification for newly mapped physical
-/// pages in `[base, base + len)`: preserves explicit zone protections
-/// (`GpuReadOnly`, `WriteCombinedGpuRw`, `CachedGpuRw`, `CoherentGpuRw`) and
-/// promotes `PAGE_GRAPHICS_NOACCESS` (`0x0801`) or unregistered placeholders
-/// to `flags = 0x2, protect = 0x2004` (`CachedGpuRw`).
-fn note_mapped_console_memory(base: usize, len: usize) {
+/// Resolves the console `(lo, hi, flags, raw_protect)` slices for mapped
+/// physical pages in `[base, base + len)` against `VA_PROTECT`: preserves
+/// explicit zone protections (`GpuReadOnly`, `WriteCombinedGpuRw`,
+/// `CachedGpuRw`, `CoherentGpuRw`) from both initial `MEM_RESERVE_PLACEHOLDER`
+/// reservations (e.g. `Func9` `0x2404`) and `MEM_REPLACE_PLACEHOLDER` splits
+/// (e.g. Low-4GB zones), and upgrades `PAGE_GRAPHICS_NOACCESS` (`0x0801`) or
+/// unregistered placeholders to `flags = 0x2, protect = 0x2004` (`CachedGpuRw`).
+fn resolve_mapped_console_memory(base: usize, len: usize) -> Vec<(usize, usize, u32, u32)> {
     const PAGE_GRAPHICS_NOACCESS: u32 = 0x800;
     const MEM_GRAPHICS: u32 = 0x2;
     const DEFAULT_MAPPED_PROTECT: u32 = 0x2004;
     if base == 0 || len == 0 {
-        return;
+        return Vec::new();
     }
     let end = base.saturating_add(len);
     if end <= base {
-        return;
+        return Vec::new();
     }
-    let slices: Vec<(usize, usize, u32, u32)> = {
-        let map = VA_PROTECT.read().unwrap_or_else(|e| e.into_inner());
-        let mut out = Vec::new();
-        let mut cur = base;
-        if let Some((_, &(e, f, p))) = map.range(..base).next_back()
-            && e > base
-        {
+    let map = VA_PROTECT.read().unwrap_or_else(|e| e.into_inner());
+    let mut out = Vec::new();
+    let mut cur = base;
+    if let Some((_, &(e, f, p))) = map.range(..base).next_back()
+        && e > base
+    {
+        let hi = e.min(end);
+        let (ef, ep) = if (f & MEM_GRAPHICS) != 0 && (p & PAGE_GRAPHICS_NOACCESS) == 0 {
+            (f, p)
+        } else {
+            (MEM_GRAPHICS, DEFAULT_MAPPED_PROTECT)
+        };
+        out.push((base, hi, ef, ep));
+        cur = hi;
+    }
+    if cur < end {
+        for (&s, &(e, f, p)) in map.range(cur..end) {
+            if s > cur {
+                out.push((cur, s.min(end), MEM_GRAPHICS, DEFAULT_MAPPED_PROTECT));
+            }
+            let lo = s.max(cur);
             let hi = e.min(end);
-            let (ef, ep) = if (f & MEM_GRAPHICS) != 0 && (p & PAGE_GRAPHICS_NOACCESS) == 0 {
-                (f, p)
-            } else {
-                (MEM_GRAPHICS, DEFAULT_MAPPED_PROTECT)
-            };
-            out.push((base, hi, ef, ep));
-            cur = hi;
+            if lo < hi {
+                let (ef, ep) = if (f & MEM_GRAPHICS) != 0 && (p & PAGE_GRAPHICS_NOACCESS) == 0 {
+                    (f, p)
+                } else {
+                    (MEM_GRAPHICS, DEFAULT_MAPPED_PROTECT)
+                };
+                out.push((lo, hi, ef, ep));
+            }
+            cur = cur.max(hi);
+            if cur >= end {
+                break;
+            }
         }
         if cur < end {
-            for (&s, &(e, f, p)) in map.range(cur..end) {
-                if s > cur {
-                    out.push((cur, s.min(end), MEM_GRAPHICS, DEFAULT_MAPPED_PROTECT));
-                }
-                let lo = s.max(cur);
-                let hi = e.min(end);
-                if lo < hi {
-                    let (ef, ep) = if (f & MEM_GRAPHICS) != 0 && (p & PAGE_GRAPHICS_NOACCESS) == 0 {
-                        (f, p)
-                    } else {
-                        (MEM_GRAPHICS, DEFAULT_MAPPED_PROTECT)
-                    };
-                    out.push((lo, hi, ef, ep));
-                }
-                cur = cur.max(hi);
-                if cur >= end {
-                    break;
-                }
-            }
-            if cur < end {
-                out.push((cur, end, MEM_GRAPHICS, DEFAULT_MAPPED_PROTECT));
-            }
+            out.push((cur, end, MEM_GRAPHICS, DEFAULT_MAPPED_PROTECT));
         }
-        out
-    };
-    for (lo, hi, flags, protect) in slices {
+    }
+    out
+}
+
+/// Restores the console protection classification for newly mapped physical
+/// pages in `[base, base + len)` from [`resolve_mapped_console_memory`].
+fn note_mapped_console_memory(base: usize, len: usize) {
+    for (lo, hi, flags, protect) in resolve_mapped_console_memory(base, len) {
         victory_gpu::note_console_memory(lo, hi - lo, flags, protect);
     }
 }
@@ -1130,15 +1135,36 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
 /// Writes a 64 KiB block into the section backing a `MEM_MAPPED` title VA `va`
 /// through a temporary alias view (`View::map`), allowing `lazy_readback` to
 /// populate physical RAM *while `va` remains `PAGE_NOACCESS`* (zero torn-read
-/// window). Uses non-blocking `PHYSICAL.try_lock()` so it can never invert
-/// lock order with `title_memory_remapped -> lazy_readback::evict_range`.
+/// window). Uses bounded non-blocking `PHYSICAL.try_lock()` retries (5 ms cap)
+/// so concurrent unrelated `XMemMapPhysicalPages` calls do not spuriously
+/// defeat alias writes, while still preventing any AB-BA deadlock with
+/// `title_memory_remapped -> lazy_readback::evict_range`.
 pub fn write_va_via_alias(va: usize, data: &[u8; PAGE]) -> bool {
     if !va.is_multiple_of(PAGE) {
         return false;
     }
     let page_slice = {
-        let Ok(physical) = PHYSICAL.try_lock() else {
-            return false;
+        let mut deadline = None;
+        let mut spins = 0u32;
+        let physical = loop {
+            match PHYSICAL.try_lock() {
+                Ok(guard) => break guard,
+                Err(std::sync::TryLockError::Poisoned(p)) => break p.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    if spins < 16 {
+                        spins += 1;
+                        std::hint::spin_loop();
+                        continue;
+                    }
+                    let until = *deadline.get_or_insert_with(|| {
+                        std::time::Instant::now() + std::time::Duration::from_millis(5)
+                    });
+                    if std::time::Instant::now() >= until {
+                        return false;
+                    }
+                    std::thread::yield_now();
+                }
+            }
         };
         let Some((&base, &(size, ref slice, is_priv))) = physical.views.range(..=va).next_back()
         else {
@@ -1235,6 +1261,9 @@ pub extern "system" fn XMemMapPhysicalPages(
     let _threads = map_threads();
     while i < n {
         let Some(first) = physical.pages.get(&pages[i]).cloned() else {
+            if i > 0 {
+                note_mapped_console_memory(base, i * PAGE);
+            }
             tracing::warn!(page = pages[i], "XMemMapPhysicalPages: unknown page");
             return std::ptr::null_mut();
         };
@@ -1249,6 +1278,9 @@ pub extern "system" fn XMemMapPhysicalPages(
             })
             .count();
         if !map(&mut physical, base + i * PAGE, run * PAGE, first) {
+            if i > 0 {
+                note_mapped_console_memory(base, i * PAGE);
+            }
             return std::ptr::null_mut();
         }
         i += run;
@@ -2444,5 +2476,67 @@ mod tests {
         assert_eq!(XMemMapPhysicalPages(c, 1, std::ptr::null()), c);
         assert_eq!(XMemMapPhysicalPages(d, 1, std::ptr::null()), d);
         assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
+    }
+
+    #[test]
+    fn initial_placeholder_preserves_wc_protect_and_alias_writes_while_noaccess() {
+        use windows_sys::Win32::System::Memory::VirtualProtect;
+
+        const WC_GPU_RW: u32 = 0x2404; // PAGE_GRAPHICS_READWRITE | PAGE_WRITECOMBINE | PAGE_READWRITE
+        const POOL_FLAGS: u64 = 0x23;
+        const KIND: u32 = PAGES_64K | MEM_RESERVE;
+
+        // Initial `MEM_RESERVE_PLACEHOLDER` reservation (exact Func9 pattern).
+        let base_ptr = XMemVirtualAlloc(std::ptr::null_mut(), 4 * PAGE, KIND, POOL_FLAGS, WC_GPU_RW);
+        assert!(!base_ptr.is_null());
+        let base = base_ptr as usize;
+
+        assert_eq!(
+            resolve_mapped_console_memory(base, 4 * PAGE),
+            vec![(base, base + 4 * PAGE, POOL_FLAGS as u32, WC_GPU_RW)],
+            "initial MEM_RESERVE_PLACEHOLDER must record 0x2404 in VA_PROTECT (not default to 0x2004)"
+        );
+
+        let mut count = 2usize;
+        let mut pages = [0usize; 2];
+        assert_eq!(XMemAllocatePhysicalPages(GRAPHICS, &mut count, pages.as_mut_ptr()), 1);
+        assert_eq!(count, 2);
+
+        // Map -> partial unmap -> remap cycle must keep 0x2404 intact.
+        assert_eq!(XMemMapPhysicalPages(base_ptr, 2, pages.as_ptr()), base_ptr);
+        assert_eq!(XMemMapPhysicalPages(base_ptr, 1, std::ptr::null()), base_ptr);
+        assert_eq!(XMemMapPhysicalPages(base_ptr, 1, pages.as_ptr()), base_ptr);
+        assert_eq!(
+            resolve_mapped_console_memory(base, 2 * PAGE),
+            vec![(base, base + 2 * PAGE, POOL_FLAGS as u32, WC_GPU_RW)]
+        );
+
+        // `write_va_via_alias` must populate physical RAM on a `MEM_MAPPED` view
+        // even while the title VA is `PAGE_NOACCESS` (zero torn-read window).
+        let mut old = 0u32;
+        // SAFETY: committed 64 KiB `MEM_MAPPED` view at `base`.
+        assert_ne!(unsafe { VirtualProtect(base_ptr, PAGE, PAGE_NOACCESS, &mut old) }, 0);
+        let payload = [0xCCu8; PAGE];
+        assert!(
+            write_va_via_alias(base, &payload),
+            "write_va_via_alias must succeed on section-backed MEM_MAPPED view while PAGE_NOACCESS"
+        );
+        // SAFETY: restoring `PAGE_READWRITE` and verifying all 64 KiB landed.
+        unsafe {
+            assert_ne!(VirtualProtect(base_ptr, PAGE, PAGE_READWRITE, &mut old), 0);
+            let got = std::slice::from_raw_parts(base_ptr.cast::<u8>(), PAGE);
+            assert!(got.iter().all(|&b| b == 0xCC));
+        }
+
+        assert_eq!(XMemMapPhysicalPages(base_ptr, 2, std::ptr::null()), base_ptr);
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+        clear_va_protect(base, 4 * PAGE);
+        // After `clear_va_protect`, unregistered placeholder resolves to default 0x2004.
+        assert_eq!(
+            resolve_mapped_console_memory(base, PAGE),
+            vec![(base, base + PAGE, 0x2, 0x2004)]
+        );
+        // SAFETY: releasing our test reservation.
+        unsafe { VirtualFree(base_ptr, 0, MEM_RELEASE) };
     }
 }

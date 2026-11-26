@@ -138,13 +138,10 @@ pub(super) fn read_by(runs: &[&HostList], mut ranges: Vec<(usize, usize)>) -> bo
     })
 }
 
-/// Everything recorded so far is done, and seen, before what follows.
-///
-/// # Safety
-/// An open list.
-unsafe fn wait_for_all(host: &Host, list: &ID3D12GraphicsCommandList) {
+/// Whether the host device supports D3D12 Enhanced Barriers (`OPTIONS12`).
+fn enhanced_barriers(host: &Host) -> bool {
     static ENHANCED: OnceLock<bool> = OnceLock::new();
-    let enhanced = *ENHANCED.get_or_init(|| {
+    *ENHANCED.get_or_init(|| {
         let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS12::default();
         // SAFETY: a feature structure of its size.
         let known = unsafe {
@@ -155,45 +152,234 @@ unsafe fn wait_for_all(host: &Host, list: &ID3D12GraphicsCommandList) {
             )
         };
         known.is_ok() && o.EnhancedBarriersSupported.as_bool()
-    });
-    // SAFETY: the caller's.
-    unsafe {
-        if enhanced && let Ok(list) = list.cast::<ID3D12GraphicsCommandList7>() {
-            let all = [D3D12_GLOBAL_BARRIER {
-                SyncBefore: D3D12_BARRIER_SYNC_ALL,
-                SyncAfter: D3D12_BARRIER_SYNC_ALL,
-                AccessBefore: D3D12_BARRIER_ACCESS_COMMON,
-                AccessAfter: D3D12_BARRIER_ACCESS_COMMON,
-            }];
-            list.Barrier(&[D3D12_BARRIER_GROUP {
-                Type: D3D12_BARRIER_TYPE_GLOBAL,
-                NumBarriers: 1,
-                Anonymous: D3D12_BARRIER_GROUP_0 {
-                    pGlobalBarriers: all.as_ptr(),
+    })
+}
+
+/// A targeted legacy UAV barrier for a single buffer (never global `UAV(NULL)`).
+fn uav_barrier(resource: &ID3D12Resource) -> D3D12_RESOURCE_BARRIER {
+    D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                // SAFETY: a borrowed pointer; the barrier never releases it.
+                pResource: unsafe { std::mem::transmute_copy(resource) },
+            }),
+        },
+    }
+}
+
+/// A targeted D3D12 Enhanced Buffer Barrier for a single buffer (never global
+/// `D3D12_BARRIER_TYPE_GLOBAL` / `SYNC_ALL`).
+fn buffer_barrier(
+    resource: &ID3D12Resource,
+    sync_before: D3D12_BARRIER_SYNC,
+    sync_after: D3D12_BARRIER_SYNC,
+    access_before: D3D12_BARRIER_ACCESS,
+    access_after: D3D12_BARRIER_ACCESS,
+) -> D3D12_BUFFER_BARRIER {
+    D3D12_BUFFER_BARRIER {
+        SyncBefore: sync_before,
+        SyncAfter: sync_after,
+        AccessBefore: access_before,
+        AccessAfter: access_after,
+        // SAFETY: a borrowed pointer; the barrier never releases it.
+        pResource: unsafe { std::mem::transmute_copy(resource) },
+        Offset: 0,
+        Size: u64::MAX,
+    }
+}
+
+/// Shader + non-render-target pipeline stages that may read or write `Shadow::buffer`.
+const BUFFER_SYNC_ALL: D3D12_BARRIER_SYNC = D3D12_BARRIER_SYNC(
+    D3D12_BARRIER_SYNC_ALL_SHADING.0
+        | D3D12_BARRIER_SYNC_INDEX_INPUT.0
+        | D3D12_BARRIER_SYNC_EXECUTE_INDIRECT.0
+        | D3D12_BARRIER_SYNC_COPY.0,
+);
+
+/// Stages that may write a `Shadow::buffer` (UAV shaders or copies).
+const BUFFER_SYNC_WRITE: D3D12_BARRIER_SYNC =
+    D3D12_BARRIER_SYNC(D3D12_BARRIER_SYNC_ALL_SHADING.0 | D3D12_BARRIER_SYNC_COPY.0);
+
+/// Accesses that may read or write a `Shadow::buffer` outside a copy.
+const BUFFER_ACCESS_ALL: D3D12_BARRIER_ACCESS = D3D12_BARRIER_ACCESS(
+    D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0
+        | D3D12_BARRIER_ACCESS_SHADER_RESOURCE.0
+        | D3D12_BARRIER_ACCESS_CONSTANT_BUFFER.0
+        | D3D12_BARRIER_ACCESS_VERTEX_BUFFER.0
+        | D3D12_BARRIER_ACCESS_INDEX_BUFFER.0
+        | D3D12_BARRIER_ACCESS_INDIRECT_ARGUMENT.0
+        | D3D12_BARRIER_ACCESS_COPY_SOURCE.0
+        | D3D12_BARRIER_ACCESS_COPY_DEST.0,
+);
+
+/// Accesses that may write a `Shadow::buffer`.
+const BUFFER_ACCESS_WRITE: D3D12_BARRIER_ACCESS =
+    D3D12_BARRIER_ACCESS(D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0 | D3D12_BARRIER_ACCESS_COPY_DEST.0);
+
+/// Emits targeted per-buffer barriers before a placed copy on `list`.
+///
+/// # Safety
+/// An open command list; `from` (if any) and `to` are live buffers.
+unsafe fn barrier_before_copy(
+    host: &Host,
+    list: &ID3D12GraphicsCommandList,
+    from: Option<&ID3D12Resource>,
+    to: &ID3D12Resource,
+) {
+    let same = from.is_some_and(|f| f.as_raw() == to.as_raw());
+    if enhanced_barriers(host)
+        && let Ok(list7) = list.cast::<ID3D12GraphicsCommandList7>()
+    {
+        let buf_barriers = [
+            buffer_barrier(
+                to,
+                BUFFER_SYNC_ALL,
+                D3D12_BARRIER_SYNC_COPY,
+                BUFFER_ACCESS_ALL,
+                if same {
+                    D3D12_BARRIER_ACCESS_COPY_SOURCE
+                } else {
+                    D3D12_BARRIER_ACCESS_COPY_DEST
                 },
-            }]);
-            return;
-        }
-        let alias = D3D12_RESOURCE_BARRIER {
-            Type: D3D12_RESOURCE_BARRIER_TYPE_ALIASING,
-            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-            Anonymous: D3D12_RESOURCE_BARRIER_0 {
-                Aliasing: std::mem::ManuallyDrop::new(D3D12_RESOURCE_ALIASING_BARRIER {
-                    pResourceBefore: std::mem::ManuallyDrop::new(None),
-                    pResourceAfter: std::mem::ManuallyDrop::new(None),
-                }),
+            ),
+            buffer_barrier(
+                from.unwrap_or(to),
+                BUFFER_SYNC_WRITE,
+                D3D12_BARRIER_SYNC_COPY,
+                BUFFER_ACCESS_WRITE,
+                D3D12_BARRIER_ACCESS_COPY_SOURCE,
+            ),
+        ];
+        let count = if from.is_some() && !same { 2 } else { 1 };
+        let group = [D3D12_BARRIER_GROUP {
+            Type: D3D12_BARRIER_TYPE_BUFFER,
+            NumBarriers: count,
+            Anonymous: D3D12_BARRIER_GROUP_0 {
+                pBufferBarriers: buf_barriers.as_ptr(),
             },
-        };
-        let uav = D3D12_RESOURCE_BARRIER {
-            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
-            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-            Anonymous: D3D12_RESOURCE_BARRIER_0 {
-                UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
-                    pResource: std::mem::ManuallyDrop::new(None),
-                }),
+        }];
+        // SAFETY: open command list; borrowed resource pointers stay alive across `Barrier`.
+        unsafe { list7.Barrier(&group) };
+        return;
+    }
+    let legacy = [uav_barrier(to), uav_barrier(from.unwrap_or(to))];
+    let count = if from.is_some() && !same { 2 } else { 1 };
+    // SAFETY: open command list; targeted per-resource UAV barrier(s).
+    unsafe { list.ResourceBarrier(&legacy[..count]) };
+}
+
+/// Emits targeted per-buffer barriers between the two copies of a same-buffer
+/// placed copy (`from -> between`, then `between -> to` where `from == to`).
+///
+/// # Safety
+/// An open command list; `between` and `target` are live buffers.
+unsafe fn barrier_between_same_buffer(
+    host: &Host,
+    list: &ID3D12GraphicsCommandList,
+    between: &ID3D12Resource,
+    target: &ID3D12Resource,
+) {
+    if enhanced_barriers(host)
+        && let Ok(list7) = list.cast::<ID3D12GraphicsCommandList7>()
+    {
+        let barriers = [
+            buffer_barrier(
+                between,
+                D3D12_BARRIER_SYNC_COPY,
+                D3D12_BARRIER_SYNC_COPY,
+                D3D12_BARRIER_ACCESS_COPY_DEST,
+                D3D12_BARRIER_ACCESS_COPY_SOURCE,
+            ),
+            buffer_barrier(
+                target,
+                D3D12_BARRIER_SYNC_COPY,
+                D3D12_BARRIER_SYNC_COPY,
+                D3D12_BARRIER_ACCESS_COPY_SOURCE,
+                D3D12_BARRIER_ACCESS_COPY_DEST,
+            ),
+        ];
+        let group = [D3D12_BARRIER_GROUP {
+            Type: D3D12_BARRIER_TYPE_BUFFER,
+            NumBarriers: barriers.len() as u32,
+            Anonymous: D3D12_BARRIER_GROUP_0 {
+                pBufferBarriers: barriers.as_ptr(),
             },
-        };
-        list.ResourceBarrier(&[alias, uav]);
+        }];
+        // SAFETY: open command list; borrowed pointers live across `Barrier`.
+        unsafe { list7.Barrier(&group) };
+        return;
+    }
+    let barriers = [
+        transition(between, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE),
+        transition(target, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST),
+    ];
+    // SAFETY: open command list; both buffers were just copied into/out of.
+    unsafe { list.ResourceBarrier(&barriers) };
+}
+
+/// Emits targeted per-buffer barriers after a placed copy on `list` so later
+/// shaders or copies see `to` (and may safely overwrite `from`) without a
+/// global GPU pipeline flush.
+///
+/// # Safety
+/// An open command list; `from` (if any) and `to` are live buffers.
+unsafe fn barrier_after_copy(
+    host: &Host,
+    list: &ID3D12GraphicsCommandList,
+    from: Option<&ID3D12Resource>,
+    to: &ID3D12Resource,
+) {
+    let same = from.is_some_and(|f| f.as_raw() == to.as_raw());
+    if enhanced_barriers(host)
+        && let Ok(list7) = list.cast::<ID3D12GraphicsCommandList7>()
+    {
+        let barriers = [
+            buffer_barrier(
+                to,
+                D3D12_BARRIER_SYNC_COPY,
+                BUFFER_SYNC_ALL,
+                D3D12_BARRIER_ACCESS_COPY_DEST,
+                BUFFER_ACCESS_ALL,
+            ),
+            buffer_barrier(
+                from.unwrap_or(to),
+                D3D12_BARRIER_SYNC_COPY,
+                BUFFER_SYNC_WRITE,
+                D3D12_BARRIER_ACCESS_COPY_SOURCE,
+                BUFFER_ACCESS_WRITE,
+            ),
+        ];
+        let count = if from.is_some() && !same { 2 } else { 1 };
+        let group = [D3D12_BARRIER_GROUP {
+            Type: D3D12_BARRIER_TYPE_BUFFER,
+            NumBarriers: count,
+            Anonymous: D3D12_BARRIER_GROUP_0 {
+                pBufferBarriers: barriers.as_ptr(),
+            },
+        }];
+        // SAFETY: open command list; borrowed pointers live across `Barrier`.
+        unsafe { list7.Barrier(&group) };
+        return;
+    }
+    if let Some(f) = from
+        && !same
+    {
+        let barriers = [
+            transition(to, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON),
+            transition(f, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON),
+            uav_barrier(to),
+        ];
+        // SAFETY: open command list; targeted transitions + UAV barrier on `to`.
+        unsafe { list.ResourceBarrier(&barriers) };
+    } else {
+        let barriers = [
+            transition(to, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON),
+            uav_barrier(to),
+        ];
+        // SAFETY: open command list; targeted transition + UAV barrier on `to`.
+        unsafe { list.ResourceBarrier(&barriers) };
     }
 }
 
@@ -213,10 +399,13 @@ impl HostList {
         let Some(host) = host() else {
             return false;
         };
-        let Some(to) = crate::shadow::peek(dst as u64, len as u64).filter(|s| !s.in_place()) else {
+        let own = shaders_own(src, len);
+        let Some(to) = crate::shadow::peek(dst as u64, len as u64)
+            .or_else(|| own.is_some().then(|| crate::shadow::find(dst as u64, len as u64)).flatten())
+            .filter(|s| !s.in_place())
+        else {
             return false;
         };
-        let own = shaders_own(src, len);
         let scratch = match &own {
             Some(_) => None,
             None if len <= MOST => match self.scratch_at(len as u64) {
@@ -228,41 +417,49 @@ impl HostList {
         let at = to.offset(dst as u64);
         // What the title's CPU wrote around and under it so far goes first.
         to.refresh(self, dst as u64, len as u64);
-        // SAFETY (both): an open list; live buffers (the list holds the
-        // copies and its scratch memory), ranges inside them.
-        unsafe { wait_for_all(host, &self.list) };
-        match (&own, &scratch) {
-            (Some(from), _) => {
-                from.refresh(self, src as u64, len as u64);
+        if let Some(from) = &own {
+            from.refresh(self, src as u64, len as u64);
+        }
+        let same_buffer = own
+            .as_ref()
+            .is_some_and(|from| from.buffer.as_raw() == to.buffer.as_raw());
+        let between = if same_buffer {
+            match self.between(host, len as u64) {
+                Some(b) => Some(b),
+                None => return false,
+            }
+        } else {
+            None
+        };
+        let from_res = own.as_ref().map(|from| &from.buffer);
+        // SAFETY: an open list; live buffers (the list holds the copies and its
+        // scratch/between memory), ranges inside them; targeted per-buffer barriers
+        // avoid stalling unrelated render targets, depth buffers, and shaders.
+        unsafe { barrier_before_copy(host, &self.list, from_res, &to.buffer) };
+        match (&own, &scratch, &between) {
+            (Some(from), _, Some(between)) => {
                 let offset = from.offset(src as u64);
-                if from.buffer.as_raw() == to.buffer.as_raw() {
-                    let Some(between) = self.between(host, len as u64) else {
-                        return false;
-                    };
-                    unsafe {
-                        self.list.CopyBufferRegion(&between, 0, &from.buffer, offset, len as u64);
-                        self.list.ResourceBarrier(&[transition(
-                            &between,
-                            D3D12_RESOURCE_STATE_COPY_DEST,
-                            D3D12_RESOURCE_STATE_COPY_SOURCE,
-                        )]);
-                        wait_for_all(host, &self.list);
-                        self.list.CopyBufferRegion(&to.buffer, at, &between, 0, len as u64);
-                    }
-                } else {
-                    unsafe {
-                        self.list
-                            .CopyBufferRegion(&to.buffer, at, &from.buffer, offset, len as u64);
-                    }
+                unsafe {
+                    self.list.CopyBufferRegion(between, 0, &from.buffer, offset, len as u64);
+                    barrier_between_same_buffer(host, &self.list, between, &to.buffer);
+                    self.list.CopyBufferRegion(&to.buffer, at, between, 0, len as u64);
                 }
                 STATS[2].fetch_add(1, Ordering::Relaxed);
             }
-            (None, Some((from, offset, _))) => unsafe {
+            (Some(from), _, None) => {
+                let offset = from.offset(src as u64);
+                unsafe {
+                    self.list
+                        .CopyBufferRegion(&to.buffer, at, &from.buffer, offset, len as u64);
+                }
+                STATS[2].fetch_add(1, Ordering::Relaxed);
+            }
+            (None, Some((from, offset, _)), _) => unsafe {
                 self.list.CopyBufferRegion(&to.buffer, at, from, *offset, len as u64);
             },
-            (None, None) => return false,
+            (None, None, _) => return false,
         }
-        unsafe { wait_for_all(host, &self.list) };
+        unsafe { barrier_after_copy(host, &self.list, from_res, &to.buffer) };
         STATS[0].fetch_add(1, Ordering::Relaxed);
         STATS[1].fetch_add(len as u64, Ordering::Relaxed);
         to.gpu_writes(self, dst as u64, len as u64);
@@ -334,5 +531,77 @@ mod tests {
         // Destination overlaps in-flight shader write: only wait for CPU readers of dst.
         assert_eq!(waits_for(1500, 4000, 64, true, &written), Waits::ForReaders);
         assert_eq!(waits_for(1500, 4000, 64, false, &written), Waits::ForReaders);
+    }
+
+    /// Live RTX 3090 D3D12 Debug Layer verification of targeted per-buffer
+    /// barriers in `place.rs` across chained `A -> B`, same-buffer `B -> B`
+    /// (via `between`), `B -> C`, and upload `scratch -> B` copies in a SINGLE
+    /// command list — asserting exact GPU bytes and ZERO Debug Layer errors.
+    #[test]
+    #[ignore = "requires live D3D12 GPU with VICTORY_D3D12_DEBUG=1"]
+    fn debug_layer_place_copy_targeted_barriers_all_paths() {
+        let Some(host) = host() else {
+            return;
+        };
+        let (buf_a, ptr_a) = host.shared_buffer(1 << 16).expect("shared A");
+        let (buf_b, ptr_b) = host.shared_buffer(1 << 16).expect("shared B");
+        let (buf_c, ptr_c) = host.shared_buffer(1 << 16).expect("shared C");
+        let between = host.uav_buffer(1 << 16).expect("between uav");
+        let list = host.new_list().expect("host list");
+        let (scratch, scratch_off, scratch_ptr) = list.scratch_at(64).expect("scratch");
+
+        // SAFETY: mapped 64 KiB shared buffers and 64-byte scratch upload range.
+        unsafe {
+            std::slice::from_raw_parts_mut(ptr_a, 128).fill(0x3A);
+            std::slice::from_raw_parts_mut(ptr_b, 512).fill(0x00);
+            std::slice::from_raw_parts_mut(ptr_c, 128).fill(0x00);
+            std::slice::from_raw_parts_mut(scratch_ptr, 64).fill(0x9C);
+        }
+
+        // SAFETY: open command list, live buffers, valid 64-byte ranges.
+        unsafe {
+            // 1. GPU->GPU (`buf_a -> buf_b[0..64]`)
+            barrier_before_copy(host, &list.list, Some(&buf_a), &buf_b);
+            list.list.CopyBufferRegion(&buf_b, 0, &buf_a, 0, 64);
+            barrier_after_copy(host, &list.list, Some(&buf_a), &buf_b);
+
+            // 2. Same-buffer (`buf_b[0..64] -> between -> buf_b[256..320]`)
+            barrier_before_copy(host, &list.list, Some(&buf_b), &buf_b);
+            list.list.CopyBufferRegion(&between, 0, &buf_b, 0, 64);
+            barrier_between_same_buffer(host, &list.list, &between, &buf_b);
+            list.list.CopyBufferRegion(&buf_b, 256, &between, 0, 64);
+            barrier_after_copy(host, &list.list, Some(&buf_b), &buf_b);
+
+            // 3. Chained GPU->GPU (`buf_b[256..320] -> buf_c[0..64]`)
+            barrier_before_copy(host, &list.list, Some(&buf_b), &buf_c);
+            list.list.CopyBufferRegion(&buf_c, 0, &buf_b, 256, 64);
+            barrier_after_copy(host, &list.list, Some(&buf_b), &buf_c);
+
+            // 4. CPU-staged upload -> `buf_b[0..64]` (overwriting after step 3 read)
+            barrier_before_copy(host, &list.list, None, &buf_b);
+            list.list.CopyBufferRegion(&buf_b, 0, &scratch, scratch_off, 64);
+            barrier_after_copy(host, &list.list, None, &buf_b);
+        }
+        list.close();
+        host.execute(&[&list]);
+
+        // SAFETY: GPU execution finished; read back mapped shared buffers.
+        unsafe {
+            assert!(
+                std::slice::from_raw_parts(ptr_b, 64).iter().all(|&b| b == 0x9C),
+                "step 4 upload must land in buf_b[0..64]"
+            );
+            assert!(
+                std::slice::from_raw_parts(ptr_b.add(256), 64).iter().all(|&b| b == 0x3A),
+                "step 2 same-buffer copy must preserve 0x3A in buf_b[256..320]"
+            );
+            assert!(
+                std::slice::from_raw_parts(ptr_c, 64).iter().all(|&b| b == 0x3A),
+                "step 3 chained copy must land 0x3A in buf_c[0..64]"
+            );
+        }
+        if let Some(err) = host.log_messages() {
+            panic!("D3D12 Debug Layer reported error on targeted place_copy barriers: {err}");
+        }
     }
 }

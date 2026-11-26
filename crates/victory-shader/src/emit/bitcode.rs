@@ -570,6 +570,38 @@ impl Module {
             .count() as u32
     }
 
+    /// Test-only inspection helper: `(gc_handles, plain_raw_uav_handles,
+    /// raw_store_blocks, entry_cond_br)`.
+    #[cfg(test)]
+    pub(crate) fn memory_stats(&self) -> (usize, usize, Vec<usize>, bool) {
+        let mut gc = 0usize;
+        let mut plain_raw_uav = 0usize;
+        let mut store_blocks = Vec::new();
+        for (bi, blk) in self.blocks.iter().enumerate() {
+            for &id in &blk.body {
+                if let Op::Call(f, args) = &self.insts[id as usize].op {
+                    let fname = self.funcs[*f as usize].name.as_str();
+                    if fname == "dx.op.annotateHandle"
+                        && let Some(&V::Const(props)) = args.get(2)
+                        && let Const::Aggregate(fields) = &self.consts[props as usize].1
+                        && let Const::Int(word0) = self.consts[fields[0] as usize].1
+                    {
+                        if word0 & 0x4000 != 0 {
+                            gc += 1;
+                        }
+                        if word0 == (11 | 0x1000) {
+                            plain_raw_uav += 1;
+                        }
+                    } else if fname == "dx.op.rawBufferStore.i32" {
+                        store_blocks.push(bi);
+                    }
+                }
+            }
+        }
+        let entry_cond = matches!(self.blocks[0].term, Some(Term::CondBr(..)));
+        (gc, plain_raw_uav, store_blocks, entry_cond)
+    }
+
     pub fn md_str(&mut self, s: &str) -> Md {
         self.mds.push(MdDef::Str(s.into()));
         Md(self.mds.len() as u32 - 1)

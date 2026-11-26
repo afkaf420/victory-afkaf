@@ -71,12 +71,12 @@ const HEAP_TILES: u32 = 1024;
 /// no heap could be had); uploads recorded again for such a level.
 pub(crate) static STATS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
 
-/// Resolves `VICTORY_LEVELS_ON_DEMAND`: defaults OFF on high-VRAM GPUs
-/// (`>= 16 GiB`, e.g. RTX 3090) so full mip chains allocate immediately and
-/// `VICTORY_UPLOAD_AHEAD` can stage textures asynchronously; defaults ON on
-/// lower-VRAM GPUs. Explicit `=1` / `=0` overrides always win.
-fn resolve_levels_on_demand(env: Option<&str>, high_vram: bool) -> bool {
-    env.map_or(!high_vram, |v| v.trim() != "0")
+/// Resolves `VICTORY_LEVELS_ON_DEMAND`: defaults ON on all GPUs (including
+/// high-VRAM GPUs `>= 16 GiB`) so `MostDetailedMip` clamping hides unmapped
+/// Mip 0 zeros on partially-mapped streaming textures instead of flashing
+/// black. Explicit `=0` disables.
+fn resolve_levels_on_demand(env: Option<&str>, _high_vram: bool) -> bool {
+    env.is_none_or(|v| v.trim() != "0")
 }
 
 /// Whether textures are made this way: `VICTORY_LEVELS_ON_DEMAND=1` (on by
@@ -1426,9 +1426,9 @@ void look() {
     }
 
     #[test]
-    fn levels_on_demand_defaults_by_vram_and_respects_overrides() {
+    fn levels_on_demand_defaults_on_and_respects_overrides() {
         assert!(resolve_levels_on_demand(None, false));
-        assert!(!resolve_levels_on_demand(None, true));
+        assert!(resolve_levels_on_demand(None, true));
         assert!(!resolve_levels_on_demand(Some("0"), true));
         assert!(!resolve_levels_on_demand(Some(" 0 "), false));
         assert!(resolve_levels_on_demand(Some("1"), false));

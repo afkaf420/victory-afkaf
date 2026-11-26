@@ -282,6 +282,11 @@ fn try_alias_writer(block_va: usize, data: &[u8; BLOCK]) -> bool {
 /// `[9]` blocks demoted to `CpuHot`,
 /// `[10]` fetch microseconds total.
 static STATS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+/// Per-interval `plan_gpu_resident` rejection counters:
+/// `[0]` out-of-shadow-span, `[1]` class ineligible (e.g. `0x2004` in mode 1),
+/// `[2]` multi-view aliased (`inplace::pages_of.len() >= 2`),
+/// `[3]` `CpuHot` / `Fetching`, `[4]` `!is_committable_block`.
+static REJ: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 /// Currently active `GpuResident` block count.
 static LIVE_BLOCKS: AtomicU64 = AtomicU64::new(0);
 /// Cumulative blocks demoted to `CpuHot`.
@@ -290,6 +295,11 @@ static TOTAL_DEMOTED: AtomicU64 = AtomicU64::new(0);
 #[inline]
 fn stat(idx: usize, delta: u64) {
     STATS[idx].fetch_add(delta, Ordering::Relaxed);
+}
+
+#[inline]
+fn rej(idx: usize) {
+    REJ[idx].fetch_add(1, Ordering::Relaxed);
 }
 
 struct ResidentInfo {
@@ -716,16 +726,19 @@ pub(crate) fn plan_gpu_resident(
             let sub_lo = from.max(b_lo);
             let sub_hi = to.min(b_hi);
             if b_lo < span_start || b_hi > span_end {
+                rej(0);
                 push_rem(&mut remaining, sub_lo, sub_hi);
                 continue;
             }
             if !block_class_eligible(b_lo, m) {
+                rej(1);
                 push_rem(&mut remaining, sub_lo, sub_hi);
                 continue;
             }
             // Skip multi-view aliased blocks so CPU access via another alias
             // VA can never bypass `PAGE_NOACCESS`.
             if crate::inplace::pages_of(b_lo).len() >= 2 {
+                rej(2);
                 push_rem(&mut remaining, sub_lo, sub_hi);
                 continue;
             }
@@ -734,11 +747,15 @@ pub(crate) fn plan_gpu_resident(
                 let mut s = lock.lock().unwrap_or_else(|e| e.into_inner());
                 match s.blocks.get(&block) {
                     Some(BlockState::GpuResident(_)) => Some(true),
-                    Some(BlockState::CpuHot) | Some(BlockState::Fetching { .. }) => Some(false),
+                    Some(BlockState::CpuHot) | Some(BlockState::Fetching { .. }) => {
+                        rej(3);
+                        Some(false)
+                    }
                     None => {
                         if s.fault_counts.get(&block).copied().unwrap_or(0) >= DEMOTE_THRESHOLD {
                             s.blocks.insert(block, BlockState::CpuHot);
                             s.sync_tracked();
+                            rej(3);
                             Some(false)
                         } else {
                             None
@@ -748,7 +765,13 @@ pub(crate) fn plan_gpu_resident(
             };
             let take = match eligible {
                 Some(v) => v,
-                None => is_committable_block(b_lo),
+                None => {
+                    let ok = is_committable_block(b_lo);
+                    if !ok {
+                        rej(4);
+                    }
+                    ok
+                }
             };
             if take {
                 if pending.last().is_none_or(|c| c.block != block) {
@@ -875,12 +898,20 @@ fn restore_title_block(block_va: usize, payload: &[u8; BLOCK], any_write: bool) 
         let mut wrote_beside = false;
         if let Some(_reading) = crate::watch::title_memory_reading_now() {
             if let Some(alias_ptr) = crate::inplace::beside(block_va, BLOCK) {
-                // SAFETY: `alias_ptr` is a writable persistent view of the same
-                // 64 KiB section pages held stable by `_reading`.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(payload.as_ptr(), alias_ptr as *mut u8, BLOCK);
+                if crate::safecopy::on() {
+                    // SAFETY: `payload` is valid 64 KiB; `safecopy` returns false
+                    // cleanly if the section page is uncommitted/stale.
+                    wrote_beside = unsafe {
+                        crate::safecopy::copy(alias_ptr as *mut u8, payload.as_ptr(), BLOCK)
+                    };
+                } else {
+                    // SAFETY: `alias_ptr` is a writable persistent view of the same
+                    // 64 KiB section pages held stable by `_reading`.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(payload.as_ptr(), alias_ptr as *mut u8, BLOCK);
+                    }
+                    wrote_beside = true;
                 }
-                wrote_beside = true;
             }
         }
         if !wrote_beside {
@@ -1284,9 +1315,10 @@ pub(crate) fn log_periodic() {
         return;
     }
     let p: [u64; 11] = std::array::from_fn(|i| STATS[i].swap(0, Ordering::Relaxed));
+    let r: [u64; 5] = std::array::from_fn(|i| REJ[i].swap(0, Ordering::Relaxed));
     let live = LIVE_BLOCKS.load(Ordering::Relaxed);
     let total_demoted = TOTAL_DEMOTED.load(Ordering::Relaxed);
-    if live == 0 && p.iter().all(|&v| v == 0) && total_demoted == 0 {
+    if live == 0 && p.iter().all(|&v| v == 0) && r.iter().all(|&v| v == 0) && total_demoted == 0 {
         return;
     }
     let faults = p[2] + p[3];
@@ -1294,7 +1326,8 @@ pub(crate) fn log_periodic() {
         "PC-native VRAM lazy readback (VICTORY_LAZY_READBACK={}): live {} blocks ({:.1} MiB), \
          promoted {}, repeat-fence-updates {} (0 VirtualProtect), VEH faults {} (read {}, write {}, coalesced {}), \
          internal fetches {}, overwrite-drops {} (0 readback), evicts {}, shadow-flushes {}, \
-         demoted-CpuHot {} (cumulative {}), fetch {:.2} ms",
+         demoted-CpuHot {} (cumulative {}), fetch {:.2} ms; \
+         rejected [span={}, class={}, alias={}, cpuhot={}, uncommittable={}]",
         mode(),
         live,
         (live * BLOCK as u64) as f64 / (1024.0 * 1024.0),
@@ -1311,6 +1344,11 @@ pub(crate) fn log_periodic() {
         p[9],
         total_demoted,
         p[10] as f64 / 1000.0,
+        r[0],
+        r[1],
+        r[2],
+        r[3],
+        r[4],
     );
 }
 
@@ -1691,5 +1729,110 @@ mod tests {
         assert!(!is_gpu_resident((base + BLOCK) / BLOCK));
         // SAFETY: block 1 is restored to `PAGE_READWRITE`.
         assert_eq!(unsafe { *pages.ptr.add(BLOCK + 512) }, 0x88);
+    }
+
+    #[test]
+    fn mem_mapped_section_read_and_write_faults_recover_via_beside_alias() {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEM_MAPPED, MEMORY_BASIC_INFORMATION,
+            MapViewOfFile, PAGE_NOACCESS, SEC_COMMIT, UnmapViewOfFile, VirtualQuery,
+        };
+
+        // Real Windows section-backed `MEM_MAPPED` 64 KiB view (Func9 layout).
+        // SAFETY: anonymous pagefile section mapped and cleaned up inside test.
+        let sec = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE | SEC_COMMIT,
+                0,
+                BLOCK as u32,
+                std::ptr::null(),
+            )
+        };
+        assert!(!sec.is_null());
+        // SAFETY: mapping 1 full 64 KiB block read-write.
+        let view = unsafe { MapViewOfFile(sec, FILE_MAP_WRITE, 0, 0, BLOCK) };
+        assert!(!view.Value.is_null());
+        let base = view.Value as usize;
+        assert_eq!(base % BLOCK, 0);
+
+        // Register with `inplace` so `restore_title_block` takes the zero-torn-read
+        // `MEM_MAPPED` + `inplace::beside` path while `base` stays `PAGE_NOACCESS`.
+        crate::inplace::title_memory_section(sec as usize, BLOCK as u64, true);
+        crate::inplace::title_memory_view(base, BLOCK, sec as usize, 0);
+
+        assert!(is_committable_block(base));
+        assert_eq!(crate::inplace::pages_of(base).len(), 1);
+        assert!(crate::inplace::beside(base, BLOCK).is_some());
+
+        // 1. CPU read fault on `MEM_MAPPED` `PAGE_NOACCESS` recovers via `beside` alias.
+        let fetches = Arc::new(AtomicU64::new(0));
+        let f1 = fetches.clone();
+        assert!(promote_test_block(
+            base,
+            201,
+            0,
+            1,
+            Arc::new(move |_, _, _| {
+                f1.fetch_add(1, Ordering::SeqCst);
+                Some(Box::new([0xD4u8; BLOCK]))
+            }),
+        ));
+        let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        assert_ne!(unsafe { VirtualQuery(base as *const _, &mut mbi, size_of_val(&mbi)) }, 0);
+        assert_eq!(mbi.Type, MEM_MAPPED);
+        assert_eq!(mbi.Protect, PAGE_NOACCESS);
+
+        // SAFETY: `base` is our 64 KiB `MEM_MAPPED` view; VEH recovers `PAGE_NOACCESS`.
+        let sample = unsafe {
+            let s = std::slice::from_raw_parts(base as *const u8, BLOCK);
+            (s[0], s[0x1234], s[BLOCK - 1])
+        };
+        assert_eq!(sample, (0xD4, 0xD4, 0xD4));
+        assert_eq!(fetches.load(Ordering::SeqCst), 1);
+        assert!(!is_gpu_resident(base / BLOCK));
+        assert_ne!(unsafe { VirtualQuery(base as *const _, &mut mbi, size_of_val(&mbi)) }, 0);
+        assert_eq!(mbi.Protect, PAGE_READWRITE);
+
+        // 2. Partial 4-byte CPU write fault on `MEM_MAPPED` preserves all other 65,532 bytes.
+        let f2 = fetches.clone();
+        assert!(promote_test_block(
+            base,
+            201,
+            0,
+            2,
+            Arc::new(move |_, _, _| {
+                f2.fetch_add(1, Ordering::SeqCst);
+                Some(Box::new([0xB2u8; BLOCK]))
+            }),
+        ));
+        // SAFETY: partial write at offset 0x3000 hits `PAGE_NOACCESS`, recovers via `beside`,
+        // then retries the 4-byte store cleanly.
+        unsafe {
+            ((base + 0x3000) as *mut u32).write_volatile(0xCAFE_BABE);
+            let s = std::slice::from_raw_parts(base as *const u8, BLOCK);
+            assert_eq!(&s[0x3000..0x3004], &0xCAFE_BABEu32.to_le_bytes());
+            assert!(s[..0x3000].iter().all(|&b| b == 0xB2));
+            assert!(s[0x3004..].iter().all(|&b| b == 0xB2));
+        }
+        assert_eq!(fetches.load(Ordering::SeqCst), 2);
+        // 2nd fault also triggered `CpuHot` demotion on this `MEM_MAPPED` block.
+        assert!(is_cpu_hot(base / BLOCK));
+
+        // Clean up `lazy_readback`, `inplace`, and Win32 handles.
+        evict_range(base, BLOCK);
+        test_fetchers()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&(base / BLOCK));
+        crate::inplace::views_gone(base, BLOCK);
+        crate::inplace::title_memory_section_gone(sec as usize);
+        // SAFETY: unmapping and closing our test section.
+        unsafe {
+            UnmapViewOfFile(view);
+            CloseHandle(sec);
+        }
     }
 }

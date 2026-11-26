@@ -896,14 +896,14 @@ impl<'a> Lower<'a> {
                         }
                         let lk = self.s.m.i32(local_k);
                         let mine = self.read_lane(a, lk);
-                        let (_, lo, hi) = self.exchange_halves(self.cur, mine);
+                        let (_, lo, hi) = self.exchange_halves(self.cur, Some(self.cur_ir), mine);
                         self.readlane_cache.insert((b_ir, val, local_k), (lo, hi));
                         return int(self, if is_hi { hi } else { lo });
                     }
                     let k31 = self.s.m.i32(31);
                     let local_lane = self.s.m.bin(self.cur, Bin::And, lane, k31);
                     let mine = self.read_lane(a, local_lane);
-                    let (c2, lo, hi) = self.exchange_halves(self.cur, mine);
+                    let (c2, lo, hi) = self.exchange_halves(self.cur, Some(self.cur_ir), mine);
                     let k32 = self.s.m.i32(32);
                     let upper = self.s.m.cmp(c2, pred::IUGE, lane, k32);
                     let r = self.s.m.select(c2, upper, hi, lo);
@@ -983,13 +983,14 @@ impl<'a> Lower<'a> {
                         // lane 0, which the lower half of every console wave
                         // has. No half needs to ask the other whether it has
                         // a lane, and the lower half's value is the answer.
-                        let (_, lo, _) = self.exchange_halves(c, mine);
+                        let (_, lo, _) = self.exchange_halves(c, Some(self.cur_ir), mine);
                         lo
                     } else {
                         // Pack `(has, mine)` into one double-buffered cross-half sync.
                         let i32t = self.s.t.i32;
                         let has = self.s.m.cast(c, Cast::ZExt, any, i32t);
-                        let (c2, pairs) = self.exchange_multi(c, &[has, mine]);
+                        let (c2, pairs) =
+                            self.exchange_multi(c, Some(self.cur_ir), &[has, mine]);
                         let ((lo_has, hi_has), (lo, hi)) = (pairs[0], pairs[1]);
                         let z = self.s.m.i32(0);
                         let in_lo = self.s.m.cmp(c2, pred::NE, lo_has, z);

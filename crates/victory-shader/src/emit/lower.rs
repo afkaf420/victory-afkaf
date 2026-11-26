@@ -246,8 +246,8 @@ fn half_shift(width: u32) -> u32 {
 
 pub(super) use super::exchange::{branches_around, reads_mask_as_data, wave_local};
 use super::exchange::{
-    Exchange, MAX_LDS_DWORDS, MODE_B_SPIN_LIMIT, all_group_blocks, all_lane_blocks,
-    lane_constant_masks, lane_uniform, lds_meetings, meeting_mode,
+    Exchange, MAX_LDS_DWORDS, MODE_B_SPIN_LIMIT, all_group_barrier_blocks, all_group_blocks,
+    all_lane_blocks, lane_constant_masks, lane_uniform, lds_meetings, meeting_mode,
 };
 
 struct Lower<'a> {
@@ -326,6 +326,9 @@ struct Lower<'a> {
     /// Per IR block: whether every console wave of the thread group runs it
     /// (excludes blocks inside wave-wide `st.wide` branches).
     all_group: Vec<bool>,
+    /// Per IR block: provably workgroup-uniform (`all_group_barrier_blocks`),
+    /// safe for hardware `BAR.SYNC` (`barrier(1 | 8)`) in `group > 64` shaders.
+    all_group_barrier: Vec<bool>,
     /// Backward SGPR whole-liveness analysis result (`whole_live`).
     whole_live: super::whole_live::WholeLive,
     /// With `exchange`: nothing is exchanged, each host wave acts as a wave
@@ -403,6 +406,16 @@ struct Lower<'a> {
 /// program as killed (a pixel discards).
 // shortcut: a genuine loop of more iterations than this is cut short too.
 pub(super) const LOOP_LIMIT: u32 = 1 << 20;
+
+#[cfg(test)]
+thread_local! {
+    /// Per-thread test override for [`super::all_group_barrier`].
+    pub(super) static TEST_ALL_GROUP_BARRIER: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+    /// Per-thread test override for [`super::rdna_float`].
+    pub(super) static TEST_RDNA_FLOAT: std::cell::Cell<Option<u32>> =
+        const { std::cell::Cell::new(None) };
+}
 
 /// Lane masks read as numbers (`s_bcnt1`, `s_ff1`, `v_mbcnt`, scalar
 /// compares, bit tests) are ballots of the lanes' booleans, taken where the
@@ -742,6 +755,7 @@ impl<'a> Lower<'a> {
         });
         let whole_live = super::whole_live::analyze(p, x.st);
         let all_group = all_group_blocks(x.st).unwrap_or_default();
+        let all_group_barrier = all_group_barrier_blocks(p, x.st).unwrap_or_default();
         let mut console_lanes = false;
         // LDS accesses get a barrier each (a console wave split in two host waves)
         let mut split_lds = false;
@@ -1092,6 +1106,7 @@ impl<'a> Lower<'a> {
             split_lds,
             lds_meet,
             all_group,
+            all_group_barrier,
             whole_live,
             local: exchange.is_some() && LOCAL_WAVES.get(),
             local_ok: false,
@@ -1503,7 +1518,7 @@ impl<'a> Lower<'a> {
                     let (k0, ku) = (self.s.m.i8(0), self.s.m.i8(u8::from(!float)));
                     let total = self.s.op(c, &format!("waveActiveOp.{sfx}"), Attr::NoUnwind, ty, 119, &[arg, k0, ku]);
                     let tb = bits(self, total);
-                    let (c, lo, _) = self.exchange_halves(self.cur, tb);
+                    let (c, lo, _) = self.exchange_halves(self.cur, Some(self.cur_ir), tb);
                     let lo = back(self, lo);
                     let cl = self.console_lane();
                     let k32 = self.s.m.i32(32);
@@ -1514,7 +1529,7 @@ impl<'a> Lower<'a> {
                 }
                 None => {
                     let rb = bits(self, r);
-                    let (c, lo, hi) = self.exchange_halves(self.cur, rb);
+                    let (c, lo, hi) = self.exchange_halves(self.cur, Some(self.cur_ir), rb);
                     let (lo, hi) = (back(self, lo), back(self, hi));
                     match op {
                         Op::AddU | Op::AddF => self.s.m.bin(c, Bin::Add, lo, hi),
@@ -1591,7 +1606,7 @@ impl<'a> Lower<'a> {
                 need(self.cur_ir);
                 return Err("a wave reduction where not every lane runs");
             }
-            let (c, pairs) = self.exchange_multi(self.cur, &[r_lo, r_hi]);
+            let (c, pairs) = self.exchange_multi(self.cur, Some(self.cur_ir), &[r_lo, r_hi]);
             let ((lo0, lo1), (hi0, hi1)) = (pairs[0], pairs[1]);
             let d0 = self
                 .s
@@ -1680,7 +1695,7 @@ impl<'a> Lower<'a> {
         if !halves {
             return Ok(mine);
         }
-        let (c, lo, hi) = self.exchange_halves(c, mine);
+        let (c, lo, hi) = self.exchange_halves(c, Some(self.cur_ir), mine);
         let total = self.add_halves(lo, hi);
         let total = self.s.m.bin(c, Bin::And, total, low);
         let first = self.s.m.bin(c, Bin::And, lo, high);
@@ -1733,7 +1748,7 @@ impl<'a> Lower<'a> {
             .is_some_and(|e| e.paired() && e.mode_b)
             && !self.local;
         self.entry_tail = self.cur;
-        if eager_mode_b {
+        if eager_mode_b && !self.use_group_barrier(None) {
             for &(_, v) in &p.inputs {
                 self.eager_ballot(v);
             }
@@ -1774,7 +1789,7 @@ impl<'a> Lower<'a> {
                 };
                 self.vals.insert(phi.value, val);
             }
-            if eager_mode_b && self.all_lanes(b) {
+            if eager_mode_b && self.all_lanes(b) && !self.use_group_barrier(Some(b)) {
                 for phi in &p.blocks[b].phis {
                     self.eager_ballot(phi.value);
                 }
@@ -1789,7 +1804,7 @@ impl<'a> Lower<'a> {
                     for j in i + 1..end {
                         self.section_inst(b, j, i);
                     }
-                    if eager_mode_b && self.all_lanes(b) {
+                    if eager_mode_b && self.all_lanes(b) && !self.use_group_barrier(Some(b)) {
                         for j in i..end {
                             for &(_, w) in &p.blocks[b].insts[j].writes {
                                 self.eager_ballot(w);
@@ -1799,7 +1814,7 @@ impl<'a> Lower<'a> {
                     i = end;
                     continue;
                 }
-                if eager_mode_b && self.all_lanes(b) {
+                if eager_mode_b && self.all_lanes(b) && !self.use_group_barrier(Some(b)) {
                     for &(_, w) in &p.blocks[b].insts[i].writes {
                         self.eager_ballot(w);
                     }
@@ -2429,15 +2444,24 @@ impl<'a> Lower<'a> {
     ///   sparse GDDR6X raw UAVs at `USER_MEMORY_BASE + 1..=12` (null raw UAV at
     ///   `USER_MEMORY_BASE + 0`), using `USER_MEMORY_APERTURE_HI` (`aperture >> 32`).
     /// - Otherwise: legacy 64 KiB page directory `SLOT_MEMORY` / `SLOT_FAULTS`.
-    /// Both paths annotate the raw buffer UAV handle as `globallycoherent`
-    /// (`0x4000`) so cross-group BVH tree linking stays coherent across SMs.
+    /// Only spilled BVH builder programs (`crate::spill::is_spilled`) mark the
+    /// raw UAV handle `globallycoherent` (`0x4000`) so non-builder readers keep
+    /// full L1 caching. Fault reporting to `SLOT_FAULTS` is guarded on `missing`
+    /// so resident accesses perform zero global sink stores.
     fn memory(&mut self, lo: V, hi: V, guard: Option<V>) -> (V, V) {
         use super::shader::{
             MEMORY_FAULTS, MEMORY_PAGES, SLOT_FAULTS, SLOT_MEMORY, USER_MEMORY_APERTURE_HI,
             USER_MEMORY_BASE,
         };
-        // DXIL ResourceProperties word 0: Kind=11 (RawBuffer) | IsUAV (0x1000) | IsGloballyCoherent (0x4000).
-        const RAW_UAV_GC: (u32, u32) = (11 | 0x1000 | 0x4000, 0);
+        // Only the ray-tracing structure builder (`is_spilled`) needs
+        // `globallycoherent` (`0x4000`) across workgroups; non-builder readers
+        // keep full L1 cache hits.
+        let coherent = if crate::spill::is_spilled(self.x.native) {
+            0x4000
+        } else {
+            0
+        };
+        let raw_uav = (11 | 0x1000 | coherent, 0);
         let c = self.cur;
         let k = |l: &mut Self, v: u32| l.s.m.i32(v);
         if super::sparse_uma() {
@@ -2458,7 +2482,7 @@ impl<'a> Lower<'a> {
             let win1 = self.s.m.bin(c, Bin::Add, win, one);
             let target_slot = self.s.m.bin(c, Bin::Add, base, win1);
             let slot = self.s.m.select(c, in_range, target_slot, base);
-            let h = self.s.heap_handle(c, slot, false, true, RAW_UAV_GC);
+            let h = self.s.heap_handle(c, slot, false, true, raw_uav);
             let mask2g = k(self, 0x7FFF_FFFF);
             let raw_byte = self.s.m.bin(c, Bin::And, lo, mask2g);
             let zero = k(self, 0);
@@ -2493,21 +2517,23 @@ impl<'a> Lower<'a> {
         );
         let (copy, start) = (self.s.m.extract(c, entry, 0), self.s.m.extract(c, entry, 1));
         let (copy, start) = (self.as_int(copy), self.as_int(start));
-        // A page without a copy: its number, at a place by the number, or
-        // at the sink for lanes that do not run and pages that have one.
+        // A page without a copy: its number, at a place by the number. Guarded
+        // on `missing` so resident steady-state hits emit zero writes to the
+        // host-visible fault buffer.
         let zero = k(self, 0);
         let mut missing = self.s.m.cmp(c, pred::EQ, copy, zero);
         if let Some(g) = guard {
             missing = self.s.m.bin(c, Bin::And, missing, g);
         }
         let places = k(self, MEMORY_FAULTS - 1);
+        let faults = self.s.root_uav_handle(SLOT_FAULTS);
+        let noting = self.begin_guarded(Some(missing));
+        let c = self.cur;
         let place = self.s.m.bin(c, Bin::URem, page, places);
         let one = k(self, 1);
         let place = self.s.m.bin(c, Bin::Add, place, one);
         let k2 = k(self, 2);
         let place = self.s.m.bin(c, Bin::Shl, place, k2);
-        let place = self.s.m.select(c, missing, place, zero);
-        let faults = self.s.root_uav_handle(SLOT_FAULTS);
         let void = self.s.t.void;
         let mask = self.s.m.i8(1);
         self.s.op(
@@ -2518,9 +2544,11 @@ impl<'a> Lower<'a> {
             140,
             &[faults, place, iu, page, iu, iu, iu, mask, align],
         );
+        self.end_guarded(noting, &[]);
+        let c = self.cur;
         let base = self.host_word(RootType::Other(USER_MEMORY_BASE), 0, 0);
         let slot = self.s.m.bin(c, Bin::Add, base, copy);
-        let h = self.s.heap_handle(c, slot, false, true, RAW_UAV_GC);
+        let h = self.s.heap_handle(c, slot, false, true, raw_uav);
         let k64k = k(self, 0xFFFF);
         let within = self.s.m.bin(c, Bin::And, lo, k64k);
         let byte = self.s.m.bin(c, Bin::Add, start, within);
@@ -2557,7 +2585,6 @@ impl<'a> Lower<'a> {
         let (lo, hi) = (word(self, 0)?, word(self, 1)?);
         let (lo, hi) = self.address_plus(lo, hi, i32::from(*offset));
         let guard = self.guard(b, i)?;
-        let c = self.cur;
         let (i32t, res, void) = (self.s.t.i32, self.s.t.res_ret, self.s.t.void);
         let iu = self.s.m.undef(i32t);
         let align = self.s.m.i32(4);
@@ -2575,6 +2602,7 @@ impl<'a> Lower<'a> {
                 return Err("a global load result");
             };
             let (h, byte) = self.memory(lo, hi, guard);
+            let c = self.cur;
             let mask = self.s.m.i8((1u8 << n) - 1);
             let r = self.s.op(
                 c,
@@ -2623,6 +2651,7 @@ impl<'a> Lower<'a> {
             None => self.s.m.i32(0),
         };
         let (h, byte) = self.memory(lo, hi, guard);
+        let c = self.cur;
         // DXIL's atomic operations: add 0, and 1, or 2, xor 3, signed
         // minimum 4 and maximum 5, unsigned 6 and 7, exchange 8.
         let simple = match op {
@@ -2725,7 +2754,7 @@ impl<'a> Lower<'a> {
             && self.exchange.as_ref().is_some_and(|e| e.paired())
             && self.all_lanes(self.cur_ir)
         {
-            let (_, pairs) = self.exchange_multi(self.cur, &vals);
+            let (_, pairs) = self.exchange_multi(self.cur, Some(self.cur_ir), &vals);
             for (k, (lo, _)) in pairs.into_iter().enumerate() {
                 self.write(inst, Reg::S(code + k as u8), lo, None);
             }
@@ -2779,6 +2808,7 @@ impl<'a> Lower<'a> {
             let n = (count - first).min(4);
             let (lo, hi) = self.address_plus(lo, hi, offset + 4 * i32::from(first));
             let (h, byte) = self.memory(lo, hi, None);
+            let c = self.cur;
             let mask = self.s.m.i8((1u8 << n) - 1);
             let r = self.s.op(
                 c,
@@ -2907,7 +2937,7 @@ impl<'a> Lower<'a> {
                         need(b.unwrap_or(0));
                         return Err("a lane mask exchanged where not every lane runs");
                     }
-                    let (_, lx, hy) = self.exchange_halves(at, xy.0);
+                    let (_, lx, hy) = self.exchange_halves(at, b, xy.0);
                     xy = (lx, hy);
                 }
                 self.ballots.insert(lo, xy);
@@ -3295,7 +3325,7 @@ impl<'a> Lower<'a> {
         }
         // `x * x` is bit-for-bit identical to IEEE `fmul` across all 2^32 f32
         // patterns (`(±0)^2 = +0`, `(±Inf)^2 = +Inf`, `NaN^2 = NaN`).
-        if self.s.m.same_bits(a, b) {
+        if self.s.m.same_bits(a, b) || (super::rdna_float() & super::rdna::LEGACY != 0) {
             return self.s.m.bin(c, Bin::Mul, a, b);
         }
         let m = self.s.m.bin(c, Bin::Mul, a, b);
@@ -3700,17 +3730,44 @@ impl<'a> Lower<'a> {
         self.exchange_sync_mode_b(at, wave_slot, half).0
     }
 
+    /// Whether a paired cross-half exchange at `ir_block` (`None` = entry
+    /// block) can use hardware Mode A `BAR.SYNC` (`barrier(1 | 8)`) instead of
+    /// Mode B pairwise TGSM atomic spin-wait loops.
+    fn use_group_barrier(&self, ir_block: Option<usize>) -> bool {
+        let Some(ex) = self.exchange.as_ref() else {
+            return false;
+        };
+        if !ex.mode_b {
+            return true;
+        }
+        if !super::all_group_barrier() {
+            return false;
+        }
+        match ir_block {
+            None => true,
+            Some(b) => self.all_group_barrier.get(b).copied().unwrap_or(false),
+        }
+    }
+
     /// Exchanges `vals` (uniform across this host wave) between the two 32-lane
     /// halves of this console wave using double-buffered TGSM banks:
-    /// - Mode A (`group <= 64`): per-half private parity + 1 `barrier(1 | 8)`.
-    /// - Mode B (`group > 64`): monotonic pairwise arrival counters + TGSM-only
-    ///   `barrier(8)` + bounded spin (`1 << 20`) + TDR fuse.
+    /// - Mode A (`group <= 64`, or provably workgroup-uniform `all_group`
+    ///   blocks when `VICTORY_ALL_GROUP_BARRIER=1`): per-half monotonic `seq`
+    ///   increment + 1 hardware `barrier(1 | 8)` (0 spin loops, 0 atomics).
+    /// - Mode B (`group > 64` inside divergent `!all_group` blocks): monotonic
+    ///   pairwise arrival counters + TGSM-only `barrier(8)` + bounded spin
+    ///   (`1 << 20`) + TDR fuse.
     /// Returns `(after_block, Vec<(lo, hi)>)`.
-    fn exchange_multi(&mut self, mut at: usize, vals: &[V]) -> (usize, Vec<(V, V)>) {
-        let Some((small, mode_b, hdr_dwords, width)) = self
+    fn exchange_multi(
+        &mut self,
+        mut at: usize,
+        ir_block: Option<usize>,
+        vals: &[V],
+    ) -> (usize, Vec<(V, V)>) {
+        let Some((small, hdr_dwords, width)) = self
             .exchange
             .as_ref()
-            .map(|ex| (ex.small, ex.mode_b, ex.hdr_dwords, ex.width))
+            .map(|ex| (ex.small, ex.hdr_dwords, ex.width))
         else {
             let z = self.s.m.i32(0);
             return (at, vals.iter().map(|&v| (v, z)).collect());
@@ -3734,6 +3791,7 @@ impl<'a> Lower<'a> {
                 .collect();
             return (at, out);
         }
+        let use_barrier = self.use_group_barrier(ir_block);
         let chunk_max = width.max(1) as usize;
         let mut out = Vec::with_capacity(vals.len());
         for chunk in vals.chunks(chunk_max) {
@@ -3765,11 +3823,14 @@ impl<'a> Lower<'a> {
                 let ptr = self.s.m.element(at, lds, idx);
                 self.s.m.store(at, ptr, v);
             }
-            if !mode_b {
-                // Mode A: toggle this half's private parity before the single barrier.
-                let next_p = self.s.m.bin(at, Bin::Xor, p, one);
-                self.s.m.store(at, hdr_ptr, next_p);
+            if use_barrier {
+                // Mode A: advance `hdr[half]` monotonically (`seq + 1`) so bank
+                // parity flips and stays aligned with any Mode B counter in the
+                // same shader, then issue a single hardware BAR.SYNC.
+                let next_seq = self.s.m.bin(at, Bin::Add, seq, one);
+                self.s.m.store(at, hdr_ptr, next_seq);
                 self.group_sync(at);
+                let zero = self.s.m.i32(0);
                 for k in 0..chunk.len() {
                     let lo_idx = if k == 0 {
                         bank_base
@@ -3781,7 +3842,12 @@ impl<'a> Lower<'a> {
                     let hi_idx = self.s.m.bin(at, Bin::Add, bank_base, hi_off);
                     let p0 = self.s.m.element(at, lds, lo_idx);
                     let p1 = self.s.m.element(at, lds, hi_idx);
-                    out.push((self.s.m.load(at, p0), self.s.m.load(at, p1)));
+                    let lo = self.s.m.load(at, p0);
+                    let mut hi = self.s.m.load(at, p1);
+                    if let Some(hp) = self.has_partner {
+                        hi = self.s.m.select(at, hp, hi, zero);
+                    }
+                    out.push((lo, hi));
                 }
             } else {
                 // Mode B: pairwise arrival counters + TGSM-only fences; double-buffering
@@ -3816,8 +3882,13 @@ impl<'a> Lower<'a> {
 
     /// `exchange`: each host wave gives `mine` (the same in all its lanes) for its half; both get
     /// `(after_block, lower half's, upper half's)`. A group with no upper half gets 0 for it.
-    fn exchange_halves(&mut self, at: usize, mine: V) -> (usize, V, V) {
-        let (after, res) = self.exchange_multi(at, &[mine]);
+    fn exchange_halves(
+        &mut self,
+        at: usize,
+        ir_block: Option<usize>,
+        mine: V,
+    ) -> (usize, V, V) {
+        let (after, res) = self.exchange_multi(at, ir_block, &[mine]);
         (after, res[0].0, res[0].1)
     }
 
@@ -3826,11 +3897,12 @@ impl<'a> Lower<'a> {
     /// bank, synchronises with its partner half (Mode A or Mode B), and reads
     /// slot `src_lane & 63`.
     fn exchange_bpermute(&mut self, val: V, src_lane: V) -> V {
-        let (mode_b, hdr_dwords, width) = {
+        let (hdr_dwords, width) = {
             let ex = self.exchange.as_ref().expect("exchange");
             debug_assert!(ex.width >= 32, "bpermute needs 32 dwords per half");
-            (ex.mode_b, ex.hdr_dwords, ex.width)
+            (ex.hdr_dwords, ex.width)
         };
+        let use_barrier = self.use_group_barrier(Some(self.cur_ir));
         let at = self.cur;
         let wave_slot = self.exchange_wave_slot();
         let cl = self.console_lane();
@@ -3865,12 +3937,20 @@ impl<'a> Lower<'a> {
         let src_base = self.s.m.bin(at, Bin::Add, bank_base, src_half_off);
         let src_idx = self.s.m.bin(at, Bin::Add, src_base, src_in_half);
 
-        if !mode_b {
-            let next_p = self.s.m.bin(at, Bin::Xor, p, one);
-            self.s.m.store(at, hdr_ptr, next_p);
+        if use_barrier {
+            let next_seq = self.s.m.bin(at, Bin::Add, seq, one);
+            self.s.m.store(at, hdr_ptr, next_seq);
             self.group_sync(at);
             let src_ptr = self.s.m.element(at, lds, src_idx);
-            self.s.m.load(at, src_ptr)
+            let raw = self.s.m.load(at, src_ptr);
+            if let Some(hp) = self.has_partner {
+                let same_half = self.s.m.cmp(at, pred::EQ, src_half, half);
+                let ok = self.s.m.bin(at, Bin::Or, hp, same_half);
+                let z = self.s.m.i32(0);
+                self.s.m.select(at, ok, raw, z)
+            } else {
+                raw
+            }
         } else {
             let (join, fallback) = self.exchange_sync_mode_b(at, wave_slot, half);
             let src_ptr = self.s.m.element(join, lds, src_idx);
@@ -3918,7 +3998,7 @@ impl<'a> Lower<'a> {
             return Err("a lane mask exchanged where not every lane runs");
         }
         let some = self.s.m.cast(at, Cast::ZExt, some, i32t);
-        let (at, lo, hi) = self.exchange_halves(at, some);
+        let (at, lo, hi) = self.exchange_halves(at, made, some);
         let both = self.s.m.bin(at, Bin::Or, lo, hi);
         let z = self.s.m.i32(0);
         Ok(self.s.m.cmp(at, pred::NE, both, z))
@@ -3960,7 +4040,7 @@ impl<'a> Lower<'a> {
         let some = self.s.op(c, "waveAnyTrue", Attr::NoUnwind, i1t, 113, &[set]);
         self.s.flags |= flags::WAVE_OPS;
         let some = self.s.m.cast(c, Cast::ZExt, some, i32t);
-        let (c, lo, hi) = self.exchange_halves(c, some);
+        let (c, lo, hi) = self.exchange_halves(c, Some(b), some);
         let both = self.s.m.bin(c, Bin::Or, lo, hi);
         let z = self.s.m.i32(0);
         Ok(self.s.m.cmp(c, if any { pred::NE } else { pred::EQ }, both, z))
@@ -4409,7 +4489,31 @@ impl<'a> Lower<'a> {
     /// `x` in the first lane of this host wave where `guard` holds, and whether it has such a
     /// lane: the console reads the first lane of EXEC, and a lane that got here with EXEC clear
     /// (a guard, not a branch) is not one. With none, `x` of the wave's first lane here.
+    ///
+    /// A helper lane of a pixel shader takes its own value when [`super::helper_own`] is on:
+    /// the console's whole-quad mode keeps helper lanes in EXEC, whereas host wave operations
+    /// exclude helper lanes (preventing stalled waterfall loops on triangle edges).
     fn first_lane(&mut self, x: V, guard: Option<V>) -> (V, V) {
+        let (first, any) = self.first_live_lane(x, guard);
+        if !self.s.pixel || !super::helper_own() {
+            return (first, any);
+        }
+        let helper = self.helper_lane();
+        let c = self.cur;
+        let yes = self.s.m.bool(true);
+        (
+            self.s.m.select(c, helper, x, first),
+            self.s.m.select(c, helper, yes, any),
+        )
+    }
+
+    /// Whether this lane of a pixel shader is a helper lane.
+    fn helper_lane(&mut self) -> V {
+        let i1t = self.s.t.i1;
+        self.s.op(self.cur, "isHelperLane.i1", Attr::ReadOnly, i1t, 221, &[])
+    }
+
+    fn first_live_lane(&mut self, x: V, guard: Option<V>) -> (V, V) {
         let c = self.cur;
         let i32t = self.s.t.i32;
         self.s.flags |= flags::WAVE_OPS;
@@ -6155,7 +6259,13 @@ impl<'a> Lower<'a> {
             if per_lane {
                 self.s.flags |= flags::WAVE_OPS;
                 let i32t = self.s.t.i32;
-                d = self.s.op(c, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[d]);
+                let first = self.s.op(c, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[d]);
+                d = if self.s.pixel && super::helper_own() {
+                    let helper = self.helper_lane();
+                    self.s.m.select(c, helper, d, first)
+                } else {
+                    first
+                };
             }
             addr = self.s.m.bin(c, Bin::Add, addr, d);
         }
@@ -9181,7 +9291,7 @@ impl<'a> Lower<'a> {
             over = self.s.op(c, wname, Attr::NoUnwind, i1t, wcode, &[over]);
             self.s.flags |= flags::WAVE_OPS;
             let over_i32 = self.s.m.cast(c, Cast::ZExt, over, i32t);
-            let (c2, lo, hi) = self.exchange_halves(c, over_i32);
+            let (c2, lo, hi) = self.exchange_halves(c, Some(self.cur_ir), over_i32);
             let combined = if p == pred::IULT {
                 self.s.m.bin(c2, Bin::And, lo, hi)
             } else {
@@ -10070,5 +10180,150 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    #[test]
+    fn non_spilled_memory_drops_globallycoherent_and_guards_fault_store() {
+        use std::collections::HashMap;
+        use super::{Lower, Stop, TEST_SPARSE_UMA};
+        // Non-spilled compute shader doing a raw 40-bit `global_load_dword` via `SLOT_MEMORY`:
+        // s_load_dwordx4 s[8:11], s[4:5], 0 (table UAV out)
+        // v_mov_b32 v2, s0; v_mov_b32 v3, s1 (64-bit title address in v[2:3])
+        // global_load_dword v4, v[2:3], off
+        // buffer_store_dword v4, v0, s[8:11], 0 offen
+        // s_endpgm
+        let words: &[u32] = &[
+            0xBE85_0380,             // s_mov_b32 s5, 0
+            0xF408_0202, 0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+            0x7E04_0200,             // v_mov_b32 v2, s0
+            0x7E06_0201,             // v_mov_b32 v3, s1
+            0xDC30_8000, 0x047D_0002, // global_load_dword v4, v[2:3], off (saddr=0x7D NULL)
+            0xE070_1000, 0x8002_0400, // buffer_store_dword v4, v0, s[8:11], 0 offen
+            0xBF81_0000,             // s_endpgm
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![
+                RootParam {
+                    root: RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 2,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            used: vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 4,
+                slot: 1,
+            }],
+            io: StageIo::Cs(crate::native::ComputeIo {
+                rsrc2: 5 << 1,
+                threads: [32, 1, 1],
+            }),
+            code,
+        };
+        let p = crate::ir::build(&native.code, native.wave64, native.vgprs).expect("ir");
+        let st = crate::structure::structure(&p).expect("structure");
+        let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st))
+            .expect("track");
+        let io = crate::io::raise(&p, &native).expect("io");
+        let parts = Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        };
+        let bad = HashMap::new();
+        let mut l = Lower::new(&parts, &bad);
+        let was_uma = TEST_SPARSE_UMA.replace(Some(false));
+        l.s.threads = Some([32, 1, 1]);
+        let res_run = (|| -> Result<(), Stop> {
+            let p = l.x.p;
+            let order = crate::ir::reverse_postorder(&p.blocks);
+            for (n, &b) in order.iter().enumerate() {
+                l.rpo[b] = n;
+                l.block[b] = Some(if n == 0 { l.s.entry } else { l.s.m.new_block() });
+            }
+            l.cur = l.s.entry;
+            l.inputs()?;
+            l.entry_tail = l.cur;
+            l.block[order[0]] = Some(l.cur);
+            for &b in &order {
+                l.cur = l.block[b].expect("reachable");
+                l.cur_ir = b;
+                for i in 0..p.blocks[b].insts.len() {
+                    l.inst(b, i)?;
+                }
+                l.exit(b)?;
+                l.tail[b] = Some(l.cur);
+            }
+            Ok(())
+        })();
+        TEST_SPARSE_UMA.set(was_uma);
+        assert!(res_run.is_ok(), "lower non-spilled global_load failed");
+
+        let (gc_handles, heap_raw_uav_handles, fault_store_blocks, entry_cond) =
+            l.s.m.memory_stats();
+        assert_eq!(
+            gc_handles, 0,
+            "non-spilled memory() shader must not emit globallycoherent (0x4000) handles"
+        );
+        assert!(
+            heap_raw_uav_handles >= 1,
+            "non-spilled memory() shader should emit plain raw UAV (0x100b) handle"
+        );
+        // The `SLOT_FAULTS` store must be guarded inside a conditional branch (not in entry block 0).
+        assert!(
+            !fault_store_blocks.contains(&0),
+            "SLOT_FAULTS store must be guarded on `missing`, not executed unconditionally in entry block 0"
+        );
+        assert!(
+            entry_cond,
+            "entry block must branch conditionally on `missing` before storing to SLOT_FAULTS"
+        );
+        // Also ensure full `lower()` produces valid DXIL.
+        let was_uma = TEST_SPARSE_UMA.replace(Some(false));
+        let mut lowered = lower(&parts).expect("full lower");
+        TEST_SPARSE_UMA.set(was_uma);
+        #[cfg(windows)]
+        if let Ok(mut v) = super::super::validator::Validator::load(
+            super::super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut lowered.dxil)
+                .expect("guarded memory() DXIL validation failed");
+        }
+    }
+
+    #[test]
+    fn rdna_float_toggle_defaults_off_and_opts_in() {
+        use super::super::{parse_rdna_float, rdna};
+        assert_eq!(parse_rdna_float(None), 0);
+        assert_eq!(parse_rdna_float(Some("0")), 0);
+        assert_eq!(parse_rdna_float(Some("1")), rdna::ALL);
+        assert_eq!(parse_rdna_float(Some("2")), rdna::LEGACY);
+        assert_eq!(parse_rdna_float(Some("0x3")), rdna::MAX_MIN | rdna::LEGACY);
     }
 }

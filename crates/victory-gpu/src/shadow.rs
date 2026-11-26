@@ -122,52 +122,88 @@ struct Card {
     gpu_written: AtomicBool,
 }
 
-/// Resolves `VICTORY_REBAR_STREAM` (Move 3 Stage 3A): default ON (`0`/`off`/`false` disables).
-fn resolve_rebar_stream(env: Option<&str>) -> bool {
-    !matches!(
-        env.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
-        Some("0" | "off" | "false")
-    )
+/// Direct ReBAR streaming mode (`VICTORY_REBAR_STREAM`, Move 3 Stage 3A).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RebarStreamMode {
+    /// Disabled (`0`/`off`/`false`): every card buffer allocates a host RAM `Card::staging` mirror.
+    Off,
+    /// Safe default (`1`/`ro`/`true`/unset): skip upfront `Card::staging` ONLY for
+    /// `ConsoleMemClass::GpuReadOnly` (write-once/immutable) buffers; mutable
+    /// `WriteCombinedGpuRw` buffers keep their `Card::staging` snapshot at
+    /// `batch.flush()` so `VICTORY_ASYNC_SUBMIT=1` never races frame `N+1` CPU overwrites.
+    ReadOnly,
+    /// Opt-in (`2`/`all`/`wc`): also stream `lazy_readback`-eligible `WriteCombinedGpuRw`
+    /// buffers directly from Title RAM into `UploadRing`.
+    All,
 }
 
-/// Whether Move 3 Stage 3A direct Title RAM -> `UploadRing` (ReBAR) -> VRAM
-/// streaming is active (bypassing `Card::staging` host RAM mirror allocation
-/// and double-copy for `GpuReadOnly` and `lazy_readback`-eligible buffers).
-pub(crate) fn rebar_stream() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
+impl RebarStreamMode {
+    fn code(self) -> u8 {
+        match self {
+            Self::Off => 0,
+            Self::ReadOnly => 1,
+            Self::All => 2,
+        }
+    }
+}
+
+/// Resolves `VICTORY_REBAR_STREAM` (Move 3 Stage 3A): default `ReadOnly` (`1`),
+/// `2`/`all`/`wc` opts in to streaming `WriteCombinedGpuRw` too, `0`/`off`/`false` disables.
+fn resolve_rebar_stream_mode(env: Option<&str>) -> RebarStreamMode {
+    match env.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        Some("0" | "off" | "false") => RebarStreamMode::Off,
+        Some("2" | "all" | "wc") => RebarStreamMode::All,
+        _ => RebarStreamMode::ReadOnly,
+    }
+}
+
+fn rebar_stream_mode() -> RebarStreamMode {
+    static MODE: std::sync::OnceLock<RebarStreamMode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
         let env = std::env::var("VICTORY_REBAR_STREAM").ok();
-        let active = resolve_rebar_stream(env.as_deref()) && crate::host::async_upload();
+        let mode = if crate::host::async_upload() {
+            resolve_rebar_stream_mode(env.as_deref())
+        } else {
+            RebarStreamMode::Off
+        };
         tracing::info!(
-            active,
+            mode = ?mode,
             "PC-native VRAM ReBAR direct streaming (VICTORY_REBAR_STREAM={})",
-            if active { 1 } else { 0 }
+            mode.code()
         );
-        active
+        mode
     })
 }
 
 /// Pure class eligibility rule for Move 3 Stage 3A direct ReBAR streaming:
-/// `GpuReadOnly` always qualifies; `lazy_readback`-eligible classes (e.g.
-/// `WriteCombinedGpuRw` in mode 1, + `CachedGpuRw` in mode 2) qualify when
-/// `lazy_readback` is active.
-fn rebar_stream_class_ok(class: crate::watch::ConsoleMemClass, lazy_on: bool) -> bool {
-    class == crate::watch::ConsoleMemClass::GpuReadOnly
-        || (lazy_on && crate::host::lazy_readback::class_eligible(class))
+/// - `Off`: no class qualifies.
+/// - `ReadOnly` (default `=1`): `GpuReadOnly` ONLY (safe under `ASYNC_SUBMIT=1`).
+/// - `All` (opt-in `=2`/`all`): `GpuReadOnly` plus `lazy_readback`-eligible classes
+///   when `lazy_readback` is active.
+fn rebar_stream_class_ok(class: crate::watch::ConsoleMemClass, mode: RebarStreamMode, lazy_on: bool) -> bool {
+    match mode {
+        RebarStreamMode::Off => false,
+        RebarStreamMode::ReadOnly => class == crate::watch::ConsoleMemClass::GpuReadOnly,
+        RebarStreamMode::All => {
+            class == crate::watch::ConsoleMemClass::GpuReadOnly
+                || (lazy_on && crate::host::lazy_readback::class_eligible(class))
+        }
+    }
 }
 
 /// Whether a carded shadow covering `[start, start + len)` can skip allocating
 /// an upfront `Card::staging` host RAM mirror and stream dirty runs directly
 /// from Title RAM into `UploadRing`.
 fn rebar_stream_eligible(start: u64, len: u64) -> bool {
-    if !rebar_stream() || len == 0 {
+    let mode = rebar_stream_mode();
+    if mode == RebarStreamMode::Off || len == 0 {
         return false;
     }
     let lo = start as usize;
     let hi = lo.saturating_add(len as usize);
     let parts = crate::watch::console_mem_class_ranges(lo, hi);
     let lazy_on = crate::host::lazy_readback::on();
-    !parts.is_empty() && parts.iter().all(|&(_, _, c)| rebar_stream_class_ok(c, lazy_on))
+    !parts.is_empty() && parts.iter().all(|&(_, _, c)| rebar_stream_class_ok(c, mode, lazy_on))
 }
 
 /// Move 3 Stage 3A counters:
@@ -177,7 +213,8 @@ static REBAR_STREAM_STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 /// Logs periodic summary of Move 3 Stage 3A direct ReBAR streaming savings.
 pub(crate) fn rebar_stream_log_periodic() {
-    if !rebar_stream() {
+    let mode = rebar_stream_mode();
+    if mode == RebarStreamMode::Off {
         return;
     }
     let created = REBAR_STREAM_STATS[0].load(Ordering::Relaxed);
@@ -188,9 +225,10 @@ pub(crate) fn rebar_stream_log_periodic() {
         return;
     }
     tracing::info!(
-        "PC-native ReBAR direct upload streaming (VICTORY_REBAR_STREAM=1): \
+        "PC-native ReBAR direct upload streaming (VICTORY_REBAR_STREAM={}): \
          {created} mirror-free card buffers ({:.1} MB host RAM saved live, {materialized} lazy materializations), \
          {:.1} MB streamed directly Title RAM -> UploadRing in interval",
+        mode.code(),
         live_saved as f64 / (1024.0 * 1024.0),
         streamed as f64 / (1024.0 * 1024.0),
     );
@@ -242,9 +280,9 @@ fn resolve_card_buffers_bytes(env: Option<&str>, high_vram: bool) -> u64 {
 
 /// Resolves the minimum title buffer size (in bytes) promoted to card VRAM:
 /// explicit `VICTORY_CARD_BUFFERS_MIN_KB` wins, else explicit
-/// `VICTORY_CARD_BUFFERS_MIN_MB`, else 512 KiB on high-VRAM GPUs (>= 16 GiB)
-/// (keeping card buffer count ~1,000 while promoting medium buffers; `=64`
-/// remains opt-in), or 1 MiB on smaller GPUs.
+/// `VICTORY_CARD_BUFFERS_MIN_MB`, else 16 KiB on high-VRAM GPUs (>= 16 GiB)
+/// so hot small atomic/counter/indirect/light-tile buffers stay in GDDR6X
+/// VRAM instead of PCIe system RAM, or 1 MiB on smaller GPUs.
 fn resolve_card_buffers_min_bytes(min_kb_env: Option<&str>, min_mb_env: Option<&str>, high_vram: bool) -> u64 {
     if let Some(kb) = min_kb_env.and_then(|v| v.trim().parse::<u64>().ok())
         && kb > 0
@@ -256,13 +294,13 @@ fn resolve_card_buffers_min_bytes(min_kb_env: Option<&str>, min_mb_env: Option<&
     {
         return mb << 20;
     }
-    if high_vram { 512 << 10 } else { 1 << 20 }
+    if high_vram { 16 << 10 } else { 1 << 20 }
 }
 
 /// The smallest title buffer whose copy goes to the card's memory, and the
 /// most bytes of such copies (their "before" twins not counted: a copy
 /// shaders write takes its size twice), both in bytes:
-/// `VICTORY_CARD_BUFFERS_MIN_KB` (default 512 on >= 16 GiB GPUs),
+/// `VICTORY_CARD_BUFFERS_MIN_KB` (default 16 on >= 16 GiB GPUs),
 /// `VICTORY_CARD_BUFFERS_MIN_MB` (default 1 on smaller GPUs), and
 /// `VICTORY_CARD_BUFFERS_MB` (default 1024, or 4096 on >= 16 GiB GPUs).
 fn card_limits() -> (u64, u64) {
@@ -4695,13 +4733,14 @@ mod window_tests {
 
         // Default >= 16 GiB (24 GB GPU smart defaults)
         assert_eq!(resolve_card_buffers_bytes(None, true), 4096 << 20);
-        assert_eq!(resolve_card_buffers_min_bytes(None, None, true), 512 << 10);
+        assert_eq!(resolve_card_buffers_min_bytes(None, None, true), 16 << 10);
         assert_eq!(resolve_card_windows_bytes(None, true), 4096 << 20);
         assert!(resolve_card_room_kept(None, true));
 
         // Explicit overrides always win in both directions
         assert_eq!(resolve_card_buffers_bytes(Some("2048"), true), 2048 << 20);
         assert_eq!(resolve_card_buffers_bytes(Some(" 512 "), false), 512 << 20);
+        assert_eq!(resolve_card_buffers_min_bytes(Some("512"), None, true), 512 << 10);
         assert_eq!(resolve_card_buffers_min_bytes(Some("64"), None, true), 64 << 10);
         assert_eq!(resolve_card_buffers_min_bytes(None, Some("2"), true), 2 << 20);
         assert_eq!(resolve_card_windows_bytes(Some("0"), true), 0);
@@ -4906,28 +4945,42 @@ mod window_tests {
     #[test]
     fn rebar_stream_toggle_class_eligibility_and_lazy_staging_materialization() {
         use super::{
-            PAGE, rebar_stream_class_ok, resolve_rebar_stream, test_card_shadow_at,
+            PAGE, RebarStreamMode, rebar_stream_class_ok, resolve_rebar_stream_mode, test_card_shadow_at,
         };
         use crate::watch::ConsoleMemClass;
         use windows_sys::Win32::System::Memory::{
             MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
         };
 
-        // 1. Toggle resolution defaults ON and honors disable overrides.
-        assert!(resolve_rebar_stream(None));
-        assert!(resolve_rebar_stream(Some("")));
-        assert!(resolve_rebar_stream(Some("1")));
-        assert!(!resolve_rebar_stream(Some("0")));
-        assert!(!resolve_rebar_stream(Some("off")));
-        assert!(!resolve_rebar_stream(Some("FALSE")));
+        // 1. Mode resolution defaults to ReadOnly (`1`), supports opt-in All (`2`/`all`/`wc`),
+        //    and honors disable overrides (`0`/`off`/`false`).
+        assert_eq!(resolve_rebar_stream_mode(None), RebarStreamMode::ReadOnly);
+        assert_eq!(resolve_rebar_stream_mode(Some("")), RebarStreamMode::ReadOnly);
+        assert_eq!(resolve_rebar_stream_mode(Some("1")), RebarStreamMode::ReadOnly);
+        assert_eq!(resolve_rebar_stream_mode(Some("ro")), RebarStreamMode::ReadOnly);
+        assert_eq!(resolve_rebar_stream_mode(Some("2")), RebarStreamMode::All);
+        assert_eq!(resolve_rebar_stream_mode(Some("ALL")), RebarStreamMode::All);
+        assert_eq!(resolve_rebar_stream_mode(Some("wc")), RebarStreamMode::All);
+        assert_eq!(resolve_rebar_stream_mode(Some("0")), RebarStreamMode::Off);
+        assert_eq!(resolve_rebar_stream_mode(Some("off")), RebarStreamMode::Off);
+        assert_eq!(resolve_rebar_stream_mode(Some("FALSE")), RebarStreamMode::Off);
 
-        // 2. Class eligibility matrix: GpuReadOnly always ok; WriteCombinedGpuRw ok when lazy_readback is on;
-        //    Unknown never ok.
-        assert!(rebar_stream_class_ok(ConsoleMemClass::GpuReadOnly, false));
-        assert!(rebar_stream_class_ok(ConsoleMemClass::GpuReadOnly, true));
-        assert!(!rebar_stream_class_ok(ConsoleMemClass::WriteCombinedGpuRw, false));
-        assert!(rebar_stream_class_ok(ConsoleMemClass::WriteCombinedGpuRw, true));
-        assert!(!rebar_stream_class_ok(ConsoleMemClass::Unknown, true));
+        // 2. Class eligibility matrix:
+        //    - Off: no class qualifies.
+        //    - ReadOnly (default mode 1): GpuReadOnly ONLY (mutable WriteCombinedGpuRw keeps staging snapshot).
+        //    - All (opt-in mode 2): GpuReadOnly always ok; WriteCombinedGpuRw ok when lazy_readback is on;
+        //      Unknown never ok.
+        assert!(!rebar_stream_class_ok(ConsoleMemClass::GpuReadOnly, RebarStreamMode::Off, true));
+        assert!(!rebar_stream_class_ok(ConsoleMemClass::WriteCombinedGpuRw, RebarStreamMode::Off, true));
+        assert!(rebar_stream_class_ok(ConsoleMemClass::GpuReadOnly, RebarStreamMode::ReadOnly, false));
+        assert!(rebar_stream_class_ok(ConsoleMemClass::GpuReadOnly, RebarStreamMode::ReadOnly, true));
+        assert!(!rebar_stream_class_ok(ConsoleMemClass::WriteCombinedGpuRw, RebarStreamMode::ReadOnly, true));
+        assert!(!rebar_stream_class_ok(ConsoleMemClass::Unknown, RebarStreamMode::ReadOnly, true));
+        assert!(rebar_stream_class_ok(ConsoleMemClass::GpuReadOnly, RebarStreamMode::All, false));
+        assert!(rebar_stream_class_ok(ConsoleMemClass::GpuReadOnly, RebarStreamMode::All, true));
+        assert!(!rebar_stream_class_ok(ConsoleMemClass::WriteCombinedGpuRw, RebarStreamMode::All, false));
+        assert!(rebar_stream_class_ok(ConsoleMemClass::WriteCombinedGpuRw, RebarStreamMode::All, true));
+        assert!(!rebar_stream_class_ok(ConsoleMemClass::Unknown, RebarStreamMode::All, true));
 
         // 3. Direct ReBAR streaming skips RAM mirror, streams Title RAM directly, and
         //    materializes `Card::staging` cleanly on demand without crashing.

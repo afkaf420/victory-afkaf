@@ -147,6 +147,67 @@ pub fn loop_limit() -> u32 {
     })
 }
 
+/// Whether a pixel shader's helper lane reads its own value where the console reads the first
+/// lane's (`lower.rs` `first_lane`); on unless `VICTORY_HELPER_OWN=0`. Part of the translation:
+/// the shader cache keys on it.
+pub fn helper_own() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HELPER_OWN").is_none_or(|v| v != "0"))
+}
+
+/// Whether paired Wave64-on-Wave32 multi-wave (`group > 64`) compute shaders use
+/// hardware Mode A `BAR.SYNC` (`barrier(1 | 8)`) in provably group-uniform
+/// `all_group` blocks instead of Mode B atomic TGSM spin-wait loops.
+/// Default ON unless `VICTORY_ALL_GROUP_BARRIER=0`. Part of the translation fingerprint.
+pub fn all_group_barrier() -> bool {
+    #[cfg(test)]
+    if let Some(on) = lower::TEST_ALL_GROUP_BARRIER.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ALL_GROUP_BARRIER").is_none_or(|v| v != "0"))
+}
+
+/// Opt-in RDNA float lowering shortcuts (`VICTORY_RDNA_FLOAT`, default `0` / off so
+/// exact legacy-mul semantics stay preserved unless opted in for A/B testing).
+/// `VICTORY_RDNA_FLOAT=1` enables all bits (`rdna::ALL`); `0x...` or another integer
+/// selects an explicit [`rdna`] bitmask. Part of the translation fingerprint.
+pub fn rdna_float() -> u32 {
+    #[cfg(test)]
+    if let Some(bits) = lower::TEST_RDNA_FLOAT.get() {
+        return bits;
+    }
+    static BITS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *BITS.get_or_init(|| parse_rdna_float(std::env::var("VICTORY_RDNA_FLOAT").ok().as_deref()))
+}
+
+/// The bits of [`rdna_float`].
+pub mod rdna {
+    /// `v_max_f32` and the like: plain FMax/FMin without `-0 < +0` tie-breaking.
+    pub const MAX_MIN: u32 = 1;
+    /// `v_mul_legacy_f32` and the like: omit zero-wins-over-NaN/Inf guards.
+    pub const LEGACY: u32 = 2;
+    /// `v_med3_f32` of a value between ordered constants.
+    pub const MED3: u32 = 4;
+    /// `v_fract_f32`: host Frc as-is.
+    pub const FRACT: u32 = 8;
+    pub const ALL: u32 = 15;
+}
+
+fn parse_rdna_float(value: Option<&str>) -> u32 {
+    let Some(v) = value.map(str::trim).filter(|v| !v.is_empty()) else {
+        return 0;
+    };
+    if v == "1" {
+        return rdna::ALL;
+    }
+    let parsed = match v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")) {
+        Some(hex) => u32::from_str_radix(hex, 16).ok(),
+        None => v.parse().ok(),
+    };
+    parsed.map_or(0, |n| n & rdna::ALL)
+}
+
 /// Which of a translated program's group barriers wait for the whole
 /// group (`GroupMemoryBarrierWithGroupSync`); the others keep their memory
 /// fence and lose the wait. A wait that some thread of the group never
@@ -243,6 +304,9 @@ pub fn translation_fingerprint() -> Vec<u8> {
     out.extend_from_slice(&shader_opt().to_le_bytes());
     out.push(u8::from(sparse_uma()));
     out.push(u8::from(dxr_rayquery()));
+    out.push(u8::from(helper_own()));
+    out.push(u8::from(all_group_barrier()));
+    out.extend_from_slice(&rdna_float().to_le_bytes());
     out
 }
 
