@@ -2469,22 +2469,80 @@ pub(crate) fn release_guard_for_lazy(block: usize) {
     }
 }
 
+/// Expands `[at, at + len)` across every mapped physical-page alias VA reported
+/// by `crate::inplace::pages_of(block)` (excluding zero/dummy pages shared in
+/// more than [`MANY_VIEWS`] views), coalescing overlapping or adjacent spans.
+fn alias_ranges(at: usize, len: usize) -> Vec<(usize, usize)> {
+    if len == 0 {
+        return Vec::new();
+    }
+    let end = at.saturating_add(len);
+    let mut raw: Vec<(usize, usize)> = vec![(at, end)];
+    let mut block = at & !(BLOCK - 1);
+    while block < end {
+        let lo = block.max(at);
+        let hi = block.saturating_add(BLOCK).min(end);
+        let lo_off = lo - block;
+        let hi_off = hi - block;
+        let aliases = crate::inplace::pages_of(block);
+        if aliases.len() >= 2 && aliases.len() <= MANY_VIEWS {
+            for alias_block in aliases {
+                if alias_block != block {
+                    raw.push((
+                        alias_block.saturating_add(lo_off),
+                        alias_block.saturating_add(hi_off),
+                    ));
+                }
+            }
+        }
+        match block.checked_add(BLOCK) {
+            Some(next) => block = next,
+            None => break,
+        }
+    }
+    raw.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(raw.len());
+    for (s, e) in raw {
+        if e <= s {
+            continue;
+        }
+        match merged.last_mut() {
+            Some((_, last_e)) if s <= *last_e => *last_e = (*last_e).max(e),
+            _ => merged.push((s, e)),
+        }
+    }
+    merged.into_iter().map(|(s, e)| (s, e - s)).collect()
+}
+
 /// Before our own write into title memory `[at, at + len)` through the
 /// kernel (which does not fault into our handler): opens its guarded blocks.
 /// The runtime calls it (as `kernel_will_write`) before the title's kernel
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
     crate::host::lazy_readback::prepare_cpu_overwrite(at, len);
-    wrote(at, len);
+    if len == 0 {
+        return;
+    }
+    let ranges = alias_ranges(at, len);
+    for &(r_at, r_len) in &ranges {
+        wrote(r_at, r_len);
+    }
     // The length is the title's (`fread`'s size times count, saturated).
-    if len > 0 && PROTECTED.any(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK)) {
-        open(&mut guards(), at, at.saturating_add(len));
+    let any_protected = ranges
+        .iter()
+        .any(|&(r_at, r_len)| PROTECTED.any(r_at / BLOCK, r_at.saturating_add(r_len).div_ceil(BLOCK)));
+    if any_protected {
+        let mut g = guards();
+        for &(r_at, r_len) in &ranges {
+            open(&mut g, r_at, r_at.saturating_add(r_len));
+        }
     }
-    if len > 0 {
-        bump_guard_epoch();
+    bump_guard_epoch();
+    // A placed texture there (or at any physical-page alias) changes with no
+    // descriptor written.
+    for &(r_at, r_len) in &ranges {
+        crate::descriptor::host::remapped(r_at, r_len);
     }
-    // A placed texture there changes with no descriptor written.
-    crate::descriptor::host::remapped(at, len);
 }
 
 fn parse_page_writes(val: Option<&str>) -> u8 {
@@ -2538,7 +2596,6 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
         return;
     }
     let mode = page_writes();
-    let end = at.saturating_add(len);
     if pages {
         WRITTEN[0].fetch_add(1, Relaxed);
         WRITTEN[1].fetch_add(len as u64, Relaxed);
@@ -2548,23 +2605,38 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
             return;
         }
     }
+    // Expand `[at, at + len)` across all mapped physical-page aliases
+    // (e.g. CPU twin space -> GPU graphics space) BEFORE acquiring `JOURNAL`
+    // or `GUARDS` so strict lock ordering is preserved and placed-texture
+    // notifications reach every alias VA.
+    let ranges = alias_ranges(at, len);
     // Notify active `ask_once` journal BEFORE acquiring `GUARDS` so strict
     // lock ordering (`JOURNAL` -> `GUARDS`) is preserved.
     if mode & 1 != 0 {
-        wrote(at, len);
+        for &(r_at, r_len) in &ranges {
+            wrote(r_at, r_len);
+        }
     }
     {
         let mut g = guards();
-        let guarded = g.protected.count_in(at / BLOCK, end.div_ceil(BLOCK)) as u64;
-        if pages {
-            WRITTEN[2].fetch_add(guarded, Relaxed);
+        let mut guarded_total = 0u64;
+        for &(r_at, r_len) in &ranges {
+            let r_end = r_at.saturating_add(r_len);
+            let guarded = g.protected.count_in(r_at / BLOCK, r_end.div_ceil(BLOCK)) as u64;
+            guarded_total += guarded;
+            if mode & 1 != 0 && guarded != 0 {
+                open(&mut g, r_at, r_end);
+            }
         }
-        if mode & 1 != 0 && guarded != 0 {
-            open(&mut g, at, end);
+        if pages {
+            WRITTEN[2].fetch_add(guarded_total, Relaxed);
         }
     }
-    // A placed texture there changed with no descriptor written.
-    crate::descriptor::host::page_written(at, len);
+    // A placed texture there (or at any physical-page alias) changed with no
+    // descriptor written.
+    for &(r_at, r_len) in &ranges {
+        crate::descriptor::host::page_written(r_at, r_len);
+    }
 }
 
 /// The runtime mapped a view of the physical bytes `[offset, offset + len)`
@@ -2808,24 +2880,56 @@ pub fn title_memory_remapping() -> Remapping {
     Remapping(changing)
 }
 
+thread_local! {
+    /// Nesting depth of [`title_memory_reading`] / [`title_memory_reading_now`]
+    /// on the current thread so re-entrant calls never re-acquire Windows'
+    /// non-reentrant `SRWLOCK` while a writer waits.
+    static READING_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
 /// What a read of title memory in place holds ([`title_memory_reading`]).
-pub struct Reading(#[allow(dead_code)] std::sync::RwLockReadGuard<'static, ()>);
+pub struct Reading(#[allow(dead_code)] Option<std::sync::RwLockReadGuard<'static, ()>>);
+
+impl Drop for Reading {
+    fn drop(&mut self) {
+        let depth = READING_DEPTH.get();
+        READING_DEPTH.set(depth.saturating_sub(1));
+    }
+}
 
 /// For reading title memory in place: until what it returns is dropped,
 /// the runtime changes no mapping, so memory found mapped stays mapped.
-/// Not to be taken twice by one thread, nor held across anything that
-/// maps title memory.
+/// Re-entrant on the same thread (nested calls reuse the outer lock); still
+/// must not be held across anything that maps title memory.
 pub fn title_memory_reading() -> Reading {
-    Reading(MAPPING.read().unwrap_or_else(|e| e.into_inner()))
+    let depth = READING_DEPTH.get();
+    if depth > 0 || CHANGING.get().0 {
+        READING_DEPTH.set(depth + 1);
+        return Reading(None);
+    }
+    let guard = MAPPING.read().unwrap_or_else(|e| e.into_inner());
+    READING_DEPTH.set(1);
+    Reading(Some(guard))
 }
 
 /// [`title_memory_reading`] if it can be had at once: `None` while the
 /// runtime changes a mapping (or waits to), for a caller that has another
 /// way to read and would rather not wait.
 pub fn title_memory_reading_now() -> Option<Reading> {
+    let depth = READING_DEPTH.get();
+    if depth > 0 || CHANGING.get().0 {
+        READING_DEPTH.set(depth + 1);
+        return Some(Reading(None));
+    }
     match MAPPING.try_read() {
-        Ok(guard) => Some(Reading(guard)),
-        Err(std::sync::TryLockError::Poisoned(e)) => Some(Reading(e.into_inner())),
+        Ok(guard) => {
+            READING_DEPTH.set(1);
+            Some(Reading(Some(guard)))
+        }
+        Err(std::sync::TryLockError::Poisoned(e)) => {
+            READING_DEPTH.set(1);
+            Some(Reading(Some(e.into_inner())))
+        }
         Err(std::sync::TryLockError::WouldBlock) => None,
     }
 }
@@ -2834,6 +2938,28 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
+    // If `[at, at + len)` splits a larger enclosing section view, the OS
+    // `UnmapViewOfFile2` + `MapViewOfFile3` split will reset the surviving
+    // head/tail PTEs back to `PAGE_READWRITE`. Collect those surviving wings
+    // BEFORE `views_gone` removes the enclosing view so we keep `lazy_readback`
+    // and `GUARDS` coherent on them without spuriously invalidating innocent
+    // placed textures or shadows in the unchanged head/tail.
+    let end = at.saturating_add(len);
+    let mut split_wings: Vec<(usize, usize)> = Vec::new();
+    if len > 0 {
+        for (v_base, v_len) in crate::inplace::views_between(at, end) {
+            let v_end = v_base.saturating_add(v_len);
+            if v_base < at {
+                split_wings.push((v_base, at - v_base));
+            }
+            if v_end > end {
+                split_wings.push((end, v_end - end));
+            }
+        }
+    }
+    for &(w_at, w_len) in &split_wings {
+        crate::host::lazy_readback::ensure_cpu_resident(w_at, w_len);
+    }
     // Evict stale write-watch journal entries BEFORE taking `GUARDS` (lock
     // order: `JOURNAL` -> `GUARDS`) so freed/reused VAs start clean, and reset
     // `Shadow::copied` on live shadows so remapped single-view `MEM_WRITE_WATCH`
@@ -2852,22 +2978,28 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     // And nothing stays in place over it.
     crate::inplace::title_memory_freeing(at, len);
     let mut g = guards();
-    let first = at / BLOCK;
-    let last = at.saturating_add(len).div_ceil(BLOCK);
-    g.absent.remove_range(first, last);
-    g.held.remove_range(first, last);
-    g.protected.remove_range(first, last);
-    g.clean.remove_range(first, last);
-    g.known_views.remove_range(first, last);
-    PUBLISHED.clear_range(first, last);
-    PROTECTED.clear_range(first, last);
-    let aliased: Vec<usize> = g.aliased.range(first..last).copied().collect();
-    for block in aliased {
-        g.aliased.remove(&block);
-    }
-    let opened: Vec<usize> = g.opened.range(first..last).map(|(&b, _)| b).collect();
-    for block in opened {
-        g.opened.remove(&block);
+    let clear_guard_range = |g: &mut Guards, s: usize, l: usize| {
+        let first = s / BLOCK;
+        let last = s.saturating_add(l).div_ceil(BLOCK);
+        g.absent.remove_range(first, last);
+        g.held.remove_range(first, last);
+        g.protected.remove_range(first, last);
+        g.clean.remove_range(first, last);
+        g.known_views.remove_range(first, last);
+        PUBLISHED.clear_range(first, last);
+        PROTECTED.clear_range(first, last);
+        let aliased: Vec<usize> = g.aliased.range(first..last).copied().collect();
+        for block in aliased {
+            g.aliased.remove(&block);
+        }
+        let opened: Vec<usize> = g.opened.range(first..last).map(|(&b, _)| b).collect();
+        for block in opened {
+            g.opened.remove(&block);
+        }
+    };
+    clear_guard_range(&mut g, at, len);
+    for &(w_at, w_len) in &split_wings {
+        clear_guard_range(&mut g, w_at, w_len);
     }
     if len > 0 {
         bump_guard_epoch();
@@ -3310,7 +3442,7 @@ mod tests {
     /// A pagefile section mapped twice: two views of the same physical
     /// pages, the second left for the test; the section handle, the two
     /// addresses.
-    fn two_views(bytes: usize) -> (usize, usize, usize) {
+    pub(super) fn two_views(bytes: usize) -> (usize, usize, usize) {
         use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile,
@@ -3339,7 +3471,7 @@ mod tests {
 
     /// The section of [`two_views`] is closed and its views unmapped; the
     /// guard is told they are gone first.
-    fn drop_views(section: usize, views: &[usize], bytes: usize) {
+    pub(super) fn drop_views(section: usize, views: &[usize], bytes: usize) {
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
         for &view in views {
@@ -3718,23 +3850,40 @@ mod tests {
         let (t0, _) = writes(base, base + TOTAL, true).expect("mapped views guarded");
 
         // 2. Untouched repeat calls to `writes(..., true)` MUST take the `g.clean`
-        //    fast path with ZERO `VirtualQuery` syscalls!
-        reset_mixed_virtual_queries();
-        for _ in 0..5 {
+        //    fast path with ZERO `VirtualQuery` syscalls (retry across parallel
+        //    tests that share the process-wide `MIXED_VQ` counter).
+        let mut hit_zero_vq = false;
+        for _ in 0..64 {
+            reset_mixed_virtual_queries();
             let (t, _) = writes(base, base + TOTAL, true).expect("clean fast path");
             assert!(t > t0);
+            if mixed_virtual_queries() == 0 {
+                hit_zero_vq = true;
+                break;
+            }
+            std::thread::yield_now();
         }
-        assert_eq!(
-            mixed_virtual_queries(),
-            0,
+        assert!(
+            hit_zero_vq,
             "clean guarded MEM_MAPPED views must issue 0 VirtualQueries in writes_mixed"
         );
 
         // 3. `writes_guarded_since` on clean span returns empty vec & 0 VQs.
-        let (seq0, initial_since) =
-            writes_guarded_since(base, base + TOTAL, t0).expect("guarded_since clean");
-        assert!(initial_since.is_empty());
-        assert_eq!(mixed_virtual_queries(), 0);
+        let mut seq0 = t0;
+        let mut hit_clean_since = false;
+        for _ in 0..64 {
+            reset_mixed_virtual_queries();
+            let (seq, initial_since) =
+                writes_guarded_since(base, base + TOTAL, seq0).expect("guarded_since clean");
+            assert!(initial_since.is_empty());
+            seq0 = seq;
+            if mixed_virtual_queries() == 0 {
+                hit_clean_since = true;
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(hit_clean_since, "writes_guarded_since on clean span must issue 0 VQs");
 
         // 4. Direct CPU write to view #5 bumps `guard_epoch()` and reports ONLY page #5.
         let ep_before_cpu = guard_epoch();
@@ -3760,14 +3909,28 @@ mod tests {
             writes_guarded_since(base, base + TOTAL, seq2).expect("after kernel_will_write");
         assert_eq!(after_kw, vec![((base + BLOCK) / PAGE, seq3)]);
 
-        // 7. Subsequent untouched check returns empty with 0 VQs and steady epoch!
-        let ep_steady = guard_epoch();
-        let (seq4, after_clean) =
-            writes_guarded_since(base, base + TOTAL, seq3).expect("back to clean");
-        assert!(after_clean.is_empty());
-        assert_eq!(seq4, seq3);
-        assert_eq!(guard_epoch(), ep_steady);
-        assert_eq!(mixed_virtual_queries(), 0);
+        // 7. Subsequent untouched check returns empty with 0 VQs and steady epoch
+        //    (retry across parallel tests sharing process-wide `JOURNAL.asked` /
+        //    `GUARD_EPOCH` / `MIXED_VQ`).
+        let mut cur_seq = seq3;
+        let mut hit_steady = false;
+        for _ in 0..128 {
+            reset_mixed_virtual_queries();
+            let ep_steady = guard_epoch();
+            let (seq4, after_clean) =
+                writes_guarded_since(base, base + TOTAL, cur_seq).expect("back to clean");
+            assert!(after_clean.is_empty());
+            if seq4 == cur_seq && guard_epoch() == ep_steady && mixed_virtual_queries() == 0 {
+                hit_steady = true;
+                break;
+            }
+            cur_seq = seq4;
+            std::thread::yield_now();
+        }
+        assert!(
+            hit_steady,
+            "untouched writes_guarded_since must reach steady seq/GUARD_EPOCH with 0 VQs"
+        );
     }
 
     #[test]
@@ -4459,5 +4622,80 @@ mod mapping_tests {
         title_memory_remapped(p, 2 * PAGE);
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// `title_memory_written` on one virtual alias of a physical page must
+    /// expand across every mapped physical-page alias VA (`inplace::pages_of`),
+    /// opening guards and notifying `descriptor::host::page_written` at the
+    /// GPU alias too.
+    #[test]
+    fn title_memory_written_expands_physical_page_aliases() {
+        let (section, cpu_alias, gpu_alias) = super::tests::two_views(2 * BLOCK);
+        let write_at = cpu_alias + 0x1000;
+        let write_len = BLOCK + 0x2000;
+        let expected_gpu = gpu_alias + 0x1000;
+
+        let expanded = alias_ranges(write_at, write_len);
+        assert!(
+            expanded.contains(&(write_at, write_len))
+                && expanded.contains(&(expected_gpu, write_len)),
+            "expected alias_ranges to cover both CPU and GPU aliases, got {expanded:?}"
+        );
+
+        // Guard ONLY the GPU alias; register a placed texture span over it.
+        assert!(guard(gpu_alias, gpu_alias + 2 * BLOCK).is_some());
+        assert!(guarded(gpu_alias, gpu_alias + 2 * BLOCK));
+        let _span = crate::descriptor::host::test_register_placed_span(
+            gpu_alias as u64,
+            (gpu_alias + 2 * BLOCK) as u64,
+        );
+        let before_pw = crate::descriptor::host::PAGE_WRITES[0].load(Ordering::Relaxed);
+
+        // Notify write at the CPU alias (as DirectStorage plain-address reads /
+        // `xg::copy_into` do): must open GPU alias guards AND record `page_written`
+        // for the GPU alias placed texture!
+        title_memory_written(write_at, write_len, false);
+
+        assert!(
+            !guarded(gpu_alias, gpu_alias + 2 * BLOCK),
+            "guarded GPU alias must be opened when CPU alias receives title_memory_written"
+        );
+        assert!(
+            crate::descriptor::host::PAGE_WRITES[0].load(Ordering::Relaxed) > before_pw,
+            "descriptor::host::page_written must be notified on the GPU alias span"
+        );
+
+        super::tests::drop_views(section, &[cpu_alias, gpu_alias], 2 * BLOCK);
+    }
+
+    /// Nested `title_memory_reading()` / `title_memory_reading_now()` on the
+    /// same thread must remain deadlock-free even while another thread blocks
+    /// waiting for `title_memory_remapping()`.
+    #[test]
+    fn title_memory_reading_is_reentrant_with_waiting_writer() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        let outer = title_memory_reading();
+        let writer_entered = Arc::new(AtomicBool::new(false));
+        let writer_done = Arc::new(AtomicBool::new(false));
+        let (entered_c, done_c) = (writer_entered.clone(), writer_done.clone());
+        let writer = std::thread::spawn(move || {
+            entered_c.store(true, Ordering::Release);
+            let _w = title_memory_remapping();
+            done_c.store(true, Ordering::Release);
+        });
+        while !writer_entered.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        // Re-entrant acquisition must NOT block behind the queued writer!
+        let inner = title_memory_reading();
+        let inner_now = title_memory_reading_now().expect("re-entrant try_read must succeed");
+        assert!(!writer_done.load(Ordering::Acquire));
+        drop(inner_now);
+        drop(inner);
+        drop(outer);
+        writer.join().expect("writer must complete once outer reader drops");
+        assert!(writer_done.load(Ordering::Acquire));
     }
 }

@@ -1205,12 +1205,22 @@ fn per_lane_self_loop_and_latch_are_not_all_lanes_and_emit_no_loop_sync() {
 }
 
 /// A 64-thread Wave64 CS with an LDS write and LDS read inside the same
-/// per-lane branch region stays un-widened (`WaveSize=64`) by default when
-/// `VICTORY_WAVE_WIDE` is unset, and widens cleanly to `WaveSize=32` when
-/// explicitly opted in via `VICTORY_WAVE_WIDE=1`, passing `dxil.dll`
-/// validation and executing accurately on a Wave32 RTX 3090.
+/// per-lane branch region cannot lower below `WaveSize=64` via any non-widened
+/// retry (including `local waves`). Under default last-resort widening
+/// (`VICTORY_WAVE_WIDE` unset), `emit()` rescues it cleanly to `WaveSize=32`,
+/// passing `dxil.dll` validation and executing bit-exactly on a Wave32 RTX 3090,
+/// while explicit `VICTORY_WAVE_WIDE=0` still opts out (`WaveSize=64`).
 #[test]
 fn last_resort_widen_rescues_wave64_lds_conflict_on_wave32() {
+    use super::WaveWideMode;
+
+    assert_eq!(super::parse_wave_wide_mode(None), WaveWideMode::LastResort);
+    assert_eq!(super::parse_wave_wide_mode(Some("")), WaveWideMode::LastResort);
+    assert_eq!(super::parse_wave_wide_mode(Some("0")), WaveWideMode::Off);
+    assert_eq!(super::parse_wave_wide_mode(Some(" 0 ")), WaveWideMode::Off);
+    assert_eq!(super::parse_wave_wide_mode(Some("1")), WaveWideMode::Eager);
+    assert_eq!(super::parse_wave_wide_mode(Some(" 1 ")), WaveWideMode::Eager);
+
     let words = [
         // Real `if (v0 < s0) { ds_write; s_barrier; ds_read; store } else { v5 = 99 }`
         // so `without_skips` cannot flatten the branch and `lds_meetings` sees
@@ -1248,24 +1258,32 @@ fn last_resort_widen_rescues_wave64_lds_conflict_on_wave32() {
     let empty_dxbc = super::container::build(&[]);
     let container = crate::dxbc::Container::parse(&empty_dxbc).expect("empty container");
 
-    // 1. Default (`VICTORY_WAVE_WIDE` off): does NOT widen (remains WaveSize=64).
+    // 1. Default (`WaveWideMode::LastResort`): rescues to WaveSize=32 after local waves stay 64.
     let was_wave = lower::TEST_HOST_WAVE.replace(Some(32));
-    let was_wide = super::TEST_WAVE_WIDE.replace(Some(false));
-    let default_shader = super::emit(&container, &native, &p, &st, &io, &res)
-        .expect("default emit succeeds with WaveSize=64");
-    // 2. Opt-in (`VICTORY_WAVE_WIDE=1`): widens cleanly to WaveSize=32.
-    super::TEST_WAVE_WIDE.set(Some(true));
-    let shader = super::emit(&container, &native, &p, &st, &io, &res)
-        .expect("opt-in VICTORY_WAVE_WIDE=1 should rescue Wave64 LDS conflict on Wave32");
+    let was_wide = super::TEST_WAVE_WIDE.replace(Some(WaveWideMode::LastResort));
+    let rescued = super::emit(&container, &native, &p, &st, &io, &res)
+        .expect("default last-resort widen should rescue Wave64 LDS conflict on Wave32");
+    // 2. Explicit opt-out (`VICTORY_WAVE_WIDE=0`): stays un-widened (`WaveSize=64`).
+    super::TEST_WAVE_WIDE.set(Some(WaveWideMode::Off));
+    let opted_out = super::emit(&container, &native, &p, &st, &io, &res)
+        .expect("opt-out emit succeeds with WaveSize=64");
+    // 3. Explicit eager (`VICTORY_WAVE_WIDE=1`): also rescues to the same WaveSize=32 DXIL.
+    super::TEST_WAVE_WIDE.set(Some(WaveWideMode::Eager));
+    let eager = super::emit(&container, &native, &p, &st, &io, &res)
+        .expect("eager VICTORY_WAVE_WIDE=1 should rescue Wave64 LDS conflict on Wave32");
     super::TEST_WAVE_WIDE.set(was_wide);
     lower::TEST_HOST_WAVE.set(was_wave);
 
     assert_ne!(
-        default_shader.dxil, shader.dxil,
-        "opt-in VICTORY_WAVE_WIDE=1 must produce distinct widened Wave32 DXIL"
+        opted_out.dxil, rescued.dxil,
+        "default last-resort widen must produce distinct Wave32 DXIL from VICTORY_WAVE_WIDE=0"
+    );
+    assert_eq!(
+        rescued.dxil, eager.dxil,
+        "last-resort widen and eager widen should emit identical rescued DXIL when local waves cannot lower"
     );
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
-        let mut copy = shader.dxil.clone();
+        let mut copy = rescued.dxil.clone();
         v.validate(&mut copy)
             .expect("rescued Wave64 CS DXIL validation failed");
     }
@@ -1274,12 +1292,12 @@ fn last_resort_widen_rescues_wave64_lds_conflict_on_wave32() {
         .unwrap_or_else(|e| e.into_inner());
     let Ok(host) = Host::new(false) else { return };
     assert!(
-        host.compute_pipeline(&default_shader).is_err(),
-        "default (non-widened) WaveSize=64 shader must remain un-widened on Wave32 host"
+        host.compute_pipeline(&opted_out).is_err(),
+        "explicit VICTORY_WAVE_WIDE=0 WaveSize=64 shader must remain un-widened on Wave32 host"
     );
     let (root, pso) = host
-        .compute_pipeline(&shader)
-        .expect("Wave32 host must accept opt-in widened shader (WaveSize <= 32)");
+        .compute_pipeline(&rescued)
+        .expect("Wave32 host must accept default last-resort rescued shader (WaveSize <= 32)");
     let ud = [64u32, 100, 0, 0];
     let out = host
         .dispatch(
@@ -1296,6 +1314,76 @@ fn last_resort_widen_rescues_wave64_lds_conflict_on_wave32() {
     for t in 0..64u32 {
         assert_eq!(out[0][t as usize], 100 + (t ^ 32), "lane {t}");
     }
+}
+
+/// A Wave64 CS that barrier-free `local waves` already lowers to `WaveSize <= 32`
+/// must NOT trigger widening under default `WaveWideMode::LastResort` (unlike
+/// eager `VICTORY_WAVE_WIDE=1`, which widens before approximate `local waves`).
+#[test]
+fn last_resort_widen_preserves_barrier_free_local_waves_path() {
+    use super::WaveWideMode;
+
+    // `if (v0 < s0) { s7 = wave_or(1 << (v0 >> 1)); store s7 } else { v5 = 99 }`
+    // The `else` arm prevents `without_skips` from flattening the branch; no LDS
+    // conflict is present, so barrier-free `local waves` lowers it to Wave32
+    // without widening, while eager `VICTORY_WAVE_WIDE=1` widens the branch first.
+    let mut words = vec![
+        0x7E0A_0281, // v_mov_b32 v5, 1
+        0x2C0C_0081, // v_lshrrev_b32 v6, 1, v0
+        0x340E_0B06, // v_lshlrev_b32 v7, v6, v5
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0000 | (super::wave::WAVE_OR_V7_TO_S7.len() as u32 + 4), // s_cbranch_execz to else block
+    ];
+    words.extend_from_slice(&super::wave::WAVE_OR_V7_TO_S7);
+    words.extend_from_slice(&[
+        0x7E00_0207, // v_mov_b32 v0, s7
+        (0x38 << 26) | (0x1C << 18),
+        (0x80 << 24) | (2 << 16), // buffer_store_dword v0, off, s[8:11], 0
+        0xBF82_0002, // s_branch +2 dwords (skip else block)
+        0x7E0A_02FF,
+        99,          // v_mov_b32 v5, 99
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+    ]);
+    let native = native_of(&words, true, 64);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let empty_dxbc = super::container::build(&[]);
+    let container = crate::dxbc::Container::parse(&empty_dxbc).expect("empty container");
+
+    let was_wave = lower::TEST_HOST_WAVE.replace(Some(32));
+    let was_wide = super::TEST_WAVE_WIDE.replace(Some(WaveWideMode::LastResort));
+    let last_resort = super::emit(&container, &native, &p, &st, &io, &res)
+        .expect("default LastResort should lower via barrier-free local waves");
+    super::TEST_WAVE_WIDE.set(Some(WaveWideMode::Off));
+    let off = super::emit(&container, &native, &p, &st, &io, &res)
+        .expect("Off should lower via barrier-free local waves");
+    super::TEST_WAVE_WIDE.set(Some(WaveWideMode::Eager));
+    let eager = super::emit(&container, &native, &p, &st, &io, &res)
+        .expect("Eager should lower via wave-wide branch widening");
+    super::TEST_WAVE_WIDE.set(was_wide);
+    lower::TEST_HOST_WAVE.set(was_wave);
+
+    assert_eq!(
+        last_resort.dxil, off.dxil,
+        "working local-waves shader must stay on barrier-free local waves under default LastResort"
+    );
+    assert_ne!(
+        last_resort.dxil, eager.dxil,
+        "eager VICTORY_WAVE_WIDE=1 should take the widened path before approximate local waves"
+    );
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = last_resort.dxil.clone();
+        v.validate(&mut copy).expect("local-waves DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else { return };
+    host.compute_pipeline(&last_resort)
+        .expect("Wave32 host must accept barrier-free local-waves shader");
 }
 
 /// Phase 8C-2 Killer #1 live RTX 3090 test (`thr=(8, 16, 1)` = 128 threads,

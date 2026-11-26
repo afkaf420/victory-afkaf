@@ -371,6 +371,56 @@ fn result(r: Result<(), Error>) -> HRESULT {
     }
 }
 
+/// Exact byte span `(rel_offset, len)` inside a plane's tiled buffer touched by
+/// writing `(mip, slice)`. Keeps partially-mapped textures safe by never
+/// reaching past the targeted mip into unmapped larger mips.
+fn mip_byte_span(layout: &Layout, mip: u32, slice: u32, plane_len: usize) -> (usize, usize) {
+    if plane_len == 0 {
+        return (0, 0);
+    }
+    if layout.desc.dimension == Dimension::Tex3d || layout.thick {
+        return (0, plane_len);
+    }
+    let Some(m) = layout.mips.get(mip as usize) else {
+        return (0, plane_len);
+    };
+    let slice_base = (u64::from(slice).saturating_mul(layout.slice_size)) as usize;
+    if m.tail.is_some() {
+        let rel = slice_base.min(plane_len);
+        let len = (layout.alignment as usize).min(plane_len.saturating_sub(rel));
+        return (rel, len);
+    }
+    let rel = slice_base.saturating_add(m.offset as usize).min(plane_len);
+    let mip_bytes = (u64::from(m.pitch)
+        .saturating_mul(u64::from(m.rows))
+        .saturating_mul(u64::from(layout.desc.element_bytes))
+        .saturating_mul(u64::from(layout.desc.samples))) as usize;
+    let len = mip_bytes.max(1).min(plane_len.saturating_sub(rel));
+    (rel, len)
+}
+
+#[cfg(test)]
+static COPY_INTO_NOTIFY_LOG: std::sync::Mutex<Option<Vec<(&'static str, usize, usize)>>> =
+    std::sync::Mutex::new(None);
+
+#[inline]
+fn notify_copy_into_will_write(addr: usize, len: usize) {
+    #[cfg(test)]
+    if let Some(log) = COPY_INTO_NOTIFY_LOG.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        log.push(("will_write", addr, len));
+    }
+    victory_gpu::kernel_will_write(addr, len);
+}
+
+#[inline]
+fn notify_copy_into_written(addr: usize, len: usize) {
+    #[cfg(test)]
+    if let Some(log) = COPY_INTO_NOTIFY_LOG.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        log.push(("written", addr, len));
+    }
+    victory_gpu::title_memory_written(addr, len, false);
+}
+
 /// `(tiled base, plane, subresource, linear, row pitch, depth pitch)`.
 extern "system" fn copy_into(
     this: This,
@@ -389,17 +439,27 @@ extern "system" fn copy_into(
         return E_INVALIDARG;
     }
     let offset = c.texture.planes[plane as usize].offset as usize;
+    let plane_len = a.tiled - offset;
+    let (rel, mip_bytes) = mip_byte_span(a.layout, a.mip, a.slice, plane_len);
+    let write_addr = (tiled as usize).wrapping_add(offset).wrapping_add(rel);
+    if mip_bytes > 0 {
+        notify_copy_into_will_write(write_addr, mip_bytes);
+    }
     // SAFETY: the title's memory holds the whole texture and its rows.
     let (tiled, linear) = unsafe {
         (
-            std::slice::from_raw_parts_mut(tiled.add(offset), a.tiled - offset),
+            std::slice::from_raw_parts_mut(tiled.add(offset), plane_len),
             std::slice::from_raw_parts(linear, a.linear),
         )
     };
     let r = a
         .layout
         .tile(tiled, a.mip, a.slice, linear, row as usize, depth as usize);
-    if r.is_err() {
+    if r.is_ok() {
+        if mip_bytes > 0 {
+            notify_copy_into_written(write_addr, mip_bytes);
+        }
+    } else {
         tracing::warn!(?r, desc = ?c.desc, subresource, "copy into a texture failed");
     }
     result(r)
@@ -776,5 +836,49 @@ mod tests {
         let bad = desc(256, 256, 1, 28, 0x103);
         assert_eq!(XGCreateTextureComputer(&bad, &mut c), E_INVALIDARG);
         assert!(module().exports.len() == 2);
+    }
+
+    #[test]
+    fn copy_into_notifies_gpu_before_and_after_tiling() {
+        // 256x256 BC7 full chain, 64 KiB display mode: tail at [0..65536), mip 0 at [65536..131072).
+        let c = create(&desc(256, 256, 0, 98, 0x10a));
+        // SAFETY: plain data filled by `layout`.
+        let mut l: Box<LayoutOut> = Box::new(unsafe { std::mem::zeroed() });
+        let get: extern "system" fn(This, *mut LayoutOut) -> HRESULT = slot(c, 2);
+        assert_eq!(get(c, &mut *l), S_OK);
+        type Into = extern "system" fn(This, *mut u8, u32, u32, *const u8, u32, u32) -> HRESULT;
+        let into: Into = slot(c, 8);
+
+        let mut tiled = vec![0u8; l.size as usize];
+        let base = tiled.as_ptr() as usize;
+        *COPY_INTO_NOTIFY_LOG.lock().unwrap() = Some(Vec::new());
+
+        // Mip 1 (in tail tile): must notify only the 64 KiB tail tile [base, base + 65536).
+        let m1 = &l.plane[0].mips[1];
+        let row1 = m1.elements[0] * 16;
+        let rows1 = vec![0x5Au8; (row1 * m1.elements[1]) as usize];
+        assert_eq!(into(c, tiled.as_mut_ptr(), 0, 1, rows1.as_ptr(), row1, 0), S_OK);
+
+        // Mip 0 (standard mip): must notify [base + 65536, base + 131072).
+        let m0 = &l.plane[0].mips[0];
+        let row0 = m0.elements[0] * 16;
+        let rows0 = vec![0xA5u8; (row0 * m0.elements[1]) as usize];
+        assert_eq!(into(c, tiled.as_mut_ptr(), 0, 0, rows0.as_ptr(), row0, 0), S_OK);
+
+        // Failing copy (row pitch too small): notifies will_write, must NOT notify written.
+        assert_eq!(into(c, tiled.as_mut_ptr(), 0, 0, rows0.as_ptr(), 1, 0), E_INVALIDARG);
+
+        let events = COPY_INTO_NOTIFY_LOG.lock().unwrap().take().unwrap();
+        assert_eq!(
+            events,
+            vec![
+                ("will_write", base, 65536),
+                ("written", base, 65536),
+                ("will_write", base + 65536, 65536),
+                ("written", base + 65536, 65536),
+                ("will_write", base + 65536, 65536),
+            ]
+        );
+        assert_eq!(release(c), 0);
     }
 }

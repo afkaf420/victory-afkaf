@@ -7,10 +7,13 @@
 
 pub(crate) mod awake;
 mod card_steps;
+mod depth_twin;
 pub(crate) mod lazy_readback;
 pub(crate) mod native_vram;
 mod place;
 mod torn;
+
+use depth_twin::{record_plane_pass, record_reverse_plane_pass, record_twin_copy};
 
 /// Whether the host device supports D3D12 Enhanced Barriers (`OPTIONS12`).
 pub(crate) fn enhanced_barriers(host: &Host) -> bool {
@@ -618,9 +621,18 @@ pub(crate) fn available_physical_ram() -> Option<u64> {
 }
 
 /// Effective idle timeout (in milliseconds) for VRAM-backed host textures,
-/// scaled down under VRAM pressure. Never returns less than 1,000 ms so
-/// handles not yet recorded into a list or slot remain protected.
+/// scaled down under VRAM pressure. On high-VRAM GPUs (`>= 12 GiB` budget)
+/// with `< 70%` VRAM used, matches `ram_idle_ms` (`300_000 ms`, 5 minutes)
+/// unless `VICTORY_KEEP_FREED=0` disables extended retention. Never returns
+/// less than 1,000 ms so handles not yet recorded into a list or slot remain
+/// protected.
 pub(crate) fn vram_idle_ms(video_memory: Option<[u64; 4]>) -> u64 {
+    vram_idle_for(video_memory, keep_freed())
+}
+
+fn vram_idle_for(video_memory: Option<[u64; 4]>, keep: bool) -> u64 {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    const KEPT_MS: u64 = 300_000;
     const NORMAL_MS: u64 = 5_000;
     const MODERATE_MS: u64 = 2_500;
     const HIGH_MS: u64 = 1_000;
@@ -635,6 +647,8 @@ pub(crate) fn vram_idle_ms(video_memory: Option<[u64; 4]>) -> u64 {
         HIGH_MS
     } else if used_pct >= 75 {
         MODERATE_MS
+    } else if keep && budget >= 12 * GIB && used_pct < 70 {
+        KEPT_MS
     } else {
         NORMAL_MS
     }
@@ -2017,6 +2031,10 @@ pub(crate) struct HostList {
     /// What the list does with depth textures that have a colour twin, by
     /// twin ([`TwinUse`]).
     twins: Mutex<std::collections::HashMap<usize, TwinUse>>,
+    /// Fast-path indicator: `true` whenever any entry in `twins` has a
+    /// deferred depth-plane pass (`late` or `late_to_plane`) waiting for
+    /// [`HostList::flush_late_depth_planes`].
+    late_planes: std::sync::atomic::AtomicBool,
     /// The list that runs those transitions just before this one, made
     /// when the list first has such transitions ([`lazy_prelude`]).
     prelude: OnceLock<Option<Prelude>>,
@@ -2104,99 +2122,15 @@ struct TwinUse {
     /// The draw or dispatch being prepared writes the twin.
     writing: bool,
     /// The depth plane's twin holds what the plane lacks although the list
-    /// copied the twins since: the plane's pass waits for the list's close.
+    /// copied the stencil twin since: flushed inline by
+    /// [`HostList::flush_late_depth_planes`] (or at `twins_to_depth` if not).
     late: bool,
-}
-
-/// The pass that draws the twin of a depth plane into the plane: one
-/// triangle over each mip of each slice, its pixel shader writing the
-/// twin's texel as the depth, with the depth test "always" and no stencil
-/// (the stencil plane is copied through a buffer and not touched here).
-///
-/// A 16-bit twin holds whole steps of 1/65535, and the depth written is
-/// the step times the float nearest 1/65535 (0x37800080). That is how
-/// The title's tiled lighting computes the depth of the
-/// rectangles it then draws with the test "equal", one class of materials
-/// a draw (all six of its vertex shaders multiply the class number by that
-/// constant), so the pass and the draw give the host the same float, and
-/// the host turns the same float into the same 24 bits. The step divided
-/// by 65535 is another float for 512 of the 65,536 steps (none under 257),
-/// and lands in another 24-bit step for 127 of them (none under 385).
-const PLANE_CORNERS: &str = r#"
-float4 corner(uint i : SV_VertexID) : SV_Position {
-    return float4(float(i & 1) * 4.0 - 1.0, float(i >> 1) * 4.0 - 1.0, 0.0, 1.0);
-}
-"#;
-const PLANE_STEPS: &str = r#"
-#define RS "DescriptorTable(SRV(t0), visibility = SHADER_VISIBILITY_PIXEL)"
-Texture2DArray<uint> twin : register(t0);
-[RootSignature(RS)]
-float plane(float4 p : SV_Position) : SV_Depth {
-    return float(twin.Load(int4(int2(p.xy), 0, 0))) * asfloat(0x37800080);
-}
-"#;
-const PLANE_FLOATS: &str = r#"
-#define RS "DescriptorTable(SRV(t0), visibility = SHADER_VISIBILITY_PIXEL)"
-Texture2DArray<float> twin : register(t0);
-[RootSignature(RS)]
-float plane(float4 p : SV_Position) : SV_Depth {
-    return twin.Load(int4(int2(p.xy), 0, 0));
-}
-"#;
-
-/// Views of twins the pass reads, in a heap of ours used as a ring.
-/// shortcut: a view must last until its list has run; with one or two
-/// passes a frame the ring is far from coming round.
-const PLANE_VIEWS: u32 = 256;
-
-/// What the pass draws with: the heap of its views of twins, and per kind
-/// of twin (16-bit steps or floats) and depth format the root signature
-/// and pipeline, made when first needed (`None`: the host refused).
-struct PlanePass {
-    views: ID3D12DescriptorHeap,
-    cpu: usize,
-    gpu: u64,
-    step: u32,
-    next: AtomicU32,
-    made: Mutex<Vec<(bool, i32, Option<PlanePipeline>)>>,
-}
-
-/// The pass's root signature and pipeline for one kind of twin and one
-/// depth format.
-type PlanePipeline = (ID3D12RootSignature, ID3D12PipelineState);
-
-// SAFETY: D3D12 objects are free-threaded.
-unsafe impl Send for PlanePass {}
-// SAFETY: as above.
-unsafe impl Sync for PlanePass {}
-
-fn plane_pass() -> Option<&'static PlanePass> {
-    static PASS: OnceLock<Option<PlanePass>> = OnceLock::new();
-    PASS.get_or_init(|| {
-        let host = host()?;
-        let kind = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        // SAFETY: plain heap creation and queries.
-        unsafe {
-            let views: ID3D12DescriptorHeap = host
-                .device
-                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                    Type: kind,
-                    NumDescriptors: PLANE_VIEWS,
-                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
-                    NodeMask: 0,
-                })
-                .ok()?;
-            Some(PlanePass {
-                cpu: views.GetCPUDescriptorHandleForHeapStart().ptr,
-                gpu: views.GetGPUDescriptorHandleForHeapStart().ptr,
-                step: host.device.GetDescriptorHandleIncrementSize(kind),
-                views,
-                next: AtomicU32::new(0),
-                made: Mutex::default(),
-            })
-        }
-    })
-    .as_ref()
+    /// The depth texture was written since shaders last wrote the depth
+    /// plane's twin: the reverse compute pass (`depth SRV -> twin.plane UAV`)
+    /// waits for [`HostList::flush_late_depth_planes`] so inline `twin_use`
+    /// inside draw/dispatch binding never clobbers the active descriptor heap
+    /// or pipeline state mid-bind.
+    late_to_plane: bool,
 }
 
 /// Compiles function `entry` of `source` for `target` with the system's
@@ -2245,268 +2179,6 @@ pub(crate) fn compile(
         std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize())
     };
     Ok(bytes.to_vec())
-}
-
-impl PlanePass {
-    /// The root signature and pipeline for a twin of 16-bit steps (`steps`)
-    /// or of floats and the depth format `format`.
-    fn pipeline(&self, steps: bool, format: DXGI_FORMAT) -> Option<PlanePipeline> {
-        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((_, _, pipeline)) = made.iter().find(|m| (m.0, m.1) == (steps, format.0)) {
-            return pipeline.clone();
-        }
-        let pipeline = match Self::make(steps, format) {
-            Ok(pipeline) => Some(pipeline),
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    steps,
-                    format = format.0,
-                    "no pipeline to draw a depth plane from its twin: such planes stay as they are"
-                );
-                None
-            }
-        };
-        made.push((steps, format.0, pipeline.clone()));
-        pipeline
-    }
-
-    fn make(steps: bool, format: DXGI_FORMAT) -> windows::core::Result<PlanePipeline> {
-        use windows::core::s;
-        let device = &host().ok_or_else(windows::core::Error::empty)?.device;
-        let vs = compile(PLANE_CORNERS, s!("corner"), s!("vs_5_1"))?;
-        let source = if steps { PLANE_STEPS } else { PLANE_FLOATS };
-        let ps = compile(source, s!("plane"), s!("ps_5_1"))?;
-        let code = |bytes: &[u8]| D3D12_SHADER_BYTECODE {
-            pShaderBytecode: bytes.as_ptr().cast(),
-            BytecodeLength: bytes.len(),
-        };
-        // SAFETY: the root signature is inside the pixel shader; the
-        // description points at live data and never releases its pointer.
-        unsafe {
-            let root: ID3D12RootSignature = device.CreateRootSignature(0, &ps[..])?;
-            let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
-                pRootSignature: std::mem::transmute_copy(&root),
-                VS: code(&vs[..]),
-                PS: code(&ps[..]),
-                SampleMask: u32::MAX,
-                RasterizerState: D3D12_RASTERIZER_DESC {
-                    FillMode: D3D12_FILL_MODE_SOLID,
-                    CullMode: D3D12_CULL_MODE_NONE,
-                    DepthClipEnable: true.into(),
-                    ..Default::default()
-                },
-                // Every texel is written; stencil stays off.
-                DepthStencilState: D3D12_DEPTH_STENCIL_DESC {
-                    DepthEnable: true.into(),
-                    DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ALL,
-                    DepthFunc: D3D12_COMPARISON_FUNC_ALWAYS,
-                    ..Default::default()
-                },
-                PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
-                DSVFormat: format,
-                SampleDesc: DXGI_SAMPLE_DESC {
-                    Count: 1,
-                    Quality: 0,
-                },
-                ..Default::default()
-            };
-            let pipeline: ID3D12PipelineState = device.CreateGraphicsPipelineState(&desc)?;
-            Ok((root, pipeline))
-        }
-    }
-}
-
-/// Records into `list` the pass that draws `plane`, the twin of the depth
-/// plane of `depth`, into that plane: `depth` in the depth-write state,
-/// `plane` readable by pixel shaders. The pass sets the list's descriptor
-/// heap, graphics root signature, pipeline, depth target, viewport,
-/// scissor and topology and puts none of them back: it is for a list that
-/// records nothing of the title's after it.
-fn record_plane_pass(
-    list: &ID3D12GraphicsCommandList,
-    depth: &ID3D12Resource,
-    plane: &ID3D12Resource,
-) {
-    let (Some(host), Some(pass)) = (host(), plane_pass()) else {
-        return;
-    };
-    // SAFETY: live resources.
-    let (of, twin) = unsafe { (depth.GetDesc(), plane.GetDesc()) };
-    // An R16 typeless twin (53) holds steps, read as R16_UINT (57); an R32
-    // typeless one floats, read as R32_FLOAT (41). The depth view names
-    // the depth-stencil format of the texture's family (44: 45, 19: 20).
-    let steps = twin.Format.0 == 53;
-    let format = DXGI_FORMAT(match of.Format.0 {
-        44 => 45,
-        19 => 20,
-        typed => typed,
-    });
-    let Some((root, pipeline)) = pass.pipeline(steps, format) else {
-        return;
-    };
-    for slice in 0..u32::from(of.DepthOrArraySize) {
-        for mip in 0..u32::from(of.MipLevels) {
-            let slot = pass.next.fetch_add(1, Ordering::Relaxed) % PLANE_VIEWS;
-            let view = D3D12_SHADER_RESOURCE_VIEW_DESC {
-                Format: DXGI_FORMAT(if steps { 57 } else { 41 }),
-                ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
-                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-                    Texture2DArray: D3D12_TEX2D_ARRAY_SRV {
-                        MostDetailedMip: mip,
-                        MipLevels: 1,
-                        FirstArraySlice: slice,
-                        ArraySize: 1,
-                        ..Default::default()
-                    },
-                },
-            };
-            let target = D3D12_DEPTH_STENCIL_VIEW_DESC {
-                Format: format,
-                ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2DARRAY,
-                Anonymous: D3D12_DEPTH_STENCIL_VIEW_DESC_0 {
-                    Texture2DArray: D3D12_TEX2D_ARRAY_DSV {
-                        MipSlice: mip,
-                        FirstArraySlice: slice,
-                        ArraySize: 1,
-                    },
-                },
-                ..Default::default()
-            };
-            let target = host.dsv(depth, Some(&target));
-            let (width, height) = ((of.Width >> mip).max(1) as u32, (of.Height >> mip).max(1));
-            let cpu = D3D12_CPU_DESCRIPTOR_HANDLE {
-                ptr: pass.cpu + (slot * pass.step) as usize,
-            };
-            let gpu = D3D12_GPU_DESCRIPTOR_HANDLE {
-                ptr: pass.gpu + u64::from(slot * pass.step),
-            };
-            // SAFETY: an open list; a slot of our heap; live resources and
-            // objects (the pass's own live as long as the process).
-            unsafe {
-                host.device
-                    .CreateShaderResourceView(plane, Some(&view), cpu);
-                list.SetDescriptorHeaps(&[Some(pass.views.clone())]);
-                list.SetGraphicsRootSignature(&root);
-                list.SetPipelineState(&pipeline);
-                list.SetGraphicsRootDescriptorTable(0, gpu);
-                list.OMSetRenderTargets(0, None, false, Some(&target));
-                list.RSSetViewports(&[D3D12_VIEWPORT {
-                    TopLeftX: 0.0,
-                    TopLeftY: 0.0,
-                    Width: width as f32,
-                    Height: height as f32,
-                    MinDepth: 0.0,
-                    MaxDepth: 1.0,
-                }]);
-                list.RSSetScissorRects(&[RECT {
-                    left: 0,
-                    top: 0,
-                    right: width as i32,
-                    bottom: height as i32,
-                }]);
-                list.IASetPrimitiveTopology(
-                    windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY(4),
-                );
-                list.DrawInstanced(3, 1, 0, 0);
-            }
-            crate::resource::PLANES[0].fetch_add(1, Ordering::Relaxed);
-        }
-    }
-}
-
-/// Records into `list` the copy of a depth texture into its colour twin
-/// (`colour`) or of the twin into the depth texture, both already in their
-/// copy states: whole textures of one size in one format family, which the
-/// host copies as they are; or, for the twin of a stencil plane, that plane
-/// alone, through the twin's buffer.
-fn record_twin_copy(
-    list: &ID3D12GraphicsCommandList,
-    depth: &ID3D12Resource,
-    twin: &crate::resource::Twin,
-    colour: bool,
-) {
-    let (from, to) = if colour {
-        (depth, &twin.colour.texture)
-    } else {
-        (&twin.colour.texture, depth)
-    };
-    crate::resource::TWINS[2 + usize::from(colour)].fetch_add(1, Ordering::Relaxed);
-    // shortcut: the depth plane's twin is not given the plane (that is a
-    // pass the other way: the plane read by a shader, the twin as its
-    // target). The twin then lacks what draws and clears wrote to the
-    // plane since shaders last wrote the twin. In the title
-    // nothing writes that plane but the twin's pass (its 192 draws against
-    // it only test, run 29), so the twin lacks nothing. Counted.
-    if colour && twin.plane.is_some() {
-        crate::resource::PLANES[1].fetch_add(1, Ordering::Relaxed);
-    }
-    let Some(through) = &twin.through else {
-        // SAFETY: an open list and two live textures.
-        unsafe { list.CopyResource(to, from) };
-        return;
-    };
-    // A stencil plane and its twin: each mip and slice of the plane goes
-    // into the buffer, laid out as the host lays the plane out for copies,
-    // and from the buffer into the other texture, whole subresources both
-    // times. In the depth texture the stencil plane's subresources follow
-    // the depth plane's; the twin has the one plane.
-    let Some(host) = host() else { return };
-    // SAFETY: a live texture.
-    let of = unsafe { depth.GetDesc() };
-    let planes = u32::from(of.MipLevels) * u32::from(of.DepthOrArraySize);
-    let mut rows = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); planes as usize];
-    // SAFETY: a plain query writing `planes` footprints.
-    unsafe {
-        host.device.GetCopyableFootprints(
-            &of,
-            planes,
-            planes,
-            0,
-            Some(rows.as_mut_ptr()),
-            None,
-            None,
-            None,
-        );
-    }
-    let (first_from, first_to) = if colour { (planes, 0) } else { (0, planes) };
-    let subresource = |texture: &ID3D12Resource, index: u32| D3D12_TEXTURE_COPY_LOCATION {
-        // SAFETY: a borrowed pointer the location never releases.
-        pResource: unsafe { std::mem::transmute_copy(texture) },
-        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-            SubresourceIndex: index,
-        },
-    };
-    let placed = |row: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT| D3D12_TEXTURE_COPY_LOCATION {
-        // SAFETY: as above.
-        pResource: unsafe { std::mem::transmute_copy(through) },
-        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-            PlacedFootprint: *row,
-        },
-    };
-    let (common, source, dest) = (
-        D3D12_RESOURCE_STATE_COMMON,
-        D3D12_RESOURCE_STATE_COPY_SOURCE,
-        D3D12_RESOURCE_STATE_COPY_DEST,
-    );
-    // SAFETY: an open list and live resources; the buffer was made as big
-    // as these footprints, and rests in the common state between copies.
-    unsafe {
-        list.ResourceBarrier(&[transition(through, common, dest)]);
-        for (i, row) in rows.iter().enumerate() {
-            let index = first_from + i as u32;
-            list.CopyTextureRegion(&placed(row), 0, 0, 0, &subresource(from, index), None);
-        }
-        list.ResourceBarrier(&[transition(through, dest, source)]);
-        for (i, row) in rows.iter().enumerate() {
-            let index = first_to + i as u32;
-            list.CopyTextureRegion(&subresource(to, index), 0, 0, 0, &placed(row), None);
-        }
-        list.ResourceBarrier(&[transition(through, source, common)]);
-    }
 }
 
 /// Whether device-removed data is on (`VICTORY_D3D12_DRED`, diagnostics
@@ -4744,6 +4416,7 @@ impl Host {
                 shared_scratch: Mutex::default(),
                 states: Mutex::default(),
                 twins: Mutex::default(),
+                late_planes: std::sync::atomic::AtomicBool::new(false),
                 prelude,
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
@@ -5677,6 +5350,8 @@ impl Host {
                     (|| -> windows::core::Result<()> {
                         allocator.Reset()?;
                         list.Reset(allocator, None)?;
+                        let mut shadow_state: Vec<Option<D3D12_RESOURCE_STATES>> =
+                            vec![None; dirty.len()];
                         let staged_val = if let (Some((val, copies)), Some(ring_buf)) =
                             (staged_ring.as_ref(), ring_buffer.as_ref())
                         {
@@ -5688,6 +5363,7 @@ impl Host {
                                     ring_off,
                                     chunk,
                                 );
+                                shadow_state[entry_idx] = Some(D3D12_RESOURCE_STATE_COPY_DEST);
                                 crate::shadow::CARD_STATS[0].fetch_add(chunk, Ordering::Relaxed);
                             }
                             crate::shadow::CARD_STATS[1].fetch_add(copies.len() as u64, Ordering::Relaxed);
@@ -5696,7 +5372,7 @@ impl Host {
                             None
                         };
                         let mut hash_bound = false;
-                        for (shadow, ranges) in &dirty {
+                        for (idx, (shadow, ranges)) in dirty.iter().enumerate() {
                             let Some((before, size)) = shadow.card_before_and_size() else {
                                 continue;
                             };
@@ -5705,6 +5381,7 @@ impl Host {
                                     let merged = coalesce_dirty_ranges(ranges);
                                     for &(a, b) in &merged {
                                         list.CopyBufferRegion(&shadow.buffer, a as u64, &staging, a as u64, (b - a) as u64);
+                                        shadow_state[idx] = Some(D3D12_RESOURCE_STATE_COPY_DEST);
                                         crate::shadow::CARD_STATS[0].fetch_add((b - a) as u64, Ordering::Relaxed);
                                     }
                                     crate::shadow::CARD_STATS[1].fetch_add(merged.len() as u64, Ordering::Relaxed);
@@ -5717,12 +5394,14 @@ impl Host {
                             // `COPY_DEST -> NON_PIXEL_SHADER_RESOURCE`; when they ran
                             // on `upload_queue`, the buffer decayed to `COMMON` before
                             // `self.queue.Wait` and promotes implicitly.
-                            if !copied_async && !ranges.is_empty() {
+                            if shadow_state[idx] == Some(D3D12_RESOURCE_STATE_COPY_DEST) {
                                 list.ResourceBarrier(&[transition(
                                     &shadow.buffer,
                                     D3D12_RESOURCE_STATE_COPY_DEST,
                                     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                                 )]);
+                                shadow_state[idx] =
+                                    Some(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                             }
                             if !hash_bound {
                                 list.SetComputeRootSignature(&work.root);
@@ -5752,6 +5431,31 @@ impl Host {
                             for run in runs {
                                 card_pass(list, &run, size as u32, 0, 0);
                             }
+                        }
+                        // Return every explicitly-written/rehashed `Shadow::buffer` to
+                        // `COMMON` before closing `sync` so following title lists never
+                        // inherit `NON_PIXEL_SHADER_RESOURCE` (`0x40`) or `COPY_DEST`
+                        // (`0x400`) when binding the same buffer as a vertex buffer (`id=538`).
+                        let mut seen_ptrs: Vec<usize> = Vec::new();
+                        let restore_common: Vec<D3D12_RESOURCE_BARRIER> = shadow_state
+                            .into_iter()
+                            .enumerate()
+                            .filter_map(|(idx, st)| {
+                                let st = st?;
+                                let ptr = Arc::as_ptr(&dirty[idx].0) as usize;
+                                if seen_ptrs.contains(&ptr) {
+                                    return None;
+                                }
+                                seen_ptrs.push(ptr);
+                                Some(transition(
+                                    &dirty[idx].0.buffer,
+                                    st,
+                                    D3D12_RESOURCE_STATE_COMMON,
+                                ))
+                            })
+                            .collect();
+                        if !restore_common.is_empty() {
+                            list.ResourceBarrier(&restore_common);
                         }
                         list.Close()?;
                         wait_active_readback();
@@ -7043,22 +6747,27 @@ impl Host {
         if crate::sparse_uma::active() {
             crate::sparse_uma::sync_before_submit(self, *submitted);
         }
+        let mut check_start: Option<usize> = None;
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
+            check_start = Some(lists.len());
             lists.push(Some(check));
+        }
+        // Per-list `[prelude?, list]` + `check` execution boundaries so D3D12
+        // decays implicitly-promoted `COMMON` `Shadow::buffer`s between
+        // consecutive command lists (eliminating cross-list `0x40 <-> 0x1`
+        // `id=538` mismatches while keeping one single fence `Signal`).
+        let mut group_starts = firsts.clone();
+        if let Some(cs) = check_start {
+            group_starts.push(cs);
         }
         PREP_SUB_US[3].fetch_add(t_card.elapsed().as_micros() as u64, Ordering::Relaxed);
         let prepared = std::time::Instant::now();
         if late {
             *submitted += 1;
             let t_exec = std::time::Instant::now();
-            let cuts: Vec<usize> = parts.iter().filter_map(|&n| firsts.get(n).copied()).collect();
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
-                let mut from = 0;
-                for to in cuts.into_iter().chain([lists.len()]) {
-                    self.queue.ExecuteCommandLists(&lists[from..to]);
-                    from = to;
-                }
+                execute_command_list_groups(&self.queue, &lists, &group_starts);
                 self.queue.Signal(&self.fence, *submitted)
             };
             self.card_sent();
@@ -7099,24 +6808,39 @@ impl Host {
         }
         // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
         #[cfg(feature = "diagnostics")]
-        let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
-            firsts
-                .iter()
-                .zip(firsts.iter().skip(1).chain([&lists.len()]))
-                .map(|(&a, &b)| &lists[a..b])
-                .collect()
+        let (groups, per_list_timed): (Vec<(usize, &[Option<ID3D12CommandList>])>, bool) = if timing() {
+            (
+                firsts
+                    .iter()
+                    .zip(firsts.iter().skip(1).chain([&lists.len()]))
+                    .map(|(&a, &b)| (a, &lists[a..b]))
+                    .collect(),
+                true,
+            )
         } else {
-            vec![&lists[..]]
+            (vec![(0, &lists[..])], false)
         };
         #[cfg(not(feature = "diagnostics"))]
-        let groups = [&lists[..]];
+        let (groups, per_list_timed) = ([(0usize, &lists[..])], false);
         submitting(2, runs.len());
-        for (i, group) in groups.iter().enumerate() {
+        for (i, &(base, group)) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
-                self.queue.ExecuteCommandLists(group);
+                if per_list_timed {
+                    // Single `[prelude?, run_i]` (and possibly trailing `check`
+                    // on the last entry): split off `check` if present so it
+                    // gets its own `ExecuteCommandLists` decay boundary.
+                    let local_cuts: Vec<usize> = check_start
+                        .filter(|&cs| cs > base && cs < base + group.len())
+                        .map(|cs| cs - base)
+                        .into_iter()
+                        .collect();
+                    execute_command_list_groups(&self.queue, group, &local_cuts);
+                } else {
+                    execute_command_list_groups(&self.queue, group, &group_starts);
+                }
                 self.card_sent();
                 let waited = self
                     .queue
@@ -7628,6 +7352,7 @@ impl HostList {
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.late_planes.store(false, Ordering::Relaxed);
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -7713,6 +7438,9 @@ impl HostList {
     ) -> Option<(&'static ID3D12Resource, u32)> {
         let texture = crate::resource::host_resource(resource)?;
         let copy = crate::resource::host_copy(resource)?;
+        // Atomically mark `NONE -> LISTED` (or wait for any in-flight COPY-queue
+        // `ahead` upload) before recording direct-queue transitions (`id=1047`).
+        crate::texture::ahead::listed(&copy);
         let wanted = legal_state(texture, wanted);
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         match states.entry(std::sync::Arc::as_ptr(&copy) as usize) {
@@ -7729,6 +7457,14 @@ impl HostList {
                 (before != wanted).then_some((texture, before))
             }
         }
+    }
+
+    fn tracked_state(&self, copy: &std::sync::Arc<crate::resource::HostTexture>) -> Option<u32> {
+        self.states
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(std::sync::Arc::as_ptr(copy) as usize))
+            .map(|&(_, last, _)| last)
     }
 
     /// Moves host texture `copy` to `wanted` (a host state) in this list,
@@ -7800,6 +7536,7 @@ impl HostList {
                 behind: [None; 2],
                 writing: false,
                 late: false,
+                late_to_plane: false,
             });
         let copy = match u.behind[side] {
             Some(behind) => behind,
@@ -7817,14 +7554,19 @@ impl HostList {
             (true, false) => u.behind[1] = Some(true),
             (false, _) => {}
         }
-        // shortcut: the depth plane's twin is not drawn into the plane
-        // here: the pass sets a pipeline and a target of ours, which a list
-        // still recording the title's commands cannot take. This use sees
-        // the plane as it was; the pass runs when the list closes
-        // (`twins_to_depth`). Counted.
-        if copy && !colour && twin.plane.is_some() {
-            u.late = true;
-            crate::resource::PLANES[2].fetch_add(1, Ordering::Relaxed);
+        // Defer shader-based depth-plane synchronization out of `twin_use`
+        // (which runs mid-`draw::State::bind` after heaps/root/PSO are set)
+        // so `flush_late_depth_planes()` runs it cleanly right before the
+        // Draw/Dispatch and lets the caller replay/re-bind state.
+        if copy && twin.plane.is_some() {
+            if colour {
+                u.late_to_plane = true;
+                u.late = false;
+            } else {
+                u.late = true;
+                u.late_to_plane = false;
+            }
+            self.late_planes.store(true, Ordering::Release);
         }
         drop(twins);
         if copy {
@@ -7841,9 +7583,7 @@ impl HostList {
 
     /// Records the pass that draws the twin of the depth plane of `depth`
     /// into the plane, if `twin` has one, with the moves to the states the
-    /// pass needs; the twin is left in the unordered access state. Only
-    /// for a list that records nothing of the title's afterwards
-    /// (`record_plane_pass`).
+    /// pass needs; the twin is left in the unordered access state.
     fn pass_plane(
         &self,
         depth: &std::sync::Arc<crate::resource::HostTexture>,
@@ -7857,6 +7597,24 @@ impl HostList {
         self.settle(plane, PIXEL_SHADER_RESOURCE);
         record_plane_pass(&self.list, &depth.texture, &plane.texture);
         self.settle(plane, UNORDERED_ACCESS);
+    }
+
+    /// Records the reverse compute pass copying the depth plane of `depth`
+    /// into `twin.plane` (`depth SRV -> plane UAV`), leaving `plane` in
+    /// `UNORDERED_ACCESS` with a trailing UAV barrier.
+    fn pass_depth_to_plane(
+        &self,
+        depth: &std::sync::Arc<crate::resource::HostTexture>,
+        twin: &crate::resource::Twin,
+    ) {
+        const UNORDERED_ACCESS: u32 = 0x8;
+        const NON_PIXEL_SHADER_RESOURCE: u32 = 0x40;
+        let Some(plane) = &twin.plane else { return };
+        self.settle(depth, NON_PIXEL_SHADER_RESOURCE);
+        self.settle(plane, UNORDERED_ACCESS);
+        if !record_reverse_plane_pass(&self.list, &depth.texture, &plane.texture) {
+            crate::resource::PLANES[1].fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Records the copy of a depth texture into its colour twin (`colour`)
@@ -7882,6 +7640,67 @@ impl HostList {
         self.settle(&twin.colour, UNORDERED_ACCESS);
     }
 
+    /// Flushes any deferred depth-plane twin passes on this list inline:
+    /// - `u.late`: draws `twin.plane -> depth` via [`HostList::pass_plane`]
+    /// - `u.late_to_plane`: copies `depth -> twin.plane` via
+    ///   [`HostList::pass_depth_to_plane`]
+    ///
+    /// Restores each flushed depth texture's tracked state in `self.states`
+    /// when the list had already transitioned it for an upcoming draw, copy,
+    /// or dispatch. Returns `true` **only** when at least one shader pass
+    /// actually ran on `self.list` (clobbering heaps/root/PSO and, for
+    /// `pass_plane`, graphics OM/RS/IA state), so callers replay and re-bind
+    /// state only when needed.
+    pub(crate) fn flush_late_depth_planes(&self) -> bool {
+        if !self.late_planes.swap(false, Ordering::AcqRel) {
+            return false;
+        }
+        const DEPTH_WRITE: u32 = 0x10;
+        const NON_PIXEL_SHADER_RESOURCE: u32 = 0x40;
+        const COPY_DEST: u32 = 0x400;
+        const COPY_SOURCE: u32 = 0x800;
+        let pending: Vec<_> = {
+            let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
+            twins
+                .values_mut()
+                .filter(|u| (u.late || u.late_to_plane) && u.twin.plane.is_some())
+                .map(|u| {
+                    let to_depth = std::mem::take(&mut u.late);
+                    let to_plane = std::mem::take(&mut u.late_to_plane);
+                    (u.depth.clone(), u.twin.clone(), to_depth, to_plane)
+                })
+                .collect()
+        };
+        if pending.is_empty() {
+            return false;
+        }
+        let mut ran = false;
+        for (depth, twin, to_depth, to_plane) in pending {
+            let prev = self.tracked_state(&depth);
+            if to_depth {
+                self.pass_plane(&depth, &twin);
+                ran = true;
+                if let Some(prev) = prev
+                    && prev != DEPTH_WRITE
+                    && prev != COPY_DEST
+                {
+                    self.settle(&depth, prev);
+                }
+            }
+            if to_plane {
+                self.pass_depth_to_plane(&depth, &twin);
+                ran = true;
+                if let Some(prev) = prev
+                    && prev != NON_PIXEL_SHADER_RESOURCE
+                    && prev != COPY_SOURCE
+                {
+                    self.settle(&depth, prev);
+                }
+            }
+        }
+        ran
+    }
+
     /// Brings a depth texture's host copy up to date with its colour/plane
     /// twin before an external consumer (such as a PC-native upscaler) reads
     /// it on this list. Returns `true` if `resource` has a depth twin.
@@ -7900,13 +7719,17 @@ impl HostList {
                 return true;
             };
             let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
-            twins
+            let found = twins
                 .get_mut(&(std::sync::Arc::as_ptr(&twin) as usize))
                 .filter(|u| u.late)
                 .map(|u| {
                     u.late = false;
+                    u.late_to_plane = false;
                     (u.depth.clone(), u.twin.clone())
-                })
+                });
+            let any_late = twins.values().any(|u| u.late || u.late_to_plane);
+            self.late_planes.store(any_late, Ordering::Release);
+            found
         };
         if let Some((depth, twin)) = plane {
             self.pass_plane(&depth, &twin);
@@ -7926,6 +7749,7 @@ impl HostList {
         wanted: u32,
     ) -> Option<std::sync::Arc<crate::resource::HostTexture>> {
         let copy = crate::resource::host_copy(resource)?;
+        crate::texture::ahead::listed(&copy);
         let wanted = legal_state(&copy.texture, wanted);
         let before = {
             let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
@@ -7993,14 +7817,21 @@ impl HostList {
             .values_mut()
             .filter(|u| u.behind[0] == Some(true) || u.late)
             .map(|u| {
+                // Count only depth planes that genuinely stayed unflushed until
+                // `HostList::close()` (i.e. missed by `flush_late_depth_planes`).
+                if u.late {
+                    crate::resource::PLANES[2].fetch_add(1, Ordering::Relaxed);
+                }
                 // Not copied again if the list copied since the last write
                 // and only the depth plane's pass is left.
                 let copy = u.behind[0] == Some(true);
                 u.behind[0] = Some(false);
                 u.late = false;
+                u.late_to_plane = false;
                 (u.depth.clone(), u.twin.clone(), copy)
             })
             .collect();
+        self.late_planes.store(false, Ordering::Relaxed);
         drop(twins);
         for (depth, twin, copy) in &written {
             if *copy {
@@ -8030,9 +7861,35 @@ impl HostList {
     /// colour twin it first copies the side the list uses as it finds it
     /// from the other, if a list submitted earlier left it behind.
     fn prelude(&self) -> Option<ID3D12CommandList> {
+        const UNORDERED_ACCESS: u32 = 0x8;
+        const DEPTH_WRITE: u32 = 0x10;
+        const NON_PIXEL_SHADER_RESOURCE: u32 = 0x40;
+        const PIXEL_SHADER_RESOURCE: u32 = 0x80;
         const COPY_DEST: u32 = 0x400;
         const COPY_SOURCE: u32 = 0x800;
         let host_state = |state: u32| D3D12_RESOURCE_STATES(state as i32);
+        // Drain any background COPY-queue `ahead` uploads for textures this
+        // list touches BEFORE holding `self.states` or recording DIRECT-queue
+        // barriers (`id=1047` cross-queue race guard).
+        let pending_ahead: Vec<std::sync::Arc<crate::resource::HostTexture>> = {
+            let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+            let mut copies: Vec<_> = states
+                .values()
+                .filter(|(_, _, copy)| crate::texture::ahead::needs_listed(copy))
+                .map(|(_, _, copy)| copy.clone())
+                .collect();
+            drop(states);
+            let twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
+            for u in twins.values() {
+                if crate::texture::ahead::needs_listed(&u.depth) {
+                    copies.push(u.depth.clone());
+                }
+            }
+            copies
+        };
+        for copy in &pending_ahead {
+            crate::texture::ahead::listed(copy);
+        }
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         // The copies (depth texture, twin, whether into the twin); the
         // sides are then as this list leaves them.
@@ -8053,34 +7910,95 @@ impl HostList {
         }
         drop(twins);
         // A copy runs with its textures in the copy states: each moves
-        // there from its real state, and from there to the state the list
-        // starts with (back to its real state if the list does not use it).
+        // there from its real state, runs stencil copy + depth-plane pass (if
+        // `twin.plane.is_some()`), and moves from its post-sync state to the
+        // state the list starts with (or back to its real state if the list
+        // does not name it directly).
         let mut to_copy = Vec::new();
         let mut barriers = Vec::new();
         let mut copying = std::collections::HashMap::new();
         for (depth, twin, colour) in &syncs {
-            let (from, to) = if *colour {
-                (depth, &twin.colour)
+            let (depth_start, colour_start) = if *colour {
+                (COPY_SOURCE, COPY_DEST)
             } else {
-                (&twin.colour, depth)
+                (COPY_DEST, COPY_SOURCE)
             };
-            for (texture, state) in [(from, COPY_SOURCE), (to, COPY_DEST)] {
-                let key = std::sync::Arc::as_ptr(texture) as usize;
-                let real = texture.state.load(Ordering::Relaxed);
-                copying.insert(key, state);
-                if real != state {
+            let depth_end = if twin.plane.is_some() {
+                if *colour {
+                    NON_PIXEL_SHADER_RESOURCE
+                } else {
+                    DEPTH_WRITE
+                }
+            } else {
+                depth_start
+            };
+            // Transition `depth` from real -> `depth_start`, and record its
+            // post-sync `depth_end` for `barriers`.
+            {
+                let key = std::sync::Arc::as_ptr(depth) as usize;
+                let real = depth.state.load(Ordering::Relaxed);
+                copying.insert(key, depth_end);
+                if real != depth_start {
                     to_copy.push(transition(
-                        &texture.texture,
+                        &depth.texture,
                         host_state(real),
-                        host_state(state),
+                        host_state(depth_start),
+                    ));
+                }
+                if !states.contains_key(&key) && depth_end != real {
+                    barriers.push(transition(
+                        &depth.texture,
+                        host_state(depth_end),
+                        host_state(real),
+                    ));
+                }
+            }
+            // Transition `twin.colour` from real -> `colour_start`.
+            {
+                let key = std::sync::Arc::as_ptr(&twin.colour) as usize;
+                let real = twin.colour.state.load(Ordering::Relaxed);
+                copying.insert(key, colour_start);
+                if real != colour_start {
+                    to_copy.push(transition(
+                        &twin.colour.texture,
+                        host_state(real),
+                        host_state(colour_start),
                     ));
                     if !states.contains_key(&key) {
                         barriers.push(transition(
-                            &texture.texture,
-                            host_state(state),
+                            &twin.colour.texture,
+                            host_state(colour_start),
                             host_state(real),
                         ));
                     }
+                }
+            }
+            // Prepare `twin.plane` for either the reverse CS copy
+            // (`UNORDERED_ACCESS`) or forward pixel pass (`PIXEL_SHADER_RESOURCE`
+            // -> `UNORDERED_ACCESS`).
+            if let Some(plane) = &twin.plane {
+                let plane_start = if *colour {
+                    UNORDERED_ACCESS
+                } else {
+                    PIXEL_SHADER_RESOURCE
+                };
+                let plane_end = UNORDERED_ACCESS;
+                let key = std::sync::Arc::as_ptr(plane) as usize;
+                let real = plane.state.load(Ordering::Relaxed);
+                copying.insert(key, plane_end);
+                if real != plane_start {
+                    to_copy.push(transition(
+                        &plane.texture,
+                        host_state(real),
+                        host_state(plane_start),
+                    ));
+                }
+                if !states.contains_key(&key) && plane_end != real {
+                    barriers.push(transition(
+                        &plane.texture,
+                        host_state(plane_end),
+                        host_state(real),
+                    ));
                 }
             }
         }
@@ -8110,6 +8028,30 @@ impl HostList {
                 }
                 for (depth, twin, colour) in &syncs {
                     record_twin_copy(list, &depth.texture, twin, *colour);
+                    if let Some(plane) = &twin.plane {
+                        if *colour {
+                            list.ResourceBarrier(&[transition(
+                                &depth.texture,
+                                host_state(COPY_SOURCE),
+                                host_state(NON_PIXEL_SHADER_RESOURCE),
+                            )]);
+                            if !record_reverse_plane_pass(list, &depth.texture, &plane.texture) {
+                                crate::resource::PLANES[1].fetch_add(1, Ordering::Relaxed);
+                            }
+                        } else {
+                            list.ResourceBarrier(&[transition(
+                                &depth.texture,
+                                host_state(COPY_DEST),
+                                host_state(DEPTH_WRITE),
+                            )]);
+                            record_plane_pass(list, &depth.texture, &plane.texture);
+                            list.ResourceBarrier(&[transition(
+                                &plane.texture,
+                                host_state(PIXEL_SHADER_RESOURCE),
+                                host_state(UNORDERED_ACCESS),
+                            )]);
+                        }
+                    }
                 }
                 if !barriers.is_empty() {
                     list.ResourceBarrier(&barriers);
@@ -10265,6 +10207,46 @@ pub(crate) fn transition(
     }
 }
 
+/// Submits `lists` on `queue` split at every group boundary in `starts` (each
+/// `[prelude?, run_i]` pair and any trailing `card.check` list in its own
+/// `ExecuteCommandLists` call, followed by the caller's single fence `Signal`).
+///
+/// `Shadow::buffer`s start in `D3D12_RESOURCE_STATE_COMMON` and promote
+/// implicitly per list (`IASetVertexBuffers` `0x1`, `SetComputeRootShaderResourceView`
+/// `0x40`, etc.). D3D12 decays `COMMON` buffers strictly at
+/// `ExecuteCommandLists` boundaries (never between lists inside the same
+/// batch), so per-group submission eliminates cross-list `id=538` mismatches.
+///
+/// # Safety
+/// Every `Some` entry in `lists` must be a closed command list valid for
+/// `queue`.
+unsafe fn execute_command_list_groups(
+    queue: &ID3D12CommandQueue,
+    lists: &[Option<ID3D12CommandList>],
+    starts: &[usize],
+) {
+    if lists.is_empty() {
+        return;
+    }
+    if starts.is_empty() {
+        // SAFETY: caller guarantees closed valid command lists.
+        unsafe { queue.ExecuteCommandLists(lists) };
+        return;
+    }
+    let mut prev = 0usize;
+    for &start in starts {
+        if start > prev && start <= lists.len() {
+            // SAFETY: slice lies in `0..=lists.len()` and caller guarantees valid lists.
+            unsafe { queue.ExecuteCommandLists(&lists[prev..start]) };
+            prev = start;
+        }
+    }
+    if prev < lists.len() {
+        // SAFETY: slice lies in `0..=lists.len()` and caller guarantees valid lists.
+        unsafe { queue.ExecuteCommandLists(&lists[prev..]) };
+    }
+}
+
 /// A window of the given client size, owned by its own message thread.
 fn window(width: u32, height: u32) -> windows::core::Result<HWND> {
     let (sender, receiver) = std::sync::mpsc::channel();
@@ -10464,18 +10446,26 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
 
     #[test]
     fn vram_idle_ms_scales_with_pressure() {
-        use super::vram_idle_ms;
+        use super::{vram_idle_for, vram_idle_ms};
         let gib = 1024 * 1024 * 1024;
-        // Normal (< 75%)
+        // Smaller VRAM budgets (< 12 GiB): normal / moderate / high pressure
         assert_eq!(vram_idle_ms(Some([10 * gib, 0, 0, 0])), 5_000);
         assert_eq!(vram_idle_ms(Some([10 * gib, 7 * gib, 0, 0])), 5_000);
         assert_eq!(vram_idle_ms(Some([100, 74, 0, 0])), 5_000);
-        // Moderate (75%..85%)
         assert_eq!(vram_idle_ms(Some([100, 75, 0, 0])), 2_500);
         assert_eq!(vram_idle_ms(Some([100, 84, 0, 0])), 2_500);
-        // High (>= 85%, including over-budget)
         assert_eq!(vram_idle_ms(Some([100, 85, 0, 0])), 1_000);
         assert_eq!(vram_idle_ms(Some([10 * gib, 12 * gib, 0, 0])), 1_000);
+        // High-VRAM GPU (24 GiB): < 70% keeps textures resident for 5 minutes
+        // (300_000 ms), 70..75% drops to 5_000 ms, 75..85% to 2_500 ms, >= 85% to 1_000 ms.
+        assert_eq!(vram_idle_for(Some([24 * gib, 0, 0, 0]), true), 300_000);
+        assert_eq!(vram_idle_for(Some([24 * gib, 16 * gib, 0, 0]), true), 300_000); // 66%
+        assert_eq!(vram_idle_for(Some([24 * gib, 17 * gib, 0, 0]), true), 5_000);   // 70%
+        assert_eq!(vram_idle_for(Some([24 * gib, 18 * gib, 0, 0]), true), 2_500);   // 75%
+        assert_eq!(vram_idle_for(Some([24 * gib, 20 * gib, 0, 0]), true), 2_500);   // 83%
+        assert_eq!(vram_idle_for(Some([24 * gib, 21 * gib, 0, 0]), true), 1_000);   // 87%
+        // VICTORY_KEEP_FREED=0 (`keep = false`) restores 5_000 ms on high-VRAM GPUs.
+        assert_eq!(vram_idle_for(Some([24 * gib, 8 * gib, 0, 0]), false), 5_000);
         // Missing or zero budget falls back to normal
         assert_eq!(vram_idle_ms(None), 5_000);
         assert_eq!(vram_idle_ms(Some([0, 100, 0, 0])), 5_000);

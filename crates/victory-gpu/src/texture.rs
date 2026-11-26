@@ -55,6 +55,10 @@ pub(crate) struct Staging {
     /// Which host copy it uploads into, and what that is told to hold.
     serial: u64,
     holds: Arc<crate::resource::Holds>,
+    /// Finest uploaded mip for non-tiled (`< 1 MiB`) partially-mapped textures
+    /// (`HostTexture::min_mip`), paired with `detiled_min` computed in `detile`.
+    min_mip: Arc<std::sync::atomic::AtomicU32>,
+    detiled_min: std::sync::atomic::AtomicU32,
     /// Made by the pass over textures picked by index, for one upload
     /// ([`once`]): read when the list is submitted, and never looked at again.
     once: std::sync::atomic::AtomicBool,
@@ -97,8 +101,10 @@ pub(crate) struct Staging {
 struct Last {
     hash: Option<Digest>,
     asked: u64,
-    /// The frame a partly mapped texture was last read in.
+    /// The frame a partly mapped texture was last read in, and how many bytes
+    /// were mapped then (newly mapped pages bypass the throttle immediately).
     partial: Option<u64>,
+    partial_mapped: u64,
     /// Until this frame a guarded texture is hashed at every check: its
     /// first checks, and after the hash found a change the guard had not
     /// seen ([`hot_textures`]). 0: not checked under the guard yet.
@@ -744,7 +750,13 @@ pub(crate) struct Digest(u128);
 
 /// [`upload`] of the levels from `first` on, the ones a view shows.
 pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
-    let first = if crate::resource::held_only() { first } else { 0 };
+    let first = if crate::resource::held_levels_enabled()
+        && crate::resource::host_tiled(resource).is_none()
+    {
+        first
+    } else {
+        0
+    };
     let host_written = HOST_WRITTEN
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -766,6 +778,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     let Some(copy) = crate::resource::host_copy(resource) else {
         return;
     };
+    let first = if copy.tiled.is_some() { 0 } else { first };
     let texture = &copy.texture;
     ahead::listed(&copy);
     let Some(staging) = staging(resource, &copy, first) else {
@@ -914,6 +927,10 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
         // upload: its slots are made due again by the texture pass.
         if waiting {
             crate::descriptor::host::levels_waiting(staging.memory as u64);
+        } else {
+            // Record what the host copy holds so `unchanged()` skips
+            // redundant re-uploads of unchanged >= 1 MiB tiled textures.
+            noted.note_held();
         }
     });
 }
@@ -1135,9 +1152,30 @@ impl Staging {
     }
 
     /// The host copy holds what the staging buffer was filled from ([`unchanged`]).
+    /// For non-tiled partially-mapped textures (`< 1 MiB`), also publishes the
+    /// finest uploaded mip level into `HostTexture::min_mip` and remakes views
+    /// via `levels_changed` when the effective `ResourceMinLODClamp` changes.
     fn note_held(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
         let hash = self.last.lock().unwrap_or_else(|e| e.into_inner()).hash;
         *self.holds.lock().unwrap_or_else(|e| e.into_inner()) = hash.map(|hash| (self.first, hash));
+        if !self.on_demand {
+            let finest = self.detiled_min.load(Relaxed);
+            if finest != u32::MAX {
+                let prev = self.min_mip.load(Relaxed);
+                let next = if self.first == 0 || prev == u32::MAX {
+                    finest
+                } else {
+                    prev.min(finest)
+                };
+                if prev != next {
+                    self.min_mip.store(next, Relaxed);
+                    if !(prev == u32::MAX && next == 0) {
+                        crate::descriptor::host::levels_changed(self.memory as u64);
+                    }
+                }
+            }
+        }
     }
 
     /// Detiles the texture memory into the staging buffer if it changed
@@ -1219,10 +1257,13 @@ impl Staging {
         };
         if !committed(self.memory, size) {
             let frame = crate::frame::current();
-            if !exact && last.partial.is_some_and(|at| frame < at + 30) {
+            let now_mapped = mapped_bytes(self.memory, size);
+            let grew = now_mapped > last.partial_mapped;
+            if !exact && !grew && last.partial.is_some_and(|at| frame < at + 4) {
                 return 0;
             }
             last.partial = Some(frame);
+            last.partial_mapped = now_mapped;
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
             let changed = with_read(size, |read| {
@@ -1247,6 +1288,7 @@ impl Staging {
             }
             return size;
         }
+        last.partial_mapped = size as u64;
         if through_copy() {
             return with_title(self.memory, size, |tiled| {
                 let hash = digest(tiled);
@@ -1352,6 +1394,24 @@ impl Staging {
             self.detiled.store(held, Relaxed);
             held
         } else {
+            use std::sync::atomic::Ordering::Relaxed;
+            // Track the finest committed mip on non-tiled (`< 1 MiB`) multi-mip
+            // textures so partially-mapped textures clamp via `ResourceMinLODClamp`
+            // instead of sampling unmapped Mip 0 zeros.
+            let finest = if self.mips <= 1
+                || self.layout.slices != 1
+                || self.layout.mips.len() > 32
+            {
+                0
+            } else if self.first == 0 && committed(self.memory, self.read) {
+                0
+            } else {
+                let levels = self.held_levels([u64::from(self.first), u64::MAX]);
+                (self.first..self.mips)
+                    .find(|&m| m < 32 && levels & (1 << m) != 0)
+                    .unwrap_or(u32::MAX)
+            };
+            self.detiled_min.store(finest, Relaxed);
             u32::MAX
         };
         #[cfg(feature = "diagnostics")]
@@ -1468,6 +1528,13 @@ pub(crate) fn unchanged(resource: This, first: u32) -> bool {
     let Some(copy) = crate::resource::made_copy(resource) else {
         return false;
     };
+    if copy
+        .tiled
+        .as_ref()
+        .is_some_and(|tiled| tiled.first_shown().is_none_or(|shown| shown > first))
+    {
+        return false;
+    }
     let Some((from, held)) = *copy.holds.lock().unwrap_or_else(|e| e.into_inner()) else {
         return false;
     };
@@ -1620,6 +1687,9 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
     if len == 0 {
         return 0;
     }
+    // Hold `title_memory_reading()` (re-entrant safe on the same thread) so a
+    // concurrent `xmem::unmap` view-split gap never reports false `0`.
+    let _reading = crate::watch::title_memory_reading();
     let start = at as usize;
     let end = start.saturating_add(len);
     if !committed(at, 1) && !committed((end - 1) as *const u8, 1) {
@@ -1757,6 +1827,8 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         read,
         serial: copy.serial,
         holds: copy.holds.clone(),
+        min_mip: copy.min_mip.clone(),
+        detiled_min: std::sync::atomic::AtomicU32::new(u32::MAX),
         once: std::sync::atomic::AtomicBool::new(once() && !on_demand && PICKING.get().is_some()),
         bytes: total,
         memory,

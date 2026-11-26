@@ -108,12 +108,15 @@ fn early_budgets() -> (u64, u64) {
     })
 }
 
-/// The pixel shaders of the title's decoration bake (the title:
-/// `PS_BakeDecorations_*`), by the first 16 hex digits of their hash as the
-/// frame listings print it. They draw into a 256x256 corner of 2048x2048
-/// targets and name no texture in a table.
+/// Legacy four hashes of the title's decoration bake pixel shaders (kept as a
+/// fallback alongside container-name matching in [`crate::pipeline::host::is_bake_shader`]).
 pub(crate) const BAKE_PIXEL_SHADERS: [&str; 4] =
     ["c0a7fe77b1862e10", "0d1575a396dfe513", "b7cfd8dda91ebb6b", "280967ad158cee0b"];
+
+/// Whether `p` contains any pixel or compute decoration/skin/composite bake shader.
+fn is_bake_pipeline(p: &HostPipeline) -> bool {
+    p.stages.iter().any(|s| crate::pipeline::host::is_bake_shader(&s.shader))
+}
 
 /// Since the start: early runs of the texture pass, and those of them
 /// made for a bake draw.
@@ -1038,8 +1041,22 @@ impl State {
             // Its geometry stage would turn each triangle into a rectangle.
             once!("a rectangle pipeline drawn with another topology");
         }
+        if self.depth != 0 {
+            // A depth texture shaders also write: bring its depth plane up to
+            // date inline before binding/drawing (avoiding stale depth until close).
+            list.twin_use(self.depth as This, false, true);
+            if list.flush_late_depth_planes() {
+                self.replay(list);
+            }
+        }
         if !self.bind(list, p, false) {
             return false;
+        }
+        if list.flush_late_depth_planes() {
+            self.replay(list);
+            if !self.bind(list, p, false) {
+                return false;
+            }
         }
         let l = &list.list;
         // Vertex buffers the input layout reads.
@@ -1088,8 +1105,6 @@ impl State {
             crate::list::ensure_state(list, t as This, RENDER_TARGET);
         }
         if self.depth != 0 {
-            // A depth texture shaders also write: what they wrote, first.
-            list.twin_use(self.depth as This, false, true);
             // A view that writes neither plane keeps the texture readable:
             // the depth read state, together with the shader read states
             // if this draw's shaders read the same texture (the write state
@@ -1106,6 +1121,20 @@ impl State {
                 DEPTH_WRITE
             };
             crate::list::ensure_state(list, self.depth as This, state);
+        }
+        true
+    }
+
+    /// Binds a compute pipeline and flushes any compute-written depth-plane
+    /// twin inline if an SRV/UAV bound by this dispatch needs it, replaying
+    /// command-list state and re-binding compute roots/PSO if a pass ran.
+    fn bind_compute(&mut self, list: &HostList, p: &HostPipeline) -> bool {
+        if !self.bind(list, p, true) {
+            return false;
+        }
+        if list.flush_late_depth_planes() {
+            self.replay(list);
+            return self.bind(list, p, true);
         }
         true
     }
@@ -1895,13 +1924,10 @@ impl State {
             return None;
         }
         let p = crate::pipeline::host_pipeline(self.pipeline as This)?;
-        if p.compute {
+        let bake = bake_ms > 0 && is_bake_pipeline(p);
+        if p.compute && !bake {
             return None;
         }
-        let bake = bake_ms > 0
-            && p.stages
-                .iter()
-                .any(|s| BAKE_PIXEL_SHADERS.contains(&s.shader.hash.as_str()));
         let first = EARLY_FRAME.swap(frame, Ordering::Relaxed) != frame;
         if first {
             EARLY_BAKED_MS.store(0, Ordering::Relaxed);
@@ -2097,11 +2123,13 @@ impl State {
     /// of the draw being bound, as the world's pass records them.
     fn early_textures(&self, list: &HostList, p: &HostPipeline, compute: bool) {
         let (early_ms, bake_ms) = early_budgets();
-        if compute || (early_ms == 0 && bake_ms == 0) {
+        if early_ms == 0 && bake_ms == 0 {
             return;
         }
-        let bake = bake_ms > 0
-            && p.stages.iter().any(|s| BAKE_PIXEL_SHADERS.contains(&s.shader.hash.as_str()));
+        let bake = bake_ms > 0 && is_bake_pipeline(p);
+        if compute && !bake {
+            return;
+        }
         let frame = crate::frame::current();
         let first = EARLY_FRAME.swap(frame, Ordering::Relaxed) != frame;
         if first {
@@ -2468,20 +2496,27 @@ impl State {
             if let Some(View::Placed(false, resource, desc)) = heap.handle(index).and_then(crate::descriptor::view) {
                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
                 let len = crate::resource::placed_bytes(&resource).unwrap_or(1);
-                let mapped = crate::texture::mapped_bytes(address as *const u8, len as usize);
+                // Hold the title-memory read lock across `mapped_bytes` / `committed`
+                // so concurrent `xmem::unmap` view splits never report false `0`.
+                let (mapped, first_committed) = {
+                    let _reading = crate::watch::title_memory_reading();
+                    let m = crate::texture::mapped_bytes(address as *const u8, len as usize);
+                    let c = m > 0 && m < len && crate::texture::committed(address as *const u8, 1);
+                    (m, c)
+                };
                 let slot_key = (std::ptr::from_ref(host) as usize, index);
                 if mapped == 0 {
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
-                    // Only immediately unmake (clearing the slot to a solid-black
-                    // null SRV) if we lack VRAM headroom (`!room`) or the slot now
-                    // describes a completely different texture. Treat mip-streaming
-                    // rewrites of the SAME placed texture (`texture_slot_shows_other`)
-                    // as `same_view` so transient streaming remaps receive full grace.
-                    let same_view = heap.handle(index).is_some_and(|h| {
-                        host.texture_slot_made_from(index, h) || host.texture_slot_shows_other(index, h)
-                    });
-                    if unmapped_grace_should_evict(slot_key, write, same_view, room) {
-                        host.texture_slot_gone(index);
+                    // When the GPU has VRAM headroom (`room == true`), NEVER null a live
+                    // made texture slot to solid black on transient unmaps; keep the last
+                    // valid descriptor visible until replaced. Only evict under VRAM pressure.
+                    if !room {
+                        let same_view = heap.handle(index).is_some_and(|h| {
+                            host.texture_slot_made_from(index, h) || host.texture_slot_shows_other(index, h)
+                        });
+                        if unmapped_grace_should_evict(slot_key, write, same_view, room) {
+                            host.texture_slot_gone(index);
+                        }
                     }
                     host.texture_slot_later(index, write, frame, most);
                     handled += 1;
@@ -2496,7 +2531,7 @@ impl State {
                         handled += 1;
                         continue;
                     }
-                    if !crate::texture::committed(address as *const u8, 1) {
+                    if !first_committed {
                         HEAP_TEXTURES_PARTLY[2].fetch_add(1, Ordering::Relaxed);
                     }
                     partly = Some(mapped);
@@ -2577,7 +2612,6 @@ impl State {
                 break;
             }
             let shows_other = !baking
-                && crate::resource::held_only()
                 && heap.handle(index).is_some_and(|handle| host.texture_slot_shows_other(index, handle));
             let late = !shows_other
                 && !baking
@@ -2846,7 +2880,7 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
-        if !self.bind(list, p, true) {
+        if !self.bind_compute(list, p) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a
             // dropped stage: the others stop too.
@@ -2917,16 +2951,21 @@ impl State {
         let image = entry(ResourceType::Uav, at);
         let depth = match role {
             Role::Resolve => entry(ResourceType::Srv, DEPTH),
-            Role::Radiance | Role::Air => image,
+            Role::Radiance | Role::Air => None,
         };
-        let (Some((of, image)), Some((seen, depth))) = (image, depth) else {
+        let Some((of, image)) = image else {
             once!(?role, "no stand-in for the indirect light: other tables");
             return false;
         };
+        if role == Role::Resolve && depth.is_none() {
+            once!(?role, "no stand-in for the indirect light: other tables");
+            return false;
+        }
         // DXGI_FORMAT_R32_UINT (42, holding R9G9B9E5); DXGI_FORMAT_R11G11B10_FLOAT (26).
         let format = if role == Role::Resolve { 42 } else { 26 };
         let volume = of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
-        if of.Format.0 != format || (seen.Width, seen.Height) != (of.Width, of.Height) || volume != (role == Role::Air) {
+        let size_ok = depth.is_none_or(|(seen, _)| (seen.Width, seen.Height) == (of.Width, of.Height));
+        if of.Format.0 != format || !size_ok || volume != (role == Role::Air) {
             once!(?role, format = of.Format.0, "no stand-in for the indirect light: another image");
             return false;
         }
@@ -2935,7 +2974,7 @@ impl State {
             role,
             &Views {
                 image,
-                depth,
+                depth: depth.map(|(_, handle)| handle),
                 size: [of.Width as u32, of.Height],
                 slices: u32::from(of.DepthOrArraySize),
             },
@@ -4022,7 +4061,7 @@ impl State {
         let ran = match kind {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
-            DISPATCH => self.bind(list, p, true),
+            DISPATCH => self.bind_compute(list, p),
             _ => false,
         };
         if !ran {

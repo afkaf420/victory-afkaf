@@ -4649,12 +4649,19 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
 
 #[cfg(test)]
 pub(crate) fn test_card_shadow(len: u64) -> Option<Arc<Shadow>> {
+    test_staged_card_shadow_at(0, len)
+}
+
+#[cfg(test)]
+pub(crate) fn test_staged_card_shadow_at(start: u64, len: u64) -> Option<Arc<Shadow>> {
     let host = host()?;
     let (staging, data) = host.shared_buffer(len)?;
+    // SAFETY: `data` points to `len` mapped writable staging bytes.
+    unsafe { std::ptr::write_bytes(data, 0, len as usize) };
     let on_card = host.uav_buffer(len)?;
     // SAFETY: live D3D12 buffer.
     let gpu = unsafe { on_card.GetGPUVirtualAddress() };
-    let mut s = Shadow::new(on_card, data, gpu, 0, len);
+    let mut s = Shadow::new(on_card, data, gpu, start, len);
     s.card = Some(Card {
         staging: Mutex::new(Some((staging, data as usize))),
         staging_ptr: AtomicUsize::new(data as usize),
@@ -4665,6 +4672,21 @@ pub(crate) fn test_card_shadow(len: u64) -> Option<Arc<Shadow>> {
         gpu_written: AtomicBool::new(false),
     });
     Some(Arc::new(s))
+}
+
+#[cfg(test)]
+impl Shadow {
+    /// Drains and joins this shadow's pending `card.dirty` ranges in isolation
+    /// without touching global `CARDED`.
+    pub(crate) fn test_take_card_dirty(&self) -> Vec<(usize, usize)> {
+        self.card
+            .as_ref()
+            .map(|c| {
+                let mut dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
+                joined(std::mem::take(&mut *dirty))
+            })
+            .unwrap_or_default()
+    }
 }
 
 #[cfg(test)]

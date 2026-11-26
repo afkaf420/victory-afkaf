@@ -578,19 +578,25 @@ extern "system" fn barrier_groups(this: This, count: u32, groups: *const u8) {
         front(this).put(BARRIER_GROUPS, &[u64::from(count), u64::MAX]);
         return;
     }
-    let (globals, buffers) = super::decode_barrier_groups(count, groups);
-    if super::enhanced_barriers_on() && globals.is_empty() && buffers.is_empty() {
-        // Non-UAV texture transitions, SYNC_NONE, or read-to-read buffer barrier
-        // groups require no host barrier under Enhanced Barriers; drop early.
+    let (globals, buffers, tex_to_srv) = super::decode_barrier_groups(count, groups);
+    if super::enhanced_barriers_on()
+        && globals.is_empty()
+        && buffers.is_empty()
+        && tex_to_srv.is_empty()
+    {
+        // Pure non-UAV, non-bindless texture transitions, SYNC_NONE, or read-to-read
+        // buffer barrier groups require no host barrier under Enhanced Barriers; drop early.
         return;
     }
     let header = u64::from(globals.len() as u32) | (u64::from(buffers.len() as u32) << 32);
+    let tex_count = u64::from(tex_to_srv.len() as u32);
     front(this).put_with(
         BARRIER_GROUPS,
-        &[u64::from(count), header],
+        &[u64::from(count), header, tex_count],
         &[
             bytes_of(globals.as_ptr(), globals.len()),
             bytes_of(buffers.as_ptr(), buffers.len()),
+            bytes_of(tex_to_srv.as_ptr(), tex_to_srv.len()),
         ],
     );
 }
@@ -839,17 +845,19 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
                 super::barrier(list, n as u32, at_or(w, 1));
             }
             BARRIER_GROUPS => {
-                if w.len() < 2 || w[1] == u64::MAX {
+                if w.len() < 3 || w[1] == u64::MAX {
                     super::barrier_groups(list, n as u32, std::ptr::null());
                 } else {
                     let g_count = w[1] as u32 as usize;
                     let b_count = (w[1] >> 32) as u32 as usize;
+                    let t_count = w[2] as u32 as usize;
                     let g_words = (g_count * size_of::<super::TitleGlobalBarrier>()).div_ceil(8);
+                    let b_words = (b_count * size_of::<super::DecodedBufferBarrier>()).div_ceil(8);
                     let globals = if g_count > 0 {
                         // SAFETY: serialized by `barrier_groups` from `TitleGlobalBarrier` slice.
                         unsafe {
                             std::slice::from_raw_parts(
-                                w[2..].as_ptr().cast::<super::TitleGlobalBarrier>(),
+                                w[3..].as_ptr().cast::<super::TitleGlobalBarrier>(),
                                 g_count,
                             )
                         }
@@ -860,14 +868,19 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
                         // SAFETY: serialized by `barrier_groups` right after `globals`.
                         unsafe {
                             std::slice::from_raw_parts(
-                                w[2 + g_words..].as_ptr().cast::<super::DecodedBufferBarrier>(),
+                                w[3 + g_words..].as_ptr().cast::<super::DecodedBufferBarrier>(),
                                 b_count,
                             )
                         }
                     } else {
                         &[]
                     };
-                    super::emit_barrier_groups(list, n as u32, true, globals, buffers);
+                    let tex_to_srv = if t_count > 0 {
+                        &w[3 + g_words + b_words..3 + g_words + b_words + t_count]
+                    } else {
+                        &[]
+                    };
+                    super::emit_barrier_groups(list, n as u32, true, globals, buffers, tex_to_srv);
                 }
             }
             VIEWPORTS => state::viewports(list, n as u32, at(w, 1, n)),

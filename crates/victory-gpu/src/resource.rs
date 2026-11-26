@@ -1151,6 +1151,9 @@ pub(crate) struct HostTexture {
     pub(crate) grown: std::sync::atomic::AtomicBool,
     /// What the last submitted upload put in it.
     pub(crate) holds: std::sync::Arc<Holds>,
+    /// Finest mip level uploaded with committed bytes for non-tiled textures
+    /// (`u32::MAX`: whole texture uploaded or not partially clamped).
+    pub(crate) min_mip: std::sync::Arc<std::sync::atomic::AtomicU32>,
     /// Who makes its first upload (`crate::texture::ahead`).
     pub(crate) ahead: std::sync::atomic::AtomicU8,
     /// The texture's D3D12 resource flags (cached once at creation).
@@ -1199,14 +1202,22 @@ fn made_now(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) {
     recent.push_back((texture.as_raw() as usize, now));
 }
 
+/// Whether `VICTORY_HELD_LEVELS` is enabled (independent of
+/// `VICTORY_LEVELS_ON_DEMAND`) so non-tiled `< 1 MiB` textures still honor
+/// their view's `first_mip` without uploading unmapped Mip 0 zeros.
+#[cfg(windows)]
+pub(crate) fn held_levels_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HELD_LEVELS").is_none_or(|v| v != "0"))
+}
+
 /// Whether placed textures only read the mip levels a view starts at when
 /// `VICTORY_LEVELS_ON_DEMAND` is off (`VICTORY_HELD_LEVELS=0` disables).
 #[cfg(windows)]
+#[allow(dead_code)]
 pub(crate) fn held_only() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var_os("VICTORY_HELD_LEVELS").is_none_or(|v| v != "0") && !crate::tiles::wanted()
-    })
+    *ON.get_or_init(|| held_levels_enabled() && !crate::tiles::wanted())
 }
 
 /// The first level a placed texture's view shows: of views of one 2D texture.
@@ -2063,6 +2074,7 @@ impl HostTexture {
             serial: NEXT_SERIAL.fetch_add(1, Relaxed),
             grown: std::sync::atomic::AtomicBool::new(false),
             holds: std::sync::Arc::default(),
+            min_mip: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(u32::MAX)),
             ahead: crate::texture::ahead::fresh(),
             flags,
         }
@@ -2090,6 +2102,7 @@ impl HostTexture {
             serial: NEXT_SERIAL.fetch_add(1, Relaxed),
             grown: std::sync::atomic::AtomicBool::new(false),
             holds: std::sync::Arc::default(),
+            min_mip: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(u32::MAX)),
             ahead: crate::texture::ahead::fresh(),
             flags,
         }
@@ -2308,12 +2321,22 @@ pub(crate) fn host_tiled(this: This) -> Option<OnDemand> {
     hosted(this, false).map(|(host, _)| host).filter(|host| host.tiled.is_some()).map(OnDemand)
 }
 
-/// The first level a view of title texture `this` may show, if its host
-/// copy is made level by level and some level is held and has memory
-/// (`crate::tiles::Tiled::first_shown`).
+/// The first level a view of title texture `this` may show: for tiled
+/// on-demand textures, the first level that is held and has tiles
+/// (`crate::tiles::Tiled::first_shown`); for non-tiled partially-mapped
+/// textures (`< 1 MiB`), the finest mip uploaded with committed bytes
+/// (`HostTexture::min_mip`) when `> 0`.
 #[cfg(windows)]
 pub(crate) fn first_shown(this: This) -> Option<u32> {
-    host_tiled(this)?.tiled()?.first_shown()
+    if this.is_null() {
+        return None;
+    }
+    let (host, _) = hosted(this, false)?;
+    if let Some(tiled) = host.tiled.as_ref() {
+        return tiled.first_shown();
+    }
+    let min_mip = host.min_mip.load(std::sync::atomic::Ordering::Relaxed);
+    (min_mip != u32::MAX && min_mip > 0).then_some(min_mip)
 }
 
 /// A host copy made without memory of its own (`crate::tiles`), as a

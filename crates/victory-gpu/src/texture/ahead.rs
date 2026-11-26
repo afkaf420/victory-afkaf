@@ -115,7 +115,16 @@ fn claim(resource: This, first: u32, there: u64) -> Option<Taken> {
     {
         return turned_down();
     }
-    if copy.ahead.compare_exchange(NONE, PENDING, Relaxed, Relaxed).is_err() {
+    if copy
+        .ahead
+        .compare_exchange(
+            NONE,
+            PENDING,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .is_err()
+    {
         return turned_down();
     }
     super::PICKING.set(Some(there));
@@ -124,7 +133,11 @@ fn claim(resource: This, first: u32, there: u64) -> Option<Taken> {
     let Some(staging) = staging.filter(|s| {
         !s.on_demand && s.first == s.level0 && !s.uploaded.load(Relaxed) && s.once.load(Relaxed)
     }) else {
-        copy.ahead.store(LISTED, Relaxed);
+        copy.ahead.store(LISTED, std::sync::atomic::Ordering::Release);
+        // Take `ON_THEIR_WAY` briefly so no waiter in `listed()` can miss the
+        // wake after observing `PENDING`.
+        let _way = ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner());
+        LANDED.notify_all();
         return turned_down();
     };
     if super::no_wait() && super::fill_unlocked() {
@@ -168,18 +181,69 @@ pub(crate) fn drain() -> usize {
     waiting
 }
 
-/// A list is about to record an upload into `copy`: one on its way here runs
-/// first, and no other is taken after it.
-pub(crate) fn listed(copy: &HostTexture) {
-    if copy.ahead.compare_exchange(NONE, LISTED, Relaxed, Relaxed) != Err(PENDING) {
+/// Fast check: whether `copy` is still `NONE` or `PENDING` and needs
+/// [`listed`] before a direct-queue list records barriers or copies on it.
+#[inline]
+pub(crate) fn needs_listed(copy: &HostTexture) -> bool {
+    let state = copy.ahead.load(std::sync::atomic::Ordering::Acquire);
+    state == NONE || state == PENDING
+}
+
+/// Core state-machine barrier shared by [`listed`] and unit tests: flips
+/// `NONE -> LISTED` atomically so `claim()` can no longer take `ahead` on the
+/// copy queue, and if `ahead` is `PENDING` (either mid-`claim` or in flight on
+/// the copy queue) waits until it leaves `PENDING` and drains from
+/// `ON_THEIR_WAY` without ever abandoning cross-queue synchronization on a
+/// timeout.
+fn wait_listed(ahead: &AtomicU8, serial: u64) {
+    let state = ahead.load(std::sync::atomic::Ordering::Acquire);
+    if state == DONE || state == LISTED {
+        return;
+    }
+    if state == NONE
+        && ahead
+            .compare_exchange(
+                NONE,
+                LISTED,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+    {
         return;
     }
     STATS[5].fetch_add(1, Relaxed);
     let mut way = ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner());
     let started = std::time::Instant::now();
-    while way.iter().any(|(serial, _)| *serial == copy.serial) && started.elapsed().as_millis() < 1000 {
-        way = LANDED.wait_timeout(way, std::time::Duration::from_millis(50)).unwrap_or_else(|e| e.into_inner()).0;
+    let mut warned = false;
+    // Wait until BOTH the atomic leaves `PENDING` (closing the window between
+    // `claim()`'s CAS and `ON_THEIR_WAY.push`) AND the serial has drained from
+    // `ON_THEIR_WAY` (after the copy queue fence completes and `finish()` runs).
+    // Never abandon on timeout: doing so would let the DIRECT queue race an
+    // active COPY queue write (`id=1047`).
+    while ahead.load(std::sync::atomic::Ordering::Acquire) == PENDING
+        || way.iter().any(|(s, _)| *s == serial)
+    {
+        if !warned && started.elapsed().as_millis() >= 2000 {
+            tracing::warn!(
+                serial,
+                ms = started.elapsed().as_millis(),
+                "waiting for copy-queue ahead upload to complete before direct-queue use"
+            );
+            warned = true;
+        }
+        way = LANDED
+            .wait_timeout(way, std::time::Duration::from_millis(25))
+            .unwrap_or_else(|e| e.into_inner())
+            .0;
     }
+}
+
+/// A list is about to record an upload or barrier touching `copy`: any copy
+/// on its way on the COPY queue completes first, and no new one is taken
+/// after it.
+pub(crate) fn listed(copy: &HostTexture) {
+    wait_listed(&copy.ahead, copy.serial);
 }
 
 /// The copy queue and its threads, made on first use.
@@ -314,7 +378,7 @@ fn finish(jobs: Vec<Arc<Job>>) {
         job.staging.uploaded.store(true, Relaxed);
         job.staging.dirty.store(false, Relaxed);
         job.staging.note_held();
-        job.copy.ahead.store(DONE, Relaxed);
+        job.copy.ahead.store(DONE, std::sync::atomic::Ordering::Release);
         BYTES.fetch_sub(job.staging.read as u64, Relaxed);
     }
     for job in &jobs {
@@ -358,4 +422,50 @@ pub(crate) fn there(resource: This) -> bool {
 /// The state of [`HostTexture::ahead`] of a new host copy.
 pub(crate) fn fresh() -> AtomicU8 {
     AtomicU8::new(NONE)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn wait_listed_flips_none_to_listed_atomically() {
+        let state = fresh();
+        wait_listed(&state, 0xCAFE_0001);
+        assert_eq!(state.load(Ordering::Acquire), LISTED);
+        // Subsequent `claim()` CAS `NONE -> PENDING` must fail once `LISTED`.
+        assert!(
+            state
+                .compare_exchange(NONE, PENDING, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        );
+        // Already `DONE` or `LISTED` returns immediately without mutating state.
+        let done = AtomicU8::new(DONE);
+        wait_listed(&done, 0xCAFE_0002);
+        assert_eq!(done.load(Ordering::Acquire), DONE);
+    }
+
+    #[test]
+    fn wait_listed_blocks_on_pending_until_done_without_early_return() {
+        let state = Arc::new(AtomicU8::new(PENDING));
+        let worker_state = state.clone();
+        let started = std::time::Instant::now();
+        let handle = std::thread::spawn(move || {
+            // Simulate `claim()` holding `PENDING` (even before `ON_THEIR_WAY`
+            // has an entry) followed by COPY-queue completion (`finish()`).
+            std::thread::sleep(std::time::Duration::from_millis(80));
+            worker_state.store(DONE, Ordering::Release);
+            let _way = ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner());
+            LANDED.notify_all();
+        });
+        wait_listed(&state, 0xCAFE_0003);
+        let elapsed = started.elapsed();
+        handle.join().unwrap();
+        assert_eq!(state.load(Ordering::Acquire), DONE);
+        assert!(
+            elapsed >= std::time::Duration::from_millis(60),
+            "wait_listed returned prematurely after {elapsed:?} while still PENDING"
+        );
+    }
 }

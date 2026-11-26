@@ -1104,7 +1104,8 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
         ) {
-            if unlike(dst, src) {
+            use windows::core::Interface;
+            if dst == src || to.as_raw() == from.as_raw() || unlike(dst, src) {
                 return;
             }
             // A source the title fills itself is uploaded first (upstream
@@ -1115,6 +1116,9 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             // Depth textures shaders also write: what they wrote, first.
             list.twin_use(dst, false, true);
             list.twin_use(src, false, false);
+            if list.flush_late_depth_planes() {
+                with_state(this, |_, state| state.replay(list));
+            }
             // A destination made level by level gets its levels' memory
             // ahead of this list (`crate::tiles`). `CopyResource` overwrites
             // every level completely, so upfront zero-fill copies are skipped.
@@ -1258,6 +1262,7 @@ extern "system" fn copy_texture_region(
         let src_dims;
         #[cfg(feature = "diagnostics")]
         let mut read = None;
+        let mut same_tex_src_sub: Option<u32> = None;
         if src.kind == FOOTPRINT {
             let (Some(host), Some(bytes)) = (crate::host::host(), src.footprint.bytes()) else {
                 return;
@@ -1284,15 +1289,27 @@ extern "system" fn copy_texture_region(
             let Some(texture) = crate::resource::host_resource(src.resource) else {
                 return;
             };
+            let same_tex = dst.kind == 0
+                && (dst.resource == src.resource || to.as_raw() == texture.as_raw());
+            let src_sub = src.footprint.offset as u32;
+            let dst_sub_check = dst.footprint.offset as u32;
+            if same_tex && src_sub == dst_sub_check {
+                // Self-copying a subresource onto itself is invalid in D3D12 (`id=538`).
+                return;
+            }
             list.twin_use(src.resource, false, false);
             if crate::texture::title_written(texture) {
                 crate::texture::upload(list, src.resource, texture);
             }
-            ensure_state(list, src.resource, COPY_SOURCE);
+            if same_tex {
+                same_tex_src_sub = Some(src_sub);
+            } else {
+                ensure_state(list, src.resource, COPY_SOURCE);
+            }
             // SAFETY: live host texture.
             let sd = unsafe { texture.GetDesc() };
             let smips = u32::from(sd.MipLevels.max(1));
-            let smip = (src.footprint.offset as u32) % smips;
+            let smip = src_sub % smips;
             let sw = (sd.Width >> smip).max(1);
             let sh = (sd.Height >> smip).max(1);
             let sdepth = if sd.Dimension.0 == 4 {
@@ -1306,6 +1323,9 @@ extern "system" fn copy_texture_region(
         // A depth texture shaders also write: what they wrote, first (the
         // source above too).
         list.twin_use(dst.resource, false, true);
+        if list.flush_late_depth_planes() {
+            with_state(this, |_, state| state.replay(list));
+        }
         // A destination made level by level gets the level's memory ahead
         // of this list (`crate::tiles`): skip redundant upfront zero-fill
         // staging copies when this copy immediately overwrites 100% of the
@@ -1372,6 +1392,27 @@ extern "system" fn copy_texture_region(
         // SAFETY: an open list; both locations in the host's layout, naming
         // live resources; the box is the title's (same layout).
         unsafe {
+            if let Some(src_sub) = same_tex_src_sub {
+                use windows::Win32::Graphics::Direct3D12::{
+                    D3D12_RESOURCE_BARRIER, D3D12_RESOURCE_BARRIER_0,
+                    D3D12_RESOURCE_BARRIER_FLAG_NONE, D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                    D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_TRANSITION_BARRIER,
+                };
+                let to_src = D3D12_RESOURCE_BARRIER {
+                    Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                    Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                    Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                        Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                            pResource: std::mem::transmute_copy(to),
+                            Subresource: src_sub,
+                            StateBefore: D3D12_RESOURCE_STATE_COPY_DEST,
+                            StateAfter: D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        }),
+                    },
+                };
+                list.list.ResourceBarrier(&[to_src]);
+            }
             list.list.CopyTextureRegion(
                 (&raw const to_location).cast(),
                 x,
@@ -1379,8 +1420,29 @@ extern "system" fn copy_texture_region(
                 z,
                 (&raw const from).cast(),
                 host_box,
-            )
-        };
+            );
+            if let Some(src_sub) = same_tex_src_sub {
+                use windows::Win32::Graphics::Direct3D12::{
+                    D3D12_RESOURCE_BARRIER, D3D12_RESOURCE_BARRIER_0,
+                    D3D12_RESOURCE_BARRIER_FLAG_NONE, D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                    D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_TRANSITION_BARRIER,
+                };
+                let back_dst = D3D12_RESOURCE_BARRIER {
+                    Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                    Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                    Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                        Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                            pResource: std::mem::transmute_copy(to),
+                            Subresource: src_sub,
+                            StateBefore: D3D12_RESOURCE_STATE_COPY_SOURCE,
+                            StateAfter: D3D12_RESOURCE_STATE_COPY_DEST,
+                        }),
+                    },
+                };
+                list.list.ResourceBarrier(&[back_dst]);
+            }
+        }
         list.record_op();
         maybe_cut_for_tdr(this);
     }
@@ -1495,6 +1557,9 @@ extern "system" fn resolve(
         // Depth textures shaders also write: what they wrote, first.
         list.twin_use(dst, false, true);
         list.twin_use(src, false, false);
+        if list.flush_late_depth_planes() {
+            with_state(this, |_, state| state.replay(list));
+        }
         // As for a copy (`crate::tiles`): skip upfront zero-fill when resolve
         // covers the whole destination subresource.
         // SAFETY: live textures.
@@ -1627,6 +1692,9 @@ extern "system" fn clear_dsv(
         // A depth texture shaders also write: what they wrote, first (the
         // clear may be of one slice or of some rectangles).
         list.twin_use(record.resource, false, true);
+        if list.flush_late_depth_planes() {
+            with_state(this, |_, state| state.replay(list));
+        }
         ensure_state(list, record.resource, DEPTH_WRITE);
         if crate::resource::depth_and_unordered(record.resource) {
             crate::resource::DEPTH_UNORDERED[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1946,7 +2014,11 @@ mod state {
     }
     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
         super::count_dispatch();
-        with_state(this, |list, s| s.dispatch(list, x, y, z));
+        super::flush_early_textures(this);
+        with_state(this, |list, s| {
+            s.dispatch(list, x, y, z);
+            s.clear_early_flushed();
+        });
         super::maybe_cut_for_tdr(this);
     }
     /// `DispatchMesh(x, y, z)` (the PC method of List6); the title's mesh
@@ -2421,27 +2493,55 @@ const RAW_TEXTURE_WRITE_ACCESS: u32 = 0x8 /* RT */ | 0x10 /* UAV */ | 0x20 /* DS
 /// Sync scopes that can execute UAV/shader texture writes (or `SYNC_ALL`).
 const RAW_SHADER_OR_ALL_SYNC: u32 =
     0x1 /* ALL */ | 0x2 /* DRAW */ | 0x8 /* VS */ | 0x10 /* PS */ | 0x80 /* CS */ | 0x100 /* RT */ | 0x1000 /* ALL_SHADING */ | 0x2000 /* NON_PIXEL */ | 0x8000 /* CLEAR_UAV */;
+const RAW_ACCESS_RENDER_TARGET: u32 = 0x8;
 const RAW_ACCESS_UAV: u32 = 0x10;
+const RAW_ACCESS_SHADER_RESOURCE: u32 = 0x80;
+const RAW_ACCESS_COPY_DEST: u32 = 0x400;
 const RAW_SYNC_SPLIT: u32 = 0x8000_0000;
-/// `D3D12_BARRIER_LAYOUT_{COMMON, UNORDERED_ACCESS, DIRECT_QUEUE_UNORDERED_ACCESS, COMPUTE_QUEUE_UNORDERED_ACCESS}`.
+/// `D3D12_BARRIER_LAYOUT_*` constants for UAV and RTV/CopyDest -> SRV transitions.
 #[cfg(windows)]
 const RAW_LAYOUT_COMMON: u32 = windows::Win32::Graphics::Direct3D12::D3D12_BARRIER_LAYOUT_COMMON.0 as u32;
 #[cfg(windows)]
+const RAW_LAYOUT_RENDER_TARGET: u32 =
+    windows::Win32::Graphics::Direct3D12::D3D12_BARRIER_LAYOUT_RENDER_TARGET.0 as u32;
+#[cfg(windows)]
 const RAW_LAYOUT_UAV: u32 = windows::Win32::Graphics::Direct3D12::D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS.0 as u32;
+#[cfg(windows)]
+const RAW_LAYOUT_SHADER_RESOURCE: u32 =
+    windows::Win32::Graphics::Direct3D12::D3D12_BARRIER_LAYOUT_SHADER_RESOURCE.0 as u32;
+#[cfg(windows)]
+const RAW_LAYOUT_COPY_DEST: u32 =
+    windows::Win32::Graphics::Direct3D12::D3D12_BARRIER_LAYOUT_COPY_DEST.0 as u32;
 #[cfg(windows)]
 const RAW_LAYOUT_DIRECT_UAV: u32 =
     windows::Win32::Graphics::Direct3D12::D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_UNORDERED_ACCESS.0 as u32;
 #[cfg(windows)]
+const RAW_LAYOUT_DIRECT_SHADER_RESOURCE: u32 =
+    windows::Win32::Graphics::Direct3D12::D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_SHADER_RESOURCE.0 as u32;
+#[cfg(windows)]
 const RAW_LAYOUT_COMPUTE_UAV: u32 =
     windows::Win32::Graphics::Direct3D12::D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_UNORDERED_ACCESS.0 as u32;
+#[cfg(windows)]
+const RAW_LAYOUT_COMPUTE_SHADER_RESOURCE: u32 =
+    windows::Win32::Graphics::Direct3D12::D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_SHADER_RESOURCE.0 as u32;
 #[cfg(not(windows))]
 const RAW_LAYOUT_COMMON: u32 = 0;
 #[cfg(not(windows))]
+const RAW_LAYOUT_RENDER_TARGET: u32 = 2;
+#[cfg(not(windows))]
 const RAW_LAYOUT_UAV: u32 = 3;
+#[cfg(not(windows))]
+const RAW_LAYOUT_SHADER_RESOURCE: u32 = 6;
+#[cfg(not(windows))]
+const RAW_LAYOUT_COPY_DEST: u32 = 8;
 #[cfg(not(windows))]
 const RAW_LAYOUT_DIRECT_UAV: u32 = 20;
 #[cfg(not(windows))]
+const RAW_LAYOUT_DIRECT_SHADER_RESOURCE: u32 = 22;
+#[cfg(not(windows))]
 const RAW_LAYOUT_COMPUTE_UAV: u32 = 26;
+#[cfg(not(windows))]
+const RAW_LAYOUT_COMPUTE_SHADER_RESOURCE: u32 = 28;
 
 #[inline]
 fn raw_buffer_is_read_only(access_before: u32, access_after: u32) -> bool {
@@ -2481,21 +2581,56 @@ fn texture_barrier_needs_uav_sync(b: &TitleTextureBarrier) -> bool {
     uav_access || uav_layout || common_write
 }
 
-/// Decodes title `D3D12_BARRIER_GROUP` payloads, preserving UAV-touching
-/// texture barriers (bindless `RWTexture` & same-state `UAV->UAV`) as scoped
-/// global barriers while skipping pure non-UAV texture transitions already
-/// managed by `ensure_state()`, `SYNC_NONE` no-ops, split-begins, and
-/// read-to-read buffer barriers.
+/// Whether a `D3D12_BARRIER_TYPE_TEXTURE` barrier transitions a render-target
+/// or copy-destination texture into shader-readable state (`SHADER_RESOURCE`,
+/// or `COMMON` with shader sync) so bindless-sampled targets (such as
+/// decoration bake outputs never listed in a descriptor table) are transitioned
+/// out of `RENDER_TARGET`/`COPY_DEST` via `ensure_state()` instead of relying
+/// on descriptor-table scanning.
+#[inline]
+fn texture_barrier_needs_srv_transition(b: &TitleTextureBarrier) -> bool {
+    if b.resource.is_null() || b.sync_after == RAW_SYNC_SPLIT {
+        return false;
+    }
+    let from_write = (b.access_before & (RAW_ACCESS_RENDER_TARGET | RAW_ACCESS_COPY_DEST)) != 0
+        || b.layout_before == RAW_LAYOUT_RENDER_TARGET
+        || b.layout_before == RAW_LAYOUT_COPY_DEST;
+    if !from_write {
+        return false;
+    }
+    let to_srv = (b.access_after & RAW_ACCESS_SHADER_RESOURCE) != 0
+        || matches!(
+            b.layout_after,
+            RAW_LAYOUT_SHADER_RESOURCE
+                | RAW_LAYOUT_DIRECT_SHADER_RESOURCE
+                | RAW_LAYOUT_COMPUTE_SHADER_RESOURCE
+        )
+        || (b.access_after == 0
+            && b.layout_after == RAW_LAYOUT_COMMON
+            && (b.sync_after & RAW_SHADER_OR_ALL_SYNC) != 0);
+    to_srv
+}
+
+/// Decodes title `D3D12_BARRIER_GROUP` payloads, preserving:
+/// 1. UAV-touching texture barriers (bindless `RWTexture` & same-state `UAV->UAV`)
+///    as scoped global barriers,
+/// 2. `RENDER_TARGET`/`COPY_DEST` -> `SHADER_RESOURCE` texture transitions on
+///    known title textures (`tex_to_srv`) so bindless-sampled bake targets always
+///    leave `RENDER_TARGET`/`COPY_DEST` cleanly via `ensure_state()`, and
+/// 3. Write-hazard buffer barriers (`buffers`),
+/// while skipping pure read-to-read buffer barriers, `SYNC_NONE` no-ops, and
+/// split-begins.
 pub(super) fn decode_barrier_groups(
     count: u32,
     groups: *const u8,
-) -> (Vec<TitleGlobalBarrier>, Vec<DecodedBufferBarrier>) {
+) -> (Vec<TitleGlobalBarrier>, Vec<DecodedBufferBarrier>, Vec<u64>) {
     const MAX_GROUPS: usize = 1024;
     const MAX_PER_GROUP: usize = 4096;
     let mut globals = Vec::new();
     let mut buffers = Vec::new();
+    let mut tex_to_srv = Vec::new();
     if count == 0 || groups.is_null() {
-        return (globals, buffers);
+        return (globals, buffers, tex_to_srv);
     }
     let n = (count as usize).min(MAX_GROUPS);
     // SAFETY: title passed `count` `D3D12_BARRIER_GROUP` records.
@@ -2507,12 +2642,25 @@ pub(super) fn decode_barrier_groups(
         let m = (g.count as usize).min(MAX_PER_GROUP);
         match g.kind {
             BARRIER_TYPE_TEXTURE => {
-                // Non-UAV texture transitions (RTV/DSV/copy/SRV) are tracked by `ensure_state()`,
-                // but bindless `RWTexture` write->read and same-state `UAV->UAV` hazards are NOT;
-                // fold UAV-touching texture barriers into deduplicated scoped global barriers.
                 // SAFETY: `g.ptr` points to `g.count` `D3D12_TEXTURE_BARRIER` records.
                 let items = unsafe { std::slice::from_raw_parts(g.ptr.cast::<TitleTextureBarrier>(), m) };
                 for b in items {
+                    let srv_trans = texture_barrier_needs_srv_transition(b);
+                    if srv_trans {
+                        let ptr = b.resource as usize as u64;
+                        if !tex_to_srv.contains(&ptr) {
+                            tex_to_srv.push(ptr);
+                        }
+                        // Pure `RENDER_TARGET`/`COPY_DEST -> SHADER_RESOURCE`/`COMMON` transitions
+                        // without UAV access/layout are handled directly by `ensure_state()` on the
+                        // texture itself; do not also fold them into a `D3D12_GLOBAL_BARRIER`.
+                        let touches_uav = ((b.access_before | b.access_after) & RAW_ACCESS_UAV) != 0
+                            || raw_is_uav_layout(b.layout_before)
+                            || raw_is_uav_layout(b.layout_after);
+                        if !touches_uav {
+                            continue;
+                        }
+                    }
                     if !texture_barrier_needs_uav_sync(b) {
                         continue;
                     }
@@ -2565,7 +2713,7 @@ pub(super) fn decode_barrier_groups(
             _ => {}
         }
     }
-    (globals, buffers)
+    (globals, buffers, tex_to_srv)
 }
 
 #[cfg(windows)]
@@ -2947,6 +3095,7 @@ pub(super) fn emit_barrier_groups(
     has_payload: bool,
     globals: &[TitleGlobalBarrier],
     buffers: &[DecodedBufferBarrier],
+    tex_to_srv: &[u64],
 ) {
     #[cfg(windows)]
     {
@@ -2957,6 +3106,20 @@ pub(super) fn emit_barrier_groups(
             with_state(this, |_, state| state.synced());
             return;
         };
+        // Transition any bindless-sampled texture moving out of `RENDER_TARGET` or
+        // `COPY_DEST` into `ALL_SHADER_RESOURCE` via safe legacy `ensure_state()`
+        // on the texture itself (never folded into a `D3D12_GLOBAL_BARRIER` `id=1331`).
+        const ALL_SHADER_RESOURCE: u32 = 0x40 | 0x80;
+        for &res_raw in tex_to_srv {
+            let res = res_raw as usize as This;
+            if !res.is_null() && crate::resource::host_resource(res).is_some() {
+                list.twin_use(res, false, false);
+                if list.flush_late_depth_planes() {
+                    with_state(this, |_, state| state.replay(list));
+                }
+                ensure_state(list, res, ALL_SHADER_RESOURCE);
+            }
+        }
         if enhanced_barriers_on() && has_payload {
             if globals.is_empty() && buffers.is_empty() {
                 return;
@@ -3160,7 +3323,7 @@ pub(super) fn emit_barrier_groups(
         list.clear_uav_dirty();
     }
     #[cfg(not(windows))]
-    let _ = (this, orig_count, has_payload, globals, buffers);
+    let _ = (this, orig_count, has_payload, globals, buffers, tex_to_srv);
 }
 
 /// The enhanced barriers `(group count, groups)`: buffer, texture and
@@ -3170,11 +3333,11 @@ extern "system" fn barrier_groups(this: This, count: u32, groups: *const u8) {
         return;
     }
     if groups.is_null() {
-        emit_barrier_groups(this, count, false, &[], &[]);
+        emit_barrier_groups(this, count, false, &[], &[], &[]);
         return;
     }
-    let (globals, buffers) = decode_barrier_groups(count, groups);
-    emit_barrier_groups(this, count, true, &globals, &buffers);
+    let (globals, buffers, tex_to_srv) = decode_barrier_groups(count, groups);
+    emit_barrier_groups(this, count, true, &globals, &buffers, &tex_to_srv);
 }
 
 /// The bottom-of-pipe value writes `(address, value, flush, flags)`, 32 and
@@ -3632,8 +3795,8 @@ mod tests {
             count: non_uav_tex.len() as u32,
             ptr: non_uav_tex.as_ptr().cast(),
         };
-        let (g, b) = decode_barrier_groups(1, (&raw const tex_group).cast());
-        assert!(g.is_empty() && b.is_empty(), "non-UAV texture transitions must be skipped");
+        let (g, b, t) = decode_barrier_groups(1, (&raw const tex_group).cast());
+        assert!(g.is_empty() && b.is_empty() && t.is_empty(), "non-UAV null-resource texture transitions must be skipped");
 
         // UAV-touching texture barriers (bindless UAV->SRV, same-state UAV->UAV, Layout=UAV + COMMON)
         // MUST be preserved and deduplicated into scoped global barriers.
@@ -3692,9 +3855,9 @@ mod tests {
             count: uav_tex.len() as u32,
             ptr: uav_tex.as_ptr().cast(),
         };
-        let (ug, ub) = decode_barrier_groups(1, (&raw const uav_tex_group).cast());
+        let (ug, ub, ut) = decode_barrier_groups(1, (&raw const uav_tex_group).cast());
         assert_eq!(ug.len(), 3, "3 distinct UAV-touching texture barriers must be preserved & deduplicated");
-        assert!(ub.is_empty());
+        assert!(ub.is_empty() && ut.is_empty());
 
         // SYNC_NONE, split-begin, and read-to-read buffer barriers are dropped; UAV->SRV & global kept.
         let buf_barriers = [
@@ -3758,9 +3921,10 @@ mod tests {
                 ptr: glob_barriers.as_ptr().cast(),
             },
         ];
-        let (g, b) = decode_barrier_groups(groups.len() as u32, groups.as_ptr().cast());
+        let (g, b, t) = decode_barrier_groups(groups.len() as u32, groups.as_ptr().cast());
         assert_eq!(g.len(), 1);
         assert_eq!(b.len(), 1);
+        assert!(t.is_empty(), "null-resource texture barriers do not enqueue tex_to_srv");
         assert_eq!(b[0].sync_before, D3D12_BARRIER_SYNC_COMPUTE_SHADING.0 as u32);
         assert_eq!(b[0].sync_after, D3D12_BARRIER_SYNC_PIXEL_SHADING.0 as u32);
 
@@ -3835,8 +3999,45 @@ mod tests {
             count: one_sided_tex.len() as u32,
             ptr: one_sided_tex.as_ptr().cast(),
         };
-        let (osg, osb) = decode_barrier_groups(1, (&raw const one_sided_group).cast());
-        assert!(osg.is_empty() && osb.is_empty(), "one-sided SYNC_NONE texture barriers must be skipped");
+        let (osg, osb, ost) = decode_barrier_groups(1, (&raw const one_sided_group).cast());
+        assert!(osg.is_empty() && osb.is_empty() && ost.is_empty(), "one-sided SYNC_NONE texture barriers must be skipped");
+
+        // Bindless RTV/COPY_DEST -> SHADER_RESOURCE texture barriers on non-null resources
+        // produce `tex_to_srv` legacy transitions without folding into `D3D12_GLOBAL_BARRIER`.
+        let fake_rtv_res = 0x1234_5678usize as This;
+        let fake_copy_res = 0x8765_4320usize as This;
+        let rtv_to_srv_tex = [
+            TitleTextureBarrier {
+                sync_before: D3D12_BARRIER_SYNC_RENDER_TARGET.0 as u32,
+                sync_after: D3D12_BARRIER_SYNC_PIXEL_SHADING.0 as u32,
+                access_before: D3D12_BARRIER_ACCESS_RENDER_TARGET.0 as u32,
+                access_after: D3D12_BARRIER_ACCESS_SHADER_RESOURCE.0 as u32,
+                layout_before: D3D12_BARRIER_LAYOUT_RENDER_TARGET.0 as u32,
+                layout_after: D3D12_BARRIER_LAYOUT_SHADER_RESOURCE.0 as u32,
+                resource: fake_rtv_res,
+                subresources: [0; 6],
+                flags: 0,
+            },
+            TitleTextureBarrier {
+                sync_before: D3D12_BARRIER_SYNC_COPY.0 as u32,
+                sync_after: D3D12_BARRIER_SYNC_COMPUTE_SHADING.0 as u32,
+                access_before: D3D12_BARRIER_ACCESS_COPY_DEST.0 as u32,
+                access_after: D3D12_BARRIER_ACCESS_COMMON.0 as u32,
+                layout_before: D3D12_BARRIER_LAYOUT_COPY_DEST.0 as u32,
+                layout_after: D3D12_BARRIER_LAYOUT_COMMON.0 as u32,
+                resource: fake_copy_res,
+                subresources: [0; 6],
+                flags: 0,
+            },
+        ];
+        let rtv_srv_group = TitleBarrierGroup {
+            kind: BARRIER_TYPE_TEXTURE,
+            count: rtv_to_srv_tex.len() as u32,
+            ptr: rtv_to_srv_tex.as_ptr().cast(),
+        };
+        let (rg, rb, rt) = decode_barrier_groups(1, (&raw const rtv_srv_group).cast());
+        assert!(rg.is_empty() && rb.is_empty(), "RTV/COPY_DEST->SRV must not fold into global/buffer barriers");
+        assert_eq!(rt, vec![fake_rtv_res as usize as u64, fake_copy_res as usize as u64]);
 
         // Non-UAV buffer sanitization strips UNORDERED_ACCESS and keeps legal COPY/SRV syncs.
         let (sb, sa, ab, aa) = enhanced::sanitize_pair_with_uav(
@@ -4268,7 +4469,7 @@ mod tests {
             addr: 0,
             len: 0,
         }];
-        emit_barrier_groups(list, 1, true, &[], &miss_buf);
+        emit_barrier_groups(list, 1, true, &[], &miss_buf, &[]);
         hl.mark_uav_write();
 
         // 2. Targeted `D3D12_BUFFER_BARRIER`s on live `shadow.buffer` (incl. COMMON-on-COMPUTE sanitizer).
@@ -4298,7 +4499,7 @@ mod tests {
                 len: BUF_LEN as u64,
             },
         ];
-        emit_barrier_groups(list, 1, true, &[], &buf_barriers);
+        emit_barrier_groups(list, 1, true, &[], &buf_barriers, &[]);
         assert!(
             hl.uav_dirty(),
             "targeted buffer barriers alone must not clear uav_dirty for unrelated buffers"
@@ -4333,7 +4534,7 @@ mod tests {
                 access_after: D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0 as u32,
             },
         ];
-        emit_barrier_groups(list, 1, true, &glob_barriers, &[]);
+        emit_barrier_groups(list, 1, true, &glob_barriers, &[], &[]);
         assert!(!hl.uav_dirty(), "global barrier must clear uav_dirty");
 
         // 4. Non-UAV `DEFAULT` buffer (`D3D12_RESOURCE_FLAG_NONE`) + `COMPUTE` command list
@@ -4435,6 +4636,211 @@ mod tests {
             non_uav_buf
         };
 
+        // 5. Live RTX 3090 Debug Layer regression checks for Phase 10A Track 2:
+        //    (a) `ambient::after` for `Role::Radiance` & `Role::Air` with `depth: None` -> 0 `id=646` errors.
+        //    (b) `copy_resource(dsv, dsv)` self-copy on 2-subresource depth-stencil -> guarded, 0 `id=538` errors.
+        //    (c) `barrier_groups` `RENDER_TARGET -> SHADER_RESOURCE` on live title RTV texture -> `ensure_state`
+        //        transitions cleanly to `ALL_SHADER_RESOURCE` with 0 `id=1331` / state errors.
+        let (_amb_heap, _amb_2d, _amb_3d, title_rtv, title_dsv) = unsafe {
+            let amb_heap: ID3D12DescriptorHeap = host
+                .device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: 2,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
+                .expect("ambient test descriptor heap");
+            let step = host
+                .device
+                .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            let mut amb_2d: Option<ID3D12Resource> = None;
+            host.device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_DEFAULT,
+                        ..Default::default()
+                    },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                        Width: 64,
+                        Height: 36,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R11G11B10_FLOAT,
+                        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                            Count: 1,
+                            Quality: 0,
+                        },
+                        Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+                        Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                        ..Default::default()
+                    },
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    None,
+                    &mut amb_2d,
+                )
+                .expect("ambient 2D UAV");
+            let amb_2d = amb_2d.unwrap();
+            let mut amb_3d: Option<ID3D12Resource> = None;
+            host.device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_DEFAULT,
+                        ..Default::default()
+                    },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE3D,
+                        Width: 16,
+                        Height: 16,
+                        DepthOrArraySize: 4,
+                        MipLevels: 1,
+                        Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R11G11B10_FLOAT,
+                        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                            Count: 1,
+                            Quality: 0,
+                        },
+                        Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+                        Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                        ..Default::default()
+                    },
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    None,
+                    &mut amb_3d,
+                )
+                .expect("ambient 3D UAV");
+            let amb_3d = amb_3d.unwrap();
+            let cpu0 = amb_heap.GetCPUDescriptorHandleForHeapStart();
+            let cpu1 = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: cpu0.ptr + step as usize };
+            host.device.CreateUnorderedAccessView(&amb_2d, None, None, cpu0);
+            host.device.CreateUnorderedAccessView(&amb_3d, None, None, cpu1);
+            let gpu0 = amb_heap.GetGPUDescriptorHandleForHeapStart();
+            let gpu1 = D3D12_GPU_DESCRIPTOR_HANDLE { ptr: gpu0.ptr + u64::from(step) };
+            hl.list.SetDescriptorHeaps(&[Some(amb_heap.clone())]);
+            assert!(
+                crate::ambient::after(
+                    hl,
+                    crate::ambient::Role::Radiance,
+                    &crate::ambient::Views {
+                        image: gpu0,
+                        depth: None,
+                        size: [64, 36],
+                        slices: 1,
+                    },
+                ),
+                "ambient Role::Radiance must run with depth=None (0 id=646 errors)"
+            );
+            assert!(
+                crate::ambient::after(
+                    hl,
+                    crate::ambient::Role::Air,
+                    &crate::ambient::Views {
+                        image: gpu1,
+                        depth: None,
+                        size: [16, 16],
+                        slices: 4,
+                    },
+                ),
+                "ambient Role::Air must run with depth=None (0 id=646 errors)"
+            );
+
+            // Title RTV + 2-subresource DSV textures created via `resource::create_committed`.
+            const _: () = assert!(size_of::<D3D12_HEAP_PROPERTIES>() == size_of::<crate::resource::HeapProperties>());
+            const _: () = assert!(size_of::<D3D12_RESOURCE_DESC>() == size_of::<crate::resource::ResourceDesc>());
+            let res_iid = crate::object::guid(
+                0x696442be,
+                0xa72e,
+                0x4059,
+                [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+            );
+            let def_heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_DEFAULT,
+                ..Default::default()
+            };
+            let rtv_desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 16,
+                Height: 16,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM,
+                SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                ..Default::default()
+            };
+            let mut title_rtv: This = std::ptr::null();
+            assert_eq!(
+                crate::resource::create_committed(
+                    std::ptr::null(),
+                    (&raw const def_heap).cast(),
+                    0,
+                    (&raw const rtv_desc).cast(),
+                    0,
+                    std::ptr::null(),
+                    &res_iid,
+                    &mut title_rtv,
+                ),
+                S_OK
+            );
+            // Seed tracked state at COMMON (matching newly committed resource), move to RTV,
+            // then test bindless `RENDER_TARGET -> SHADER_RESOURCE` transition via `barrier_groups`.
+            ensure_state(hl, title_rtv, 0);
+            ensure_state(hl, title_rtv, 0x4 /* RENDER_TARGET */);
+            let rtv_to_srv = [TitleTextureBarrier {
+                sync_before: D3D12_BARRIER_SYNC_RENDER_TARGET.0 as u32,
+                sync_after: D3D12_BARRIER_SYNC_PIXEL_SHADING.0 as u32,
+                access_before: D3D12_BARRIER_ACCESS_RENDER_TARGET.0 as u32,
+                access_after: D3D12_BARRIER_ACCESS_SHADER_RESOURCE.0 as u32,
+                layout_before: D3D12_BARRIER_LAYOUT_RENDER_TARGET.0 as u32,
+                layout_after: D3D12_BARRIER_LAYOUT_SHADER_RESOURCE.0 as u32,
+                resource: title_rtv,
+                subresources: [0; 6],
+                flags: 0,
+            }];
+            let rtv_srv_group = TitleBarrierGroup {
+                kind: BARRIER_TYPE_TEXTURE,
+                count: 1,
+                ptr: rtv_to_srv.as_ptr().cast(),
+            };
+            barrier_groups(list, 1, (&raw const rtv_srv_group).cast());
+
+            let dsv_desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 16,
+                Height: 16,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
+                SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+                ..Default::default()
+            };
+            let mut title_dsv: This = std::ptr::null();
+            assert_eq!(
+                crate::resource::create_committed(
+                    std::ptr::null(),
+                    (&raw const def_heap).cast(),
+                    0,
+                    (&raw const dsv_desc).cast(),
+                    0,
+                    std::ptr::null(),
+                    &res_iid,
+                    &mut title_dsv,
+                ),
+                S_OK
+            );
+            ensure_state(hl, title_dsv, 0);
+            ensure_state(hl, title_dsv, COPY_SOURCE);
+            // Self-copy on a 2-subresource depth-stencil texture must be guarded (0 `id=538` errors).
+            copy_resource(list, title_dsv, title_dsv);
+
+            (amb_heap, amb_2d, amb_3d, title_rtv, title_dsv)
+        };
+
         // Close and execute on a live Direct queue to force full GPU + Debug Layer validation.
         close(list);
         let cmd: ID3D12CommandList = hl.list.cast().expect("ID3D12CommandList");
@@ -4455,6 +4861,9 @@ mod tests {
             WaitForSingleObject(event, INFINITE);
             let _ = CloseHandle(event);
         }
+        type ReleaseFn = extern "system" fn(This) -> u32;
+        crate::object::slot::<ReleaseFn>(title_rtv, 0x10)(title_rtv);
+        crate::object::slot::<ReleaseFn>(title_dsv, 0x10)(title_dsv);
         drop(shadow);
         crate::shadow::unregister(FAKE_RES, mem as u64);
 

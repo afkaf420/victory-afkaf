@@ -615,24 +615,78 @@ impl Drop for Tiled {
     }
 }
 
-/// Keeps a two-dimensional shader view from the levels before `first` of a
-/// texture of `levels` levels: it starts at `first` if it started before
-/// it, and shows as many levels fewer. A sample then lands on the first
-/// level that has memory instead of reading zeros from one that has none;
-/// level numbers and sizes a shader asks for count from that level.
+/// Clamps mip selection on a shader view so levels finer than `first`
+/// (without memory or not yet uploaded) are never sampled.
+///
+/// Prefers `ResourceMinLODClamp` when `MostDetailedMip == 0` and `first` lies
+/// inside the view's mip range, preserving full mip-chain geometry for
+/// `GetDimensions` and `SampleLevel(..., 0)`. Falls back to shifting
+/// `MostDetailedMip` (with `ResourceMinLODClamp = 0.0`) only when the title
+/// already set `MostDetailedMip > 0` or a narrower `MipLevels`, because D3D12
+/// forbids combining non-zero `MostDetailedMip` with non-zero
+/// `ResourceMinLODClamp`.
+fn clamp_lod(
+    most_detailed_mip: &mut u32,
+    mip_levels: &mut u32,
+    min_lod_clamp: &mut f32,
+    first: u32,
+    levels: u32,
+) {
+    if first == 0 || first >= levels || first <= *most_detailed_mip {
+        return;
+    }
+    if *most_detailed_mip == 0 {
+        let effective_mips = if *mip_levels == u32::MAX {
+            levels
+        } else {
+            (*mip_levels).min(levels)
+        };
+        if first < effective_mips {
+            *min_lod_clamp = (*min_lod_clamp).max(first as f32);
+            return;
+        }
+    }
+    let fewer = first - *most_detailed_mip;
+    *most_detailed_mip = first;
+    *min_lod_clamp = 0.0;
+    if *mip_levels != u32::MAX {
+        *mip_levels = (*mip_levels).saturating_sub(fewer).max(1);
+    }
+}
+
+/// Keeps a shader view from sampling levels before `first` of a texture of
+/// `levels` levels via `ResourceMinLODClamp` (preserving `MostDetailedMip` and
+/// `MipLevels` so `GetDimensions` and `SampleLevel(..., 0)` keep full texture
+/// geometry instead of shifting to a smaller mip).
 pub(crate) fn show_from(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, first: u32, levels: u32) {
-    if desc.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2D || first >= levels {
+    if first == 0 || first >= levels {
         return;
     }
-    // SAFETY: a 2D view's member of the union.
-    let view = unsafe { &mut desc.Anonymous.Texture2D };
-    if first <= view.MostDetailedMip {
-        return;
-    }
-    let fewer = first - view.MostDetailedMip;
-    view.MostDetailedMip = first;
-    if view.MipLevels != u32::MAX {
-        view.MipLevels = view.MipLevels.saturating_sub(fewer).max(1);
+    // SAFETY: each match arm accesses the exact union member named by `ViewDimension`.
+    unsafe {
+        match desc.ViewDimension {
+            D3D12_SRV_DIMENSION_TEXTURE2D => {
+                let v = &mut desc.Anonymous.Texture2D;
+                clamp_lod(&mut v.MostDetailedMip, &mut v.MipLevels, &mut v.ResourceMinLODClamp, first, levels);
+            }
+            D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+                let v = &mut desc.Anonymous.Texture2DArray;
+                clamp_lod(&mut v.MostDetailedMip, &mut v.MipLevels, &mut v.ResourceMinLODClamp, first, levels);
+            }
+            D3D12_SRV_DIMENSION_TEXTURECUBE => {
+                let v = &mut desc.Anonymous.TextureCube;
+                clamp_lod(&mut v.MostDetailedMip, &mut v.MipLevels, &mut v.ResourceMinLODClamp, first, levels);
+            }
+            D3D12_SRV_DIMENSION_TEXTURECUBEARRAY => {
+                let v = &mut desc.Anonymous.TextureCubeArray;
+                clamp_lod(&mut v.MostDetailedMip, &mut v.MipLevels, &mut v.ResourceMinLODClamp, first, levels);
+            }
+            D3D12_SRV_DIMENSION_TEXTURE3D => {
+                let v = &mut desc.Anonymous.Texture3D;
+                clamp_lod(&mut v.MostDetailedMip, &mut v.MipLevels, &mut v.ResourceMinLODClamp, first, levels);
+            }
+            _ => {}
+        }
     }
 }
 
@@ -1273,7 +1327,8 @@ void look() {
             };
             let mut shown = as_asked;
             show_from(&mut shown, tiled.first_shown()?, u32::from(LEVELS));
-            assert_eq!(shown.Anonymous.Texture2D.MostDetailedMip, 1);
+            assert_eq!(shown.Anonymous.Texture2D.MostDetailedMip, 0);
+            assert_eq!(shown.Anonymous.Texture2D.ResourceMinLODClamp, 1.0);
             let step = rig.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
             let mut at = views.GetCPUDescriptorHandleForHeapStart();
             rig.device.CreateShaderResourceView(&texture, Some(&raw const shown), at);
@@ -1433,5 +1488,86 @@ void look() {
         assert!(!resolve_levels_on_demand(Some(" 0 "), false));
         assert!(resolve_levels_on_demand(Some("1"), false));
         assert!(resolve_levels_on_demand(Some(" 1 "), true));
+    }
+
+    #[test]
+    fn show_from_clamps_via_resource_min_lod_clamp_preserving_mip_geometry() {
+        // Standard 2D full-chain view: clamps via `ResourceMinLODClamp`,
+        // leaving `MostDetailedMip = 0` and `MipLevels = u32::MAX` intact so
+        // `GetDimensions` and `SampleLevel(..., 0)` keep full geometry.
+        let mut srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_BC7_UNORM,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: 5768,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV {
+                    MostDetailedMip: 0,
+                    MipLevels: u32::MAX,
+                    PlaneSlice: 0,
+                    ResourceMinLODClamp: 0.0,
+                },
+            },
+        };
+        show_from(&mut srv, 3, 11);
+        // SAFETY: 2D SRV union member.
+        unsafe {
+            assert_eq!(srv.Anonymous.Texture2D.MostDetailedMip, 0);
+            assert_eq!(srv.Anonymous.Texture2D.MipLevels, u32::MAX);
+            assert_eq!(srv.Anonymous.Texture2D.ResourceMinLODClamp, 3.0);
+        }
+
+        // Never loosens an existing stricter title clamp.
+        srv.Anonymous.Texture2D.ResourceMinLODClamp = 5.0;
+        show_from(&mut srv, 3, 11);
+        // SAFETY: 2D SRV union member.
+        unsafe {
+            assert_eq!(srv.Anonymous.Texture2D.ResourceMinLODClamp, 5.0);
+        }
+
+        // View that already set `MostDetailedMip > 0`: D3D12 forbids combining
+        // non-zero `MostDetailedMip` and `ResourceMinLODClamp`, so fall back to
+        // shifting `MostDetailedMip` cleanly with `ResourceMinLODClamp == 0.0`.
+        let mut shifted = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_BC7_UNORM,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: 5768,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV {
+                    MostDetailedMip: 1,
+                    MipLevels: 10,
+                    PlaneSlice: 0,
+                    ResourceMinLODClamp: 0.0,
+                },
+            },
+        };
+        show_from(&mut shifted, 3, 11);
+        // SAFETY: 2D SRV union member.
+        unsafe {
+            assert_eq!(shifted.Anonymous.Texture2D.MostDetailedMip, 3);
+            assert_eq!(shifted.Anonymous.Texture2D.MipLevels, 8);
+            assert_eq!(shifted.Anonymous.Texture2D.ResourceMinLODClamp, 0.0);
+        }
+
+        // Single-mip view of mip 0 when only mip 3+ is resident: shift to mip 3.
+        let mut single = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_BC7_UNORM,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: 5768,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV {
+                    MostDetailedMip: 0,
+                    MipLevels: 1,
+                    PlaneSlice: 0,
+                    ResourceMinLODClamp: 0.0,
+                },
+            },
+        };
+        show_from(&mut single, 3, 11);
+        // SAFETY: 2D SRV union member.
+        unsafe {
+            assert_eq!(single.Anonymous.Texture2D.MostDetailedMip, 3);
+            assert_eq!(single.Anonymous.Texture2D.MipLevels, 1);
+            assert_eq!(single.Anonymous.Texture2D.ResourceMinLODClamp, 0.0);
+        }
     }
 }

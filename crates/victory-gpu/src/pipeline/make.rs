@@ -95,7 +95,7 @@ fn scene_input(shaders: &[Arc<Shader>]) -> bool {
                 | "ebe4e53f031f5249"
                 | "2cc4c197ee29e291"
                 | "369cbe906ea72764"
-        ) || crate::draw::BAKE_PIXEL_SHADERS.contains(&s.hash.as_str())
+        ) || super::host::is_bake_shader(s)
     })
 }
 
@@ -169,7 +169,28 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
 /// Signalled whenever a worker has made a pipeline.
 static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
-/// Waiting allowed per title frame, over all threads.
+/// Whether first-use pipeline compilation blocks until ready instead of
+/// dropping draws past the 500 ms frame wait budget (`VICTORY_SYNC_PIPELINES`,
+/// default ON = `1` for Zero-Drop Correctness Mode; `0`/`off`/`false` restores
+/// the bounded async wait budget).
+fn resolve_sync_pipelines(env: Option<&str>) -> bool {
+    !matches!(
+        env.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("0" | "off" | "false")
+    )
+}
+
+fn sync_pipelines() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let env = std::env::var("VICTORY_SYNC_PIPELINES").ok();
+        let on = resolve_sync_pipelines(env.as_deref());
+        tracing::info!(sync = on, "host pipeline first-use compilation mode (VICTORY_SYNC_PIPELINES)");
+        on
+    })
+}
+
+/// Waiting allowed per title frame, over all threads (when `VICTORY_SYNC_PIPELINES=0`).
 fn wait_budget() -> Duration {
     static BUDGET: OnceLock<Duration> = OnceLock::new();
     *BUDGET.get_or_init(|| {
@@ -208,9 +229,13 @@ pub(crate) fn waiting() -> u64 {
     WAITING.load(Ordering::Relaxed)
 }
 
-/// The host pipeline if it is made (or is made within the frame's budget);
-/// queues it on first use.
+/// The host pipeline if it is made (or blocks/waits according to
+/// `VICTORY_SYNC_PIPELINES`); queues it on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
+    ready_with(p, sync_pipelines())
+}
+
+fn ready_with(p: &Arc<Pending>, sync: bool) -> Option<&HostPipeline> {
     if p.left_out.is_some() {
         crate::draw::set_last_left_out(true);
         return None;
@@ -223,9 +248,33 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     }
     if p.made.get().is_none() {
         start(p, REQUESTED);
-        wait(p, crate::frame::current());
+        if sync {
+            // Zero-drop correctness mode (default `VICTORY_SYNC_PIPELINES=1`):
+            // wait on the worker pool until `p.make()` finishes so Run #1 never
+            // drops one-shot init/bake/probe/LUT draws past a 500 ms cap.
+            wait_until_ready(p);
+        } else {
+            wait(p, crate::frame::current());
+        }
     }
     p.made.get()?.as_ref()
+}
+
+/// Blocks on `DONE` until `p.make()` has populated `p.made`.
+fn wait_until_ready(p: &Pending) {
+    #[cfg(feature = "diagnostics")]
+    let started = Instant::now();
+    let (lock, done) = &DONE;
+    let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
+    while p.made.get().is_none() {
+        held = done.wait(held).unwrap_or_else(|e| e.into_inner());
+    }
+    drop(held);
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(
+        crate::copystat::C::PipelineWaitUs,
+        started.elapsed().as_micros() as u64,
+    );
 }
 
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
@@ -495,7 +544,9 @@ mod tests {
         let p = Arc::new(p);
 
         assert!(!super::super::library::wanted_early(&p.key));
-        assert!(ready(&p).is_none());
+        // Under bounded async mode (`VICTORY_SYNC_PIPELINES=0`), a still-making
+        // pipeline times out cleanly while still recording itself for next launch.
+        assert!(ready_with(&p, false).is_none());
         assert!(p.made.get().is_none());
         assert!(super::super::library::wanted_early(&p.key));
     }
@@ -592,5 +643,29 @@ mod tests {
         assert!(Arc::ptr_eq(&queue.pop(true).unwrap(), &screen));
         assert!(queue.pop(true).is_none());
         assert!(Arc::ptr_eq(&queue.pop(false).unwrap(), &world));
+
+        // Container-name bake detection covers all pixel & compute decoration/skin bake families.
+        for &(stage, name) in &[
+            ("pixel", b"PS_BakeDecorations_0101" as &[u8]),
+            ("pixel", b"PS_DecorationBlend_0011_ff00f5de_Wrapped"),
+            ("compute", b"decoration_blend:CS_DecorationCopy"),
+            ("compute", b"decoration_blend:CS_DecorationDilate"),
+            ("compute", b"ped_skin_processing:CS_SunTanUpdate"),
+            ("pixel", b"PS_CompositeNMB"),
+        ] {
+            let p = Pending::new(vec![fake_shader(stage, "0000000000000000", name)], None);
+            assert!(p.scene_input, "expected scene_input=true for {:?}", String::from_utf8_lossy(name));
+            assert!(p.screen);
+        }
+        let regular = Pending::new(vec![fake_shader("compute", "0000000000000000", b"CS_Other")], None);
+        assert!(!regular.scene_input);
+
+        // VICTORY_SYNC_PIPELINES defaults ON (Zero-Drop Correctness Mode) and honors =0/off/false.
+        assert!(resolve_sync_pipelines(None));
+        assert!(resolve_sync_pipelines(Some("1")));
+        assert!(resolve_sync_pipelines(Some("")));
+        assert!(!resolve_sync_pipelines(Some("0")));
+        assert!(!resolve_sync_pipelines(Some("off")));
+        assert!(!resolve_sync_pipelines(Some("false")));
     }
 }

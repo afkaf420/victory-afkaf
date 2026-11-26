@@ -650,6 +650,7 @@ impl HostPipeline {
                 Err(e) => tracing::warn!(error = %e, ?shaders, "no rectangle geometry stage"),
             }
         }
+        let blend = sanitize_blend_for_targets(g.blend, &g.targets);
         let mut desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
             // SAFETY: a borrowed pointer the description never releases.
             pRootSignature: unsafe { std::mem::transmute_copy(&root) },
@@ -661,7 +662,7 @@ impl HostPipeline {
                     BytecodeLength: gs.len(),
                 }
             }),
-            BlendState: g.blend,
+            BlendState: blend,
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
             DepthStencilState: g.depth,
@@ -868,6 +869,102 @@ fn graphics_depth_bounds_pipeline(
     }
 }
 
+/// Container name prefixes for all pixel & compute decoration, skin, and
+/// composite bake shaders (`357` variants in the shader archive) that sample
+/// bindless textures into persistent targets and therefore require every due
+/// texture to be uploaded and flipped before drawing/dispatching.
+const BAKE_SHADER_NAMES: [&[u8]; 6] = [
+    b"PS_BakeDecorations",
+    b"PS_DecorationBlend",
+    b"CS_DecorationCopy",
+    b"CS_DecorationDilate",
+    b"CS_SunTanUpdate",
+    b"PS_Composite",
+];
+
+/// Whether `shader` is a decoration/skin/composite bake shader (pixel or
+/// compute), matched by container name prefix or legacy [`crate::draw::BAKE_PIXEL_SHADERS`] hash.
+pub(crate) fn is_bake_shader(shader: &Shader) -> bool {
+    crate::draw::BAKE_PIXEL_SHADERS.contains(&shader.hash.as_str())
+        || BAKE_SHADER_NAMES
+            .iter()
+            .any(|name| shader.container.windows(name.len()).any(|w| w == *name))
+}
+
+/// Whether `format` is an integer (`*_UINT` / `*_SINT`) render-target format
+/// that PC D3D12 does not support blending on (`CreateGraphicsPipelineState`
+/// `id=676`). Console hardware ignores `BlendEnable` on integer render targets.
+fn is_integer_rt_format(format: DXGI_FORMAT) -> bool {
+    matches!(
+        format,
+        DXGI_FORMAT_R32G32B32A32_UINT
+            | DXGI_FORMAT_R32G32B32A32_SINT
+            | DXGI_FORMAT_R32G32B32_UINT
+            | DXGI_FORMAT_R32G32B32_SINT
+            | DXGI_FORMAT_R16G16B16A16_UINT
+            | DXGI_FORMAT_R16G16B16A16_SINT
+            | DXGI_FORMAT_R32G32_UINT
+            | DXGI_FORMAT_R32G32_SINT
+            | DXGI_FORMAT_R10G10B10A2_UINT
+            | DXGI_FORMAT_R8G8B8A8_UINT
+            | DXGI_FORMAT_R8G8B8A8_SINT
+            | DXGI_FORMAT_R16G16_UINT
+            | DXGI_FORMAT_R16G16_SINT
+            | DXGI_FORMAT_R32_UINT
+            | DXGI_FORMAT_R32_SINT
+            | DXGI_FORMAT_R8G8_UINT
+            | DXGI_FORMAT_R8G8_SINT
+            | DXGI_FORMAT_R16_UINT
+            | DXGI_FORMAT_R16_SINT
+            | DXGI_FORMAT_R8_UINT
+            | DXGI_FORMAT_R8_SINT
+    )
+}
+
+/// Sanitizes `blend` against `targets` for PC D3D12: disables `BlendEnable`
+/// and `LogicOpEnable` on any integer (`*_UINT` / `*_SINT`) render-target slot.
+/// When `IndependentBlendEnable` is `false` and slot 0 has blending enabled,
+/// clones slot 0 across slots `1..8` and enables `IndependentBlendEnable` so
+/// float render targets preserve their exact blend state while integer targets
+/// bypass blending cleanly (matching console GPU semantics).
+fn sanitize_blend_for_targets(
+    mut blend: D3D12_BLEND_DESC,
+    targets: &D3D12_RT_FORMAT_ARRAY,
+) -> D3D12_BLEND_DESC {
+    let count = (targets.NumRenderTargets as usize).min(8);
+    let mut needs_fix = false;
+    for i in 0..count {
+        if is_integer_rt_format(targets.RTFormats[i]) {
+            let eff = if blend.IndependentBlendEnable.as_bool() {
+                &blend.RenderTarget[i]
+            } else {
+                &blend.RenderTarget[0]
+            };
+            if eff.BlendEnable.as_bool() || eff.LogicOpEnable.as_bool() {
+                needs_fix = true;
+                break;
+            }
+        }
+    }
+    if !needs_fix {
+        return blend;
+    }
+    if !blend.IndependentBlendEnable.as_bool() {
+        let rt0 = blend.RenderTarget[0];
+        for rt in &mut blend.RenderTarget[1..8] {
+            *rt = rt0;
+        }
+        blend.IndependentBlendEnable = true.into();
+    }
+    for i in 0..count {
+        if is_integer_rt_format(targets.RTFormats[i]) {
+            blend.RenderTarget[i].BlendEnable = false.into();
+            blend.RenderTarget[i].LogicOpEnable = false.into();
+        }
+    }
+    blend
+}
+
 /// A mesh pipeline from the title's graphics state: the pipeline-state
 /// stream form (no input layout).
 ///
@@ -889,6 +986,7 @@ fn mesh_pipeline(
     name: &str,
 ) -> windows::core::Result<ID3D12PipelineState> {
     use windows::core::Interface;
+    let blend = sanitize_blend_for_targets(g.blend, &g.targets);
     #[repr(C)]
     struct Stream<D> {
         root: Sub<*mut std::ffi::c_void>,
@@ -908,7 +1006,7 @@ fn mesh_pipeline(
             root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
             ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
             ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
+            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, blend),
             mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
             raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
             depth,
@@ -927,7 +1025,7 @@ fn mesh_pipeline(
             root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
             ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
             ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
+            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, blend),
             mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
             raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
             depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, g.depth1()),
@@ -1342,5 +1440,83 @@ mod tests {
 
         assert_eq!(run_draw(0.6, 1.0), 0, "depth 0.5 outside [0.6, 1.0] must be rejected");
         assert_eq!(run_draw(0.4, 0.6), 255, "depth 0.5 inside [0.4, 0.6] must pass");
+    }
+
+    #[test]
+    fn sanitize_blend_disables_blending_on_integer_rt_formats() {
+        let mut blend = GraphicsState::default().blend;
+        blend.IndependentBlendEnable = false.into();
+        blend.RenderTarget[0].BlendEnable = true.into();
+        blend.RenderTarget[0].SrcBlend = D3D12_BLEND_SRC_ALPHA;
+        blend.RenderTarget[0].DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+        blend.RenderTarget[0].RenderTargetWriteMask = 0x7;
+
+        let mut targets = D3D12_RT_FORMAT_ARRAY {
+            NumRenderTargets: 3,
+            ..Default::default()
+        };
+        targets.RTFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        targets.RTFormats[1] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        targets.RTFormats[2] = DXGI_FORMAT_R8_UINT;
+
+        // Expanding IndependentBlendEnable=false preserves float slots 0 & 1 and disables slot 2 (R8_UINT).
+        let fixed = sanitize_blend_for_targets(blend, &targets);
+        assert!(fixed.IndependentBlendEnable.as_bool());
+        assert!(fixed.RenderTarget[0].BlendEnable.as_bool());
+        assert!(fixed.RenderTarget[1].BlendEnable.as_bool());
+        assert_eq!(fixed.RenderTarget[1].SrcBlend, D3D12_BLEND_SRC_ALPHA);
+        assert!(!fixed.RenderTarget[2].BlendEnable.as_bool());
+        assert!(!fixed.RenderTarget[2].LogicOpEnable.as_bool());
+        assert_eq!(fixed.RenderTarget[2].RenderTargetWriteMask, 0x7);
+
+        // Explicit IndependentBlendEnable=true disables only the integer slot.
+        let mut indep = GraphicsState::default().blend;
+        indep.IndependentBlendEnable = true.into();
+        indep.RenderTarget[0].BlendEnable = true.into();
+        indep.RenderTarget[2].BlendEnable = true.into();
+        indep.RenderTarget[2].LogicOpEnable = true.into();
+        let fixed_indep = sanitize_blend_for_targets(indep, &targets);
+        assert!(fixed_indep.RenderTarget[0].BlendEnable.as_bool());
+        assert!(!fixed_indep.RenderTarget[1].BlendEnable.as_bool());
+        assert!(!fixed_indep.RenderTarget[2].BlendEnable.as_bool());
+        assert!(!fixed_indep.RenderTarget[2].LogicOpEnable.as_bool());
+
+        // Float-only render targets stay untouched (IndependentBlendEnable remains false).
+        let mut float_targets = targets;
+        float_targets.RTFormats[2] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        let untouched = sanitize_blend_for_targets(blend, &float_targets);
+        assert!(!untouched.IndependentBlendEnable.as_bool());
+        assert!(untouched.RenderTarget[0].BlendEnable.as_bool());
+    }
+
+    #[test]
+    fn bake_shader_matching_covers_pixel_and_compute_families() {
+        let make = |stage: &'static str, hash: &str, name: &[u8]| Shader {
+            stage,
+            hash: hash.to_owned(),
+            container: name.to_vec(),
+            translated: std::sync::OnceLock::new(),
+            ambient: None,
+        };
+        assert!(is_bake_shader(&make("pixel", crate::draw::BAKE_PIXEL_SHADERS[0], b"legacy")));
+        for &(stage, name) in &[
+            ("pixel", b"PS_BakeDecorations_0010" as &[u8]),
+            ("pixel", b"PS_DecorationBlend_0000_ff00f5de_Wrapped"),
+            ("pixel", b"PS_DecorationBlend_0011_ff00f5de_Wrapped"),
+            ("compute", b"decoration_blend:CS_DecorationCopy"),
+            ("compute", b"decoration_blend:CS_DecorationDilate"),
+            ("compute", b"ped_skin_processing:CS_SunTanUpdate"),
+            ("pixel", b"PS_CompositeIndirectDrawBlend"),
+            ("pixel", b"PS_CompositeNMB"),
+            ("pixel", b"PS_Composite"),
+        ] {
+            assert!(
+                is_bake_shader(&make(stage, "deadbeefcafebabe", name)),
+                "must match bake shader {:?}",
+                String::from_utf8_lossy(name)
+            );
+        }
+        assert!(!is_bake_shader(&make("compute", "deadbeefcafebabe", b"CS_ScreenProbes_TemporalResolve")));
+        assert!(!is_bake_shader(&make("pixel", "deadbeefcafebabe", b"PS_OpaqueForward")));
     }
 }

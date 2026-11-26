@@ -419,17 +419,36 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     emit(&c, &native, &p, &st, &io, &res)
 }
 
-#[cfg(test)]
-thread_local! {
-    pub(super) static TEST_WAVE_WIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum WaveWideMode {
+    /// `VICTORY_WAVE_WIDE=0`: never widen Wave64 compute branches (even as last resort).
+    Off,
+    /// Default (unset): try barrier-free `local waves` first; widen ONLY as a
+    /// last resort when every non-widened path fails to reach `WaveSize <= 32`.
+    LastResort,
+    /// `VICTORY_WAVE_WIDE=1`: eager widening before approximate `local waves`.
+    Eager,
 }
 
-fn wave_wide_on() -> bool {
-    #[cfg(test)]
-    if let Some(on) = TEST_WAVE_WIDE.get() {
-        return on;
+#[cfg(test)]
+thread_local! {
+    pub(super) static TEST_WAVE_WIDE: std::cell::Cell<Option<WaveWideMode>> = const { std::cell::Cell::new(None) };
+}
+
+pub(super) fn parse_wave_wide_mode(value: Option<&str>) -> WaveWideMode {
+    match value.map(str::trim) {
+        Some("0") => WaveWideMode::Off,
+        Some("1") => WaveWideMode::Eager,
+        _ => WaveWideMode::LastResort,
     }
-    std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1")
+}
+
+fn wave_wide_mode() -> WaveWideMode {
+    #[cfg(test)]
+    if let Some(mode) = TEST_WAVE_WIDE.get() {
+        return mode;
+    }
+    parse_wave_wide_mode(std::env::var("VICTORY_WAVE_WIDE").ok().as_deref())
 }
 
 /// Emits a program whose earlier stages already ran.
@@ -509,12 +528,17 @@ pub fn emit(
                 }
             }
         }
-        // Strictly opt-in (`VICTORY_WAVE_WIDE=1`): widening puts cross-half
-        // syncs / Mode-B spins inside branches and loops and enables shaders
-        // that regress visual clarity and frame time when run without BVH.
-        // Keep default off so Wave64 compute falls back cleanly to non-widened
-        // forms only; the barrier-free 32-lane trace path below stays on.
-        let wide_on = wave_wide_on();
+        // Eager widening (before approximate `local waves`) stays opt-in via
+        // `VICTORY_WAVE_WIDE=1` so working compute shaders keep their fast
+        // barrier-free `local waves` path. If every non-widened path below still
+        // fails to reach `<= 32` lanes (returning `WaveSize=64`, which Wave32
+        // hosts refuse with `E_INVALIDARG` / D3D12 `id=622`, or an emit error),
+        // last-resort widening rescues those residual shaders unless explicitly
+        // opted out via `VICTORY_WAVE_WIDE=0`.
+        let wide_mode = wave_wide_mode();
+        let wide_on = wide_mode == WaveWideMode::Eager;
+        let wide_allowed = wide_mode != WaveWideMode::Off;
+        let mut deep = None;
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
@@ -523,9 +547,9 @@ pub fn emit(
                 // Every skip left out that the code after it cannot see
                 // ([`ir::without_skips`], `deep`): most of the body is then code every
                 // lane runs, where the two host waves can exchange.
-                // (`VICTORY_WAVE_DEEP_SKIPS=0` turns deep skips off; `VICTORY_WAVE_WIDE=1` turns wide branches on.)
+                // (`VICTORY_WAVE_DEEP_SKIPS=0` turns deep skips off; `VICTORY_WAVE_WIDE=1` turns eager wide branches on.)
                 let deep_on = std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0");
-                let deep = if deep_on { form(ir::without_skips(p, true)) } else { None };
+                deep = if deep_on { form(ir::without_skips(p, true)) } else { None };
                 if let Some((p, st, io, res)) = &deep {
                     let again = emit_program(c, native, p, st, io, res);
                     report("without skips, scalars followed", &again);
@@ -596,6 +620,25 @@ pub fn emit(
                 }
             }
         }
+        // Last-resort rescue: every non-widened path above (including barrier-free
+        // `local waves`) failed to drop below `WaveSize=64` (which Wave32 hosts
+        // refuse with `E_INVALIDARG` / D3D12 `id=622`) or stopped on a cross-half
+        // exchange where not every lane runs.
+        if !wide_on && wide_allowed {
+            let bases = [
+                deep.as_ref().map(|f| &f.0),
+                forms[1].1.as_ref().map(|f| &f.0),
+                forms[0].1.as_ref().map(|f| &f.0),
+                Some(p),
+            ];
+            if let Some(base) = bases.into_iter().flatten().next() {
+                let again = widen(c, native, base, why);
+                report("wave-wide branches (last resort)", &again);
+                if done(&again) {
+                    return again.map(|(shader, _)| shader);
+                }
+            }
+        }
     }
     // SCC of a mask operation joined with a scalar test behind a per-lane skip (the 32-lane
     // trace programs): right once the wave takes that skip together ([`widen`]; the
@@ -604,7 +647,7 @@ pub fn emit(
         Err(ShaderError::Unsupported { what, .. })
             if native.stage == HwStage::Cs
                 && what == lower::LANE_MASK
-                && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") =>
+                && wave_wide_mode() != WaveWideMode::Off =>
         {
             let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some());
             match again {

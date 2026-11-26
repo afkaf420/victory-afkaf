@@ -23,10 +23,7 @@ use windows_sys::Win32::System::Memory::{
     MemExtendedParameterAddressRequirements, PAGE_NOACCESS, PAGE_READWRITE, SEC_COMMIT,
     SEC_RESERVE, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualFree, VirtualQueryEx,
 };
-use windows_sys::Win32::System::ProcessStatus::{
-    K32GetPerformanceInfo, K32GetProcessMemoryInfo, PERFORMANCE_INFORMATION,
-    PROCESS_MEMORY_COUNTERS,
-};
+use windows_sys::Win32::System::ProcessStatus::{K32GetPerformanceInfo, PERFORMANCE_INFORMATION};
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 use windows_sys::core::BOOL;
 
@@ -49,6 +46,140 @@ pub(crate) fn on_wine() -> bool {
 
 /// Standard memory the title has handed to the system.
 static TRANSFERRED: AtomicUsize = AtomicUsize::new(0);
+
+/// Bytes currently allocated through `XMemAllocDefault` (non-32-bit blocks).
+static HEAP_USED: AtomicUsize = AtomicUsize::new(0);
+
+/// Committed non-placeholder virtual ranges allocated via `XMemVirtualAlloc`,
+/// stored as non-overlapping `base -> end` intervals for accurate title
+/// working-set reporting (`XMemGetWorkingSetStatistics`).
+static VIRTUAL_COMMITTED: LazyLock<Mutex<BTreeMap<usize, usize>>> =
+    LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+fn record_virtual_commit(base: usize, len: usize) {
+    if base == 0 || len == 0 {
+        return;
+    }
+    let end = base.saturating_add(len);
+    if end <= base {
+        return;
+    }
+    let mut map = VIRTUAL_COMMITTED.lock().unwrap_or_else(|e| e.into_inner());
+    let mut lo = base;
+    let mut hi = end;
+    let mut remove = Vec::new();
+    if let Some((&s, &e)) = map.range(..base).next_back()
+        && e >= base
+    {
+        lo = lo.min(s);
+        hi = hi.max(e);
+        remove.push(s);
+    }
+    for (&s, &e) in map.range(base..=end) {
+        lo = lo.min(s);
+        hi = hi.max(e);
+        remove.push(s);
+    }
+    for s in remove {
+        map.remove(&s);
+    }
+    map.insert(lo, hi);
+}
+
+fn clear_virtual_commit(base: usize, len: usize) {
+    if base == 0 || len == 0 {
+        return;
+    }
+    let end = base.saturating_add(len);
+    if end <= base {
+        return;
+    }
+    let mut map = VIRTUAL_COMMITTED.lock().unwrap_or_else(|e| e.into_inner());
+    let mut overlapping = Vec::new();
+    if let Some((&s, &e)) = map.range(..base).next_back()
+        && e > base
+    {
+        overlapping.push((s, e));
+    }
+    for (&s, &e) in map.range(base..end) {
+        overlapping.push((s, e));
+    }
+    for &(s, _) in &overlapping {
+        map.remove(&s);
+    }
+    for (s, e) in overlapping {
+        if s < base {
+            map.insert(s, base);
+        }
+        if e > end {
+            map.insert(end, e);
+        }
+    }
+}
+
+/// Sums live committed bytes from `VIRTUAL_COMMITTED`, pruning sub-ranges the
+/// title released directly via kernel32 `VirtualFree`.
+fn live_virtual_committed() -> usize {
+    let mut map = VIRTUAL_COMMITTED.lock().unwrap_or_else(|e| e.into_inner());
+    if map.is_empty() {
+        return 0;
+    }
+    let snapshot: Vec<(usize, usize)> = map.iter().map(|(&s, &e)| (s, e)).collect();
+    let mut live = BTreeMap::new();
+    let mut total = 0usize;
+    // SAFETY: pseudo-handle for current process.
+    let process = unsafe { GetCurrentProcess() };
+    for (start, end) in snapshot {
+        let mut p = start;
+        while p < end {
+            // SAFETY: plain out struct filled by `VirtualQueryEx`.
+            let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            let n = unsafe {
+                VirtualQueryEx(
+                    process,
+                    p as *const c_void,
+                    &mut mbi,
+                    size_of::<MEMORY_BASIC_INFORMATION>(),
+                )
+            };
+            let next = (mbi.BaseAddress as usize)
+                .saturating_add(mbi.RegionSize)
+                .min(end);
+            if n == 0 || next <= p {
+                break;
+            }
+            if mbi.State == MEM_COMMIT {
+                total = total.saturating_add(next - p);
+                if let Some((_, last_e)) = live.iter_mut().next_back()
+                    && *last_e == p
+                {
+                    *last_e = next;
+                } else {
+                    live.insert(p, next);
+                }
+            }
+            p = next;
+        }
+    }
+    *map = live;
+    total
+}
+
+/// Returns `(tracked_title_bytes, allocated_physical_pages)` counting only
+/// title-owned physical pages, committed `XMemVirtualAlloc` regions, and
+/// `XMemAllocDefault` blocks (excluding host layer / D3D12 commit).
+fn tracked_title_memory() -> (usize, usize) {
+    let phys_pages = physical().pages.len();
+    let phys_bytes = phys_pages.saturating_mul(PAGE);
+    let virt_bytes = live_virtual_committed();
+    let heap_bytes = HEAP_USED.load(Ordering::Relaxed);
+    (
+        phys_bytes
+            .saturating_add(virt_bytes)
+            .saturating_add(heap_bytes),
+        phys_pages,
+    )
+}
 
 // Console additions to the host's flags.
 /// 2 MiB pages; the host reads this bit as large pages, which need a
@@ -358,6 +489,7 @@ pub extern "system" fn XMemVirtualAlloc(
         record_va_protect(at as usize, size, flags as u32, raw_protect);
         note_protection(raw_protect, raw_kind, flags, at as usize, size);
         if !placeholder && (kind & MEM_COMMIT) != 0 {
+            record_virtual_commit(at as usize, size);
             victory_gpu::sparse_uma::on_map(at as usize, size);
         }
     }
@@ -508,6 +640,7 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
     }
     // SAFETY: the block holds the alignment (at least the header) and then
     // `size` bytes.
+    HEAP_USED.fetch_add(layout.size(), Ordering::Relaxed);
     unsafe {
         let user = block.add(layout.align());
         user.sub(HEADER)
@@ -536,6 +669,7 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
             let len = if queried != 0 { mbi.RegionSize } else { 0 };
             if len > 0 {
                 clear_va_protect(address as usize, len);
+                clear_virtual_commit(address as usize, len);
                 victory_gpu::clear_console_memory(address as usize, len);
                 victory_gpu::title_memory_remapped(address as usize, len);
             }
@@ -544,6 +678,9 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
         }
         let user = address.cast::<u8>();
         let [size, align] = user.sub(HEADER).cast::<[usize; 2]>().read();
+        let _ = HEAP_USED.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+            Some(cur.saturating_sub(size))
+        });
         dealloc(
             user.sub(align),
             Layout::from_size_align_unchecked(size, align),
@@ -1472,6 +1609,16 @@ fn promote_view_containing(physical: &mut Physical, addr: usize) -> bool {
 /// allocation in place of a placeholder (zero `PAGE_READONLY` guards / SEH
 /// faults while only one virtual address shows these physical pages).
 fn map_private(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
+    map_private_ex(physical, base, len, slice, true)
+}
+
+fn map_private_ex(
+    physical: &mut Physical,
+    base: usize,
+    len: usize,
+    slice: Slice,
+    notify_remap: bool,
+) -> bool {
     // SAFETY: splits placeholder (failing harmlessly if exact size) and
     // replaces it with committed `MEM_WRITE_WATCH` private memory.
     let ptr = unsafe {
@@ -1493,8 +1640,10 @@ fn map_private(physical: &mut Physical, base: usize, len: usize, slice: Slice) -
     if ptr as usize != base {
         return false;
     }
-    victory_gpu::title_memory_remapped(base, len);
-    victory_gpu::sparse_uma::on_map(base, len);
+    if notify_remap {
+        victory_gpu::title_memory_remapped(base, len);
+        victory_gpu::sparse_uma::on_map(base, len);
+    }
     for k in 0..len.div_ceil(PAGE) {
         physical.shown.entry(slice.key(k)).or_default().push(base + k * PAGE);
     }
@@ -1535,6 +1684,19 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
 /// Maps `slice` and the slices after it from their `SEC_RESERVE` section over
 /// `[base, base + len)`, which must lie in one placeholder.
 fn map_section(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
+    map_section_ex(physical, base, len, slice, true)
+}
+
+/// Like [`map_section`], emitting `title_memory_remapped` + `sparse_uma::on_map`
+/// only when `notify_remap` is true (skipped when restoring unchanged surviving
+/// head/tail slices of a split view inside [`unmap`]).
+fn map_section_ex(
+    physical: &mut Physical,
+    base: usize,
+    len: usize,
+    slice: Slice,
+    notify_remap: bool,
+) -> bool {
     // SAFETY: splits the placeholder around the range (failing harmlessly
     // when the range is the whole placeholder), then maps the section
     // there; both act only on placeholders.
@@ -1570,9 +1732,11 @@ fn map_section(physical: &mut Physical, base: usize, len: usize, slice: Slice) -
         unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
         return false;
     }
-    // New contents, read-write: the GPU side's copies no longer guard it.
-    victory_gpu::title_memory_remapped(base, len);
-    victory_gpu::sparse_uma::on_map(base, len);
+    if notify_remap {
+        // New contents, read-write: the GPU side's copies no longer guard it.
+        victory_gpu::title_memory_remapped(base, len);
+        victory_gpu::sparse_uma::on_map(base, len);
+    }
     // What the range shows now, for the GPU side's in-place census.
     static ALIAS_HOOK: std::sync::Once = std::sync::Once::new();
     ALIAS_HOOK.call_once(|| victory_gpu::use_alias_writer(write_va_via_alias));
@@ -1632,6 +1796,26 @@ fn commit_limit_message(
         "Close other applications or increase the Windows paging file size, then retry.\n",
     );
     message
+}
+
+#[cfg(test)]
+thread_local! {
+    static UNMAP_REMAP_LOG: std::cell::RefCell<Option<Vec<(usize, usize)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[inline]
+fn notify_unmap_remapped(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    #[cfg(test)]
+    UNMAP_REMAP_LOG.with(|log| {
+        if let Some(log) = log.borrow_mut().as_mut() {
+            log.push((at, len));
+        }
+    });
+    victory_gpu::title_memory_remapped(at, len);
 }
 
 /// Returns `[base, base + len)` to placeholders; views reaching past it
@@ -1705,7 +1889,9 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
                     }
                 }
             }
-            victory_gpu::title_memory_remapped(at, size);
+            if unmap_start < unmap_end {
+                notify_unmap_remapped(unmap_start, unmap_end - unmap_start);
+            }
             // SAFETY: release our entire `MEM_REPLACE_PLACEHOLDER` private
             // allocation back into a placeholder of exact size `size`.
             let freed = unsafe {
@@ -1736,7 +1922,9 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
             }
             if let Some(bytes) = head_saved {
                 let len = base - at;
-                if map_private(physical, at, len, slice.clone()) || map_section(physical, at, len, slice.clone()) {
+                if map_private_ex(physical, at, len, slice.clone(), false)
+                    || map_section_ex(physical, at, len, slice.clone(), false)
+                {
                     // SAFETY: newly mapped `PAGE_READWRITE` head.
                     unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), at as *mut u8, len) };
                 }
@@ -1745,14 +1933,18 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
                 let len = at + size - end;
                 let index = slice.index + (end - at) / PAGE;
                 let tail_slice = Slice { index, ..slice };
-                if map_private(physical, end, len, tail_slice.clone()) || map_section(physical, end, len, tail_slice) {
+                if map_private_ex(physical, end, len, tail_slice.clone(), false)
+                    || map_section_ex(physical, end, len, tail_slice, false)
+                {
                     // SAFETY: newly mapped `PAGE_READWRITE` tail.
                     unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), end as *mut u8, len) };
                 }
             }
             continue;
         }
-        victory_gpu::title_memory_remapped(at, size);
+        if unmap_start < unmap_end {
+            notify_unmap_remapped(unmap_start, unmap_end - unmap_start);
+        }
         // SAFETY: a view we mapped; it becomes a placeholder again.
         unsafe {
             UnmapViewOfFile2(
@@ -1764,11 +1956,11 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
             )
         };
         if at < base {
-            map_section(physical, at, base - at, slice.clone());
+            map_section_ex(physical, at, base - at, slice.clone(), false);
         }
         if at + size > end {
             let index = slice.index + (end - at) / PAGE;
-            map_section(physical, end, at + size - end, Slice { index, ..slice });
+            map_section_ex(physical, end, at + size - end, Slice { index, ..slice }, false);
         }
     }
 }
@@ -1792,36 +1984,23 @@ pub struct WorkingSet {
     pub kernel_pool_limit: u32,
 }
 
-/// The title's budget and our process's commit as what it uses. No tools
-/// memory: a retail console.
-// shortcut: all fields are filled whatever the flags ask for, and use is
-// not split by bandwidth class (GPU-optimal use reads 0); track
-// allocations per class if a title budgets from that field.
+/// The title's budget and actual tracked title memory usage (allocated
+/// physical pages, committed `XMemVirtualAlloc` regions, and `XMemAllocDefault`
+/// heap blocks — excluding VIctory's own host/D3D12 commit). No tools memory:
+/// a retail console.
 pub extern "system" fn XMemGetWorkingSetStatistics(_which: u32, out: *mut WorkingSet) -> BOOL {
     if out.is_null() {
         return 0;
     }
-    let mut counters = PROCESS_MEMORY_COUNTERS {
-        cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
-        ..Default::default()
-    };
-    // SAFETY: our own process and a sized structure.
-    unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) };
+    let (tracked, phys_pages) = tracked_title_memory();
     let (gpu_optimal, standard) = victory_gpu::console::current().title_memory();
     let stats = WorkingSet {
         title_limit: gpu_optimal + standard - TRANSFERRED.load(Ordering::Relaxed),
-        title_used: counters.PagefileUsage,
+        title_used: tracked.max(PAGE),
+        physical_pages: phys_pages.min(u32::MAX as usize) as u32,
         gpu_optimal_limit: gpu_optimal,
         ..Default::default()
     };
-    // What the title is told, logged at the first asking and at every
-    // 1,024th: "used" is all the process has committed, the layer's own
-    // memory and the card's included (27 GB in run 60's gameplay against a
-    // limit of 13.5 GB). A title that budgets its streaming from these two
-    // figures believes it is far over its limit.
-    // shortcut: the figure is not yet the title's own memory alone (its
-    // heaps and the pages it mapped); count those if this line shows the
-    // title asking.
     static ASKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let asked = ASKED.fetch_add(1, Ordering::Relaxed);
     if asked.is_multiple_of(1024) {
@@ -1830,6 +2009,7 @@ pub extern "system" fn XMemGetWorkingSetStatistics(_which: u32, out: *mut Workin
             which = _which,
             limit_mb = stats.title_limit >> 20,
             used_mb = stats.title_used >> 20,
+            phys_pages,
             "the title asks how much memory it uses"
         );
     }
@@ -2538,5 +2718,128 @@ mod tests {
         );
         // SAFETY: releasing our test reservation.
         unsafe { VirtualFree(base_ptr, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn unmap_split_notifies_only_unmapped_subrange() {
+        let pages = allocate(4);
+        let a = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            4 * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        assert!(!a.is_null());
+        assert_eq!(XMemMapPhysicalPages(a, 4, pages.as_ptr()), a);
+        let base = a as usize;
+        // Write distinct markers into head (page 0) and tail (pages 2..3).
+        // SAFETY: all 4 pages are mapped `PAGE_READWRITE`.
+        unsafe {
+            (base as *mut u8).write(0x11);
+            ((base + 2 * PAGE) as *mut u8).write(0x33);
+            ((base + 3 * PAGE) as *mut u8).write(0x44);
+        }
+
+        // Unmap ONLY page 1 in the middle of the 4-page view.
+        UNMAP_REMAP_LOG.with(|log| *log.borrow_mut() = Some(Vec::new()));
+        let middle = (base + PAGE) as *mut c_void;
+        assert_eq!(XMemMapPhysicalPages(middle, 1, std::ptr::null()), middle);
+        let events = UNMAP_REMAP_LOG.with(|log| log.borrow_mut().take().unwrap());
+
+        assert_eq!(
+            events,
+            vec![(base + PAGE, PAGE)],
+            "splitting a 4-page view to unmap page 1 must emit title_memory_remapped ONLY for [base+PAGE, PAGE), not head or tail"
+        );
+        assert_eq!(query(a).host.State, MEM_COMMIT);
+        assert_eq!(query(middle).host.State, MEM_RESERVE);
+        assert_eq!(query((base + 2 * PAGE) as *const c_void).host.State, MEM_COMMIT);
+        assert_eq!(query((base + 3 * PAGE) as *const c_void).host.State, MEM_COMMIT);
+        // SAFETY: head and tail remain mapped with their original bytes intact.
+        unsafe {
+            assert_eq!((base as *const u8).read(), 0x11);
+            assert_eq!(((base + 2 * PAGE) as *const u8).read(), 0x33);
+            assert_eq!(((base + 3 * PAGE) as *const u8).read(), 0x44);
+        }
+
+        assert_eq!(XMemMapPhysicalPages(a, 4, std::ptr::null()), a);
+        assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
+        // SAFETY: releasing our test reservation.
+        unsafe { VirtualFree(a, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn working_set_tracks_title_memory_and_ignores_host_allocations() {
+        let mut before = WorkingSet::default();
+        assert_eq!(XMemGetWorkingSetStatistics(0, &mut before), 1);
+        assert!(before.title_used >= PAGE);
+
+        // Use large enough title allocations (16 + 4 + 2 = 22 MiB) and host
+        // noise (64 MiB) that concurrent sibling unit tests (which touch a few
+        // hundred KiB at most) cannot perturb the assertions.
+        const PHYS_COUNT: usize = 256; // 16 MiB
+        const VIRT_BYTES: usize = 4 * MIB;
+        const HEAP_BYTES: usize = 2 * MIB;
+        const HOST_NOISE_BYTES: usize = 64 * MIB;
+
+        let phys = allocate(PHYS_COUNT);
+        let virt = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            VIRT_BYTES,
+            MEM_RESERVE | MEM_COMMIT,
+            GRAPHICS,
+            PAGE_READWRITE,
+        );
+        assert!(!virt.is_null());
+        let heap = XMemAllocDefault(HEAP_BYTES, 0);
+        assert!(!heap.is_null());
+
+        let mut after = WorkingSet::default();
+        assert_eq!(XMemGetWorkingSetStatistics(0, &mut after), 1);
+        assert!(
+            after.title_used >= before.title_used.saturating_add(16 * MIB),
+            "expected tracked title_used to rise by >= 16 MiB (before={}, after={})",
+            before.title_used,
+            after.title_used
+        );
+        assert!(after.physical_pages >= PHYS_COUNT as u32);
+        assert!(
+            VIRTUAL_COMMITTED.lock().unwrap().contains_key(&(virt as usize)),
+            "committed XMemVirtualAlloc region must be tracked"
+        );
+
+        // Touching a 64 MiB host Rust allocation commits 64 MiB in Windows
+        // `PagefileUsage` but must NOT inflate `title_used`.
+        let host_noise = vec![0xA5u8; HOST_NOISE_BYTES];
+        std::hint::black_box(&host_noise);
+        let mut with_noise = WorkingSet::default();
+        assert_eq!(XMemGetWorkingSetStatistics(0, &mut with_noise), 1);
+        assert!(
+            with_noise.title_used < after.title_used.saturating_add(16 * MIB),
+            "64 MiB host-side allocation must not inflate title_used (after={}, with_noise={})",
+            after.title_used,
+            with_noise.title_used
+        );
+        drop(host_noise);
+
+        // Free all title allocations (including direct kernel32 VirtualFree on `virt`).
+        XMemFreeDefault(heap, 0);
+        // SAFETY: releasing our committed virtual region.
+        assert_ne!(unsafe { VirtualFree(virt, 0, MEM_RELEASE) }, 0);
+        assert_eq!(XMemFreePhysicalPages(PHYS_COUNT, phys.as_ptr()), 1);
+
+        let mut freed = WorkingSet::default();
+        assert_eq!(XMemGetWorkingSetStatistics(0, &mut freed), 1);
+        assert!(
+            freed.title_used.saturating_add(16 * MIB) <= after.title_used,
+            "freeing 22 MiB of title memory must reduce tracked title_used (after={}, freed={})",
+            after.title_used,
+            freed.title_used
+        );
+        assert!(
+            !VIRTUAL_COMMITTED.lock().unwrap().contains_key(&(virt as usize)),
+            "kernel32 VirtualFree'd region must be pruned from VIRTUAL_COMMITTED"
+        );
     }
 }

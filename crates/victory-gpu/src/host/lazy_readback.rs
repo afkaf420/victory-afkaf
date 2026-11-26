@@ -3004,18 +3004,18 @@ mod tests {
         let pages = WatchPages::new(1);
         let base = pages.va();
         let blk = base / BLOCK;
-        let res_id = base ^ 0x5A5A_1234;
         crate::watch::note_console_memory(base, BLOCK, 0x23, 0x2404);
-        crate::shadow::register(res_id, base as u64, BLOCK as u64);
-        struct Cleanup(usize, usize);
+        struct Cleanup(usize);
         impl Drop for Cleanup {
             fn drop(&mut self) {
-                crate::shadow::unregister(self.0, self.1 as u64);
-                crate::watch::clear_console_memory(self.1, BLOCK);
+                crate::watch::clear_console_memory(self.0, BLOCK);
             }
         }
-        let _cleanup = Cleanup(res_id, base);
-        let Some(shadow) = crate::shadow::find(base as u64, BLOCK as u64) else {
+        let _cleanup = Cleanup(base);
+        // Use an isolated staged card shadow (not registered in global `CARDED`)
+        // so parallel tests submitting to `host::host()` cannot drain `dirty`.
+        let Some(shadow) = crate::shadow::test_staged_card_shadow_at(base as u64, BLOCK as u64)
+        else {
             return; // headless machine without D3D12
         };
         assert!(shadow.carded() && !shadow.in_place() && !shadow.is_rebar_streaming());
@@ -3041,12 +3041,7 @@ mod tests {
             staging[4096..].iter().all(|&b| b == 0xA5),
             "plan_gpu_resident must copy untouched 60 KiB tail into Shadow::staging before card_dirty"
         );
-        let dirty = crate::shadow::card_dirty(0);
-        let our_dirty = dirty
-            .iter()
-            .find(|(s, _)| s.id() == shadow.id())
-            .map(|(_, r)| r.clone())
-            .unwrap_or_default();
+        let our_dirty = shadow.test_take_card_dirty();
         assert_eq!(our_dirty, vec![(0, BLOCK)], "full 64 KiB must be queued in card_dirty");
 
         // Simulate VRAM upload from `staging` + GPU 4 KiB write `0x7E`, commit, then `ensure_cpu_resident`.
