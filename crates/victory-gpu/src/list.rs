@@ -2462,7 +2462,7 @@ fn raw_is_uav_layout(layout: u32) -> bool {
 /// return `false` and remain skipped.
 #[inline]
 fn texture_barrier_needs_uav_sync(b: &TitleTextureBarrier) -> bool {
-    if (b.sync_before == 0 && b.sync_after == 0) || b.sync_after == RAW_SYNC_SPLIT {
+    if b.sync_before == 0 || b.sync_after == 0 || b.sync_after == RAW_SYNC_SPLIT {
         return false;
     }
     let before_write = b.access_before == 0 || (b.access_before & RAW_TEXTURE_WRITE_ACCESS) != 0;
@@ -2531,7 +2531,7 @@ pub(super) fn decode_barrier_groups(
                 // SAFETY: `g.ptr` points to `g.count` `D3D12_GLOBAL_BARRIER` records.
                 let items = unsafe { std::slice::from_raw_parts(g.ptr.cast::<TitleGlobalBarrier>(), m) };
                 for &b in items {
-                    if (b.sync_before == 0 && b.sync_after == 0) || b.sync_after == RAW_SYNC_SPLIT {
+                    if b.sync_before == 0 || b.sync_after == 0 || b.sync_after == RAW_SYNC_SPLIT {
                         continue;
                     }
                     if !globals.contains(&b) {
@@ -2543,7 +2543,8 @@ pub(super) fn decode_barrier_groups(
                 // SAFETY: `g.ptr` points to `g.count` `D3D12_BUFFER_BARRIER` records.
                 let items = unsafe { std::slice::from_raw_parts(g.ptr.cast::<TitleBufferBarrier>(), m) };
                 for &b in items {
-                    if (b.sync_before == 0 && b.sync_after == 0)
+                    if b.sync_before == 0
+                        || b.sync_after == 0
                         || b.sync_after == RAW_SYNC_SPLIT
                         || raw_buffer_is_read_only(b.access_before, b.access_after)
                     {
@@ -2843,7 +2844,8 @@ mod enhanced {
 
     /// Sanitizes raw title `(sync_before, sync_after, access_before, access_after)`
     /// into a D3D12 Debug Layer-legal pair for `list_type`. Returns `None` when
-    /// the barrier is a no-op (`SYNC_NONE`, split-begin, or read-to-read buffer barrier).
+    /// the barrier is a no-op (`SYNC_NONE` on either side, split-begin, or
+    /// read-to-read buffer barrier).
     pub(super) fn sanitize_pair(
         raw_sync_before: u32,
         raw_sync_after: u32,
@@ -2851,6 +2853,35 @@ mod enhanced {
         raw_access_after: u32,
         list_type: D3D12_COMMAND_LIST_TYPE,
         is_buffer: bool,
+    ) -> Option<(
+        D3D12_BARRIER_SYNC,
+        D3D12_BARRIER_SYNC,
+        D3D12_BARRIER_ACCESS,
+        D3D12_BARRIER_ACCESS,
+    )> {
+        sanitize_pair_with_uav(
+            raw_sync_before,
+            raw_sync_after,
+            raw_access_before,
+            raw_access_after,
+            list_type,
+            is_buffer,
+            true,
+        )
+    }
+
+    /// As [`sanitize_pair`], allowing callers targeting a non-UAV buffer resource
+    /// (`allow_uav == false`, e.g., `GpuReadOnly` ReBAR buffers lacking
+    /// `D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS`) to strip `UNORDERED_ACCESS`
+    /// and re-sanitize sync bits so D3D12 `Close()` never fails with `E_INVALIDARG`.
+    pub(super) fn sanitize_pair_with_uav(
+        raw_sync_before: u32,
+        raw_sync_after: u32,
+        raw_access_before: u32,
+        raw_access_after: u32,
+        list_type: D3D12_COMMAND_LIST_TYPE,
+        is_buffer: bool,
+        allow_uav: bool,
     ) -> Option<(
         D3D12_BARRIER_SYNC,
         D3D12_BARRIER_SYNC,
@@ -2867,7 +2898,7 @@ mod enhanced {
         }
         sync_before &= !SYNC_SPLIT;
         sync_after &= !SYNC_SPLIT;
-        if sync_before == 0 && sync_after == 0 {
+        if sync_before == 0 || sync_after == 0 {
             return None;
         }
         let (sync_mask, list_access_mask) = match list_type {
@@ -2875,10 +2906,13 @@ mod enhanced {
             D3D12_COMMAND_LIST_TYPE_COPY => (COPY_SYNC_MASK, COPY_ACCESS_MASK),
             _ => (DIRECT_SYNC_MASK, GLOBAL_ACCESS_MASK),
         };
-        let valid_access = list_access_mask & if is_buffer { BUFFER_ACCESS_MASK } else { GLOBAL_ACCESS_MASK };
+        let mut valid_access = list_access_mask & if is_buffer { BUFFER_ACCESS_MASK } else { GLOBAL_ACCESS_MASK };
+        if is_buffer && !allow_uav {
+            valid_access &= !D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0;
+        }
         let (sb, ab) = sanitize_side(sync_before, raw_access_before as i32, sync_mask, valid_access);
         let (sa, aa) = sanitize_side(sync_after, raw_access_after as i32, sync_mask, valid_access);
-        if sb.0 == 0 && sa.0 == 0 {
+        if sb.0 == 0 || sa.0 == 0 {
             return None;
         }
         if is_buffer {
@@ -2977,17 +3011,66 @@ pub(super) fn emit_barrier_groups(
                         .then(|| crate::shadow::peek(b.addr, b.len))
                         .flatten();
                     if let Some(shadow) = shadow {
-                        out_buffers.push(D3D12_BUFFER_BARRIER {
-                            SyncBefore: sb,
-                            SyncAfter: sa,
-                            AccessBefore: ab,
-                            AccessAfter: aa,
-                            // SAFETY: borrowed pointer kept alive by `kept` across `list7.Barrier`.
-                            pResource: unsafe { std::mem::transmute_copy(&shadow.buffer) },
-                            Offset: 0,
-                            Size: u64::MAX,
-                        });
-                        kept.push(shadow);
+                        // SAFETY: `shadow.buffer` is a live D3D12 buffer resource.
+                        let (has_uav, is_cpu_heap) = unsafe {
+                            let flags = shadow.buffer.GetDesc().Flags;
+                            let mut heap = D3D12_HEAP_PROPERTIES::default();
+                            let cpu_heap = shadow
+                                .buffer
+                                .GetHeapProperties(Some(&mut heap), None)
+                                .is_ok()
+                                && matches!(
+                                    heap.Type,
+                                    D3D12_HEAP_TYPE_UPLOAD | D3D12_HEAP_TYPE_READBACK
+                                );
+                            (
+                                flags.contains(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+                                cpu_heap,
+                            )
+                        };
+                        let uav_bit = D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0;
+                        let target_pair = if is_cpu_heap {
+                            // `UPLOAD`/`READBACK` heap buffers reject write accesses (`COPY_DEST`/
+                            // `UAV`) in `D3D12_BUFFER_BARRIER`; preserve ordering via global barrier.
+                            None
+                        } else if has_uav || ((ab.0 | aa.0) & uav_bit == 0) {
+                            Some((sb, sa, ab, aa))
+                        } else {
+                            enhanced::sanitize_pair_with_uav(
+                                b.sync_before,
+                                b.sync_after,
+                                b.access_before,
+                                b.access_after,
+                                list_type,
+                                true,
+                                false,
+                            )
+                        };
+                        if let Some((bsb, bsa, bab, baa)) = target_pair {
+                            out_buffers.push(D3D12_BUFFER_BARRIER {
+                                SyncBefore: bsb,
+                                SyncAfter: bsa,
+                                AccessBefore: bab,
+                                AccessAfter: baa,
+                                // SAFETY: borrowed pointer kept alive by `kept` across `list7.Barrier`.
+                                pResource: unsafe { std::mem::transmute_copy(&shadow.buffer) },
+                                Offset: 0,
+                                Size: u64::MAX,
+                            });
+                            kept.push(shadow);
+                        } else {
+                            // Stripping UAV from a non-UAV buffer left no buffer write hazard;
+                            // preserve synchronization via a scoped global barrier.
+                            push_global_unique(
+                                &mut out_globals,
+                                D3D12_GLOBAL_BARRIER {
+                                    SyncBefore: sb,
+                                    SyncAfter: sa,
+                                    AccessBefore: ab,
+                                    AccessAfter: aa,
+                                },
+                            );
+                        }
                     } else {
                         // Always emit a scoped global fallback on a write-hazard buffer lookup miss
                         // (e.g., loose/raw-address buffer or post-copy hazard) regardless of `uav_dirty`.
@@ -3687,20 +3770,93 @@ mod tests {
         assert_ne!(ab, D3D12_BARRIER_ACCESS_COMMON);
         assert_eq!(aa, D3D12_BARRIER_ACCESS_UNORDERED_ACCESS);
 
-        // Sanitizer: SYNC_NONE forces ACCESS_NO_ACCESS.
-        let (sb, sa, ab, aa) = enhanced::sanitize_pair(
-            D3D12_BARRIER_SYNC_COMPUTE_SHADING.0 as u32,
-            D3D12_BARRIER_SYNC_NONE.0 as u32,
-            D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0 as u32,
+        // Sanitizer: one-sided SYNC_NONE (e.g., UNDEFINED->UAV layout init or end-of-list flush)
+        // is rejected on global & buffer barriers so `Close()` never fails with `E_INVALIDARG`.
+        assert!(
+            enhanced::sanitize_pair(
+                D3D12_BARRIER_SYNC_NONE.0 as u32,
+                D3D12_BARRIER_SYNC_COMPUTE_SHADING.0 as u32,
+                D3D12_BARRIER_ACCESS_NO_ACCESS.0 as u32,
+                D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0 as u32,
+                D3D12_COMMAND_LIST_TYPE_DIRECT,
+                false,
+            )
+            .is_none(),
+            "SYNC_NONE before must be rejected on global barriers"
+        );
+        assert!(
+            enhanced::sanitize_pair(
+                D3D12_BARRIER_SYNC_COMPUTE_SHADING.0 as u32,
+                D3D12_BARRIER_SYNC_NONE.0 as u32,
+                D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0 as u32,
+                D3D12_BARRIER_ACCESS_NO_ACCESS.0 as u32,
+                D3D12_COMMAND_LIST_TYPE_DIRECT,
+                true,
+            )
+            .is_none(),
+            "SYNC_NONE after must be rejected on buffer barriers"
+        );
+        // Texture UNDEFINED->UAV layout transition with SYNC_NONE before is skipped at decode time.
+        let one_sided_tex = [
+            TitleTextureBarrier {
+                sync_before: D3D12_BARRIER_SYNC_NONE.0 as u32,
+                sync_after: D3D12_BARRIER_SYNC_COMPUTE_SHADING.0 as u32,
+                access_before: D3D12_BARRIER_ACCESS_NO_ACCESS.0 as u32,
+                access_after: D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0 as u32,
+                layout_before: D3D12_BARRIER_LAYOUT_UNDEFINED.0 as u32,
+                layout_after: D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS.0 as u32,
+                resource: std::ptr::null(),
+                subresources: [0; 6],
+                flags: 0,
+            },
+            TitleTextureBarrier {
+                sync_before: D3D12_BARRIER_SYNC_COMPUTE_SHADING.0 as u32,
+                sync_after: D3D12_BARRIER_SYNC_NONE.0 as u32,
+                access_before: D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0 as u32,
+                access_after: D3D12_BARRIER_ACCESS_NO_ACCESS.0 as u32,
+                layout_before: D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS.0 as u32,
+                layout_after: D3D12_BARRIER_LAYOUT_COMMON.0 as u32,
+                resource: std::ptr::null(),
+                subresources: [0; 6],
+                flags: 0,
+            },
+        ];
+        let one_sided_group = TitleBarrierGroup {
+            kind: BARRIER_TYPE_TEXTURE,
+            count: one_sided_tex.len() as u32,
+            ptr: one_sided_tex.as_ptr().cast(),
+        };
+        let (osg, osb) = decode_barrier_groups(1, (&raw const one_sided_group).cast());
+        assert!(osg.is_empty() && osb.is_empty(), "one-sided SYNC_NONE texture barriers must be skipped");
+
+        // Non-UAV buffer sanitization strips UNORDERED_ACCESS and keeps legal COPY/SRV syncs.
+        let (sb, sa, ab, aa) = enhanced::sanitize_pair_with_uav(
+            (D3D12_BARRIER_SYNC_COPY.0 | D3D12_BARRIER_SYNC_COMPUTE_SHADING.0) as u32,
+            D3D12_BARRIER_SYNC_PIXEL_SHADING.0 as u32,
+            (D3D12_BARRIER_ACCESS_COPY_DEST.0 | D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0) as u32,
             D3D12_BARRIER_ACCESS_SHADER_RESOURCE.0 as u32,
             D3D12_COMMAND_LIST_TYPE_DIRECT,
             true,
+            false,
         )
-        .expect("flush barrier with SYNC_NONE after must sanitize");
-        assert_eq!(sb, D3D12_BARRIER_SYNC_COMPUTE_SHADING);
-        assert_eq!(sa, D3D12_BARRIER_SYNC_NONE);
-        assert_eq!(ab, D3D12_BARRIER_ACCESS_UNORDERED_ACCESS);
-        assert_eq!(aa, D3D12_BARRIER_ACCESS_NO_ACCESS);
+        .expect("non-UAV COPY_DEST|UAV -> SRV must strip UAV and keep COPY_DEST -> SRV");
+        assert_eq!(sb, D3D12_BARRIER_SYNC_COPY);
+        assert_eq!(sa, D3D12_BARRIER_SYNC_PIXEL_SHADING);
+        assert_eq!(ab, D3D12_BARRIER_ACCESS_COPY_DEST);
+        assert_eq!(aa, D3D12_BARRIER_ACCESS_SHADER_RESOURCE);
+        assert!(
+            enhanced::sanitize_pair_with_uav(
+                D3D12_BARRIER_SYNC_COMPUTE_SHADING.0 as u32,
+                D3D12_BARRIER_SYNC_PIXEL_SHADING.0 as u32,
+                D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0 as u32,
+                D3D12_BARRIER_ACCESS_SHADER_RESOURCE.0 as u32,
+                D3D12_COMMAND_LIST_TYPE_DIRECT,
+                true,
+                false,
+            )
+            .is_none(),
+            "pure UAV -> SRV on non-UAV buffer must return None so caller emits global fallback"
+        );
 
         // Sanitizer: mismatched VERTEX_SHADING + INDEX_BUFFER widens sync to cover INDEX_INPUT.
         let (sb, sa, ab, aa) = enhanced::sanitize_pair(
@@ -3809,8 +3965,43 @@ mod tests {
         barrier_groups(list, 1, (&raw const tex_group).cast());
         assert!(hl.uav_dirty(), "non-UAV texture group must not emit barrier or clear uav_dirty");
 
-        // 1b. UAV-touching texture barriers (bindless UAV->SRV, same-state UAV->UAV, Layout=UAV + COMMON)
-        //     emit scoped `D3D12_GLOBAL_BARRIER`s with 0 Debug Layer errors and clear `uav_dirty`.
+        // 1a. One-sided SYNC_NONE texture layout transitions (UNDEFINED->UAV and UAV->COMMON flush)
+        //     MUST be skipped cleanly without emitting invalid `D3D12_GLOBAL_BARRIER`s.
+        let one_sided_tex = [
+            TitleTextureBarrier {
+                sync_before: D3D12_BARRIER_SYNC_NONE.0 as u32,
+                sync_after: D3D12_BARRIER_SYNC_COMPUTE_SHADING.0 as u32,
+                access_before: D3D12_BARRIER_ACCESS_NO_ACCESS.0 as u32,
+                access_after: D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0 as u32,
+                layout_before: D3D12_BARRIER_LAYOUT_UNDEFINED.0 as u32,
+                layout_after: D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS.0 as u32,
+                resource: std::ptr::null(),
+                subresources: [0; 6],
+                flags: 0,
+            },
+            TitleTextureBarrier {
+                sync_before: D3D12_BARRIER_SYNC_COMPUTE_SHADING.0 as u32,
+                sync_after: D3D12_BARRIER_SYNC_NONE.0 as u32,
+                access_before: D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0 as u32,
+                access_after: D3D12_BARRIER_ACCESS_NO_ACCESS.0 as u32,
+                layout_before: D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS.0 as u32,
+                layout_after: D3D12_BARRIER_LAYOUT_COMMON.0 as u32,
+                resource: std::ptr::null(),
+                subresources: [0; 6],
+                flags: 0,
+            },
+        ];
+        let one_sided_group = TitleBarrierGroup {
+            kind: BARRIER_TYPE_TEXTURE,
+            count: one_sided_tex.len() as u32,
+            ptr: one_sided_tex.as_ptr().cast(),
+        };
+        barrier_groups(list, 1, (&raw const one_sided_group).cast());
+        assert!(hl.uav_dirty(), "one-sided SYNC_NONE texture transitions must be skipped");
+
+        // 1b. UAV-touching texture barriers (bindless UAV->SRV, same-state UAV->UAV, Layout=UAV + COMMON,
+        //     and non-NONE sync with NO_ACCESS on one side) emit scoped `D3D12_GLOBAL_BARRIER`s with
+        //     0 Debug Layer errors and clear `uav_dirty`.
         let uav_tex = [
             TitleTextureBarrier {
                 sync_before: D3D12_BARRIER_SYNC_COMPUTE_SHADING.0 as u32,
@@ -3841,6 +4032,28 @@ mod tests {
                 access_after: D3D12_BARRIER_ACCESS_SHADER_RESOURCE.0 as u32,
                 layout_before: D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS.0 as u32,
                 layout_after: D3D12_BARRIER_LAYOUT_SHADER_RESOURCE.0 as u32,
+                resource: std::ptr::null(),
+                subresources: [0; 6],
+                flags: 0,
+            },
+            TitleTextureBarrier {
+                sync_before: D3D12_BARRIER_SYNC_COMPUTE_SHADING.0 as u32,
+                sync_after: D3D12_BARRIER_SYNC_COMPUTE_SHADING.0 as u32,
+                access_before: D3D12_BARRIER_ACCESS_NO_ACCESS.0 as u32,
+                access_after: D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0 as u32,
+                layout_before: D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS.0 as u32,
+                layout_after: D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS.0 as u32,
+                resource: std::ptr::null(),
+                subresources: [0; 6],
+                flags: 0,
+            },
+            TitleTextureBarrier {
+                sync_before: D3D12_BARRIER_SYNC_COMPUTE_SHADING.0 as u32,
+                sync_after: D3D12_BARRIER_SYNC_COMPUTE_SHADING.0 as u32,
+                access_before: D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0 as u32,
+                access_after: D3D12_BARRIER_ACCESS_NO_ACCESS.0 as u32,
+                layout_before: D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS.0 as u32,
+                layout_after: D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS.0 as u32,
                 resource: std::ptr::null(),
                 subresources: [0; 6],
                 flags: 0,
@@ -3900,7 +4113,7 @@ mod tests {
             "targeted buffer barriers alone must not clear uav_dirty for unrelated buffers"
         );
 
-        // 3. `D3D12_GLOBAL_BARRIER`s (exact scope, ALL/COMMON, SYNC_NONE flush) -> clears `uav_dirty`.
+        // 3. `D3D12_GLOBAL_BARRIER`s (exact scope, ALL/COMMON, plus one-sided SYNC_NONE skipped) -> clears `uav_dirty`.
         let glob_barriers = [
             TitleGlobalBarrier {
                 sync_before: D3D12_BARRIER_SYNC_COMPUTE_SHADING.0 as u32,
@@ -3914,6 +4127,7 @@ mod tests {
                 access_before: D3D12_BARRIER_ACCESS_COMMON.0 as u32,
                 access_after: D3D12_BARRIER_ACCESS_COMMON.0 as u32,
             },
+            // One-sided SYNC_NONE must be skipped cleanly without tripping `Close()`.
             TitleGlobalBarrier {
                 sync_before: D3D12_BARRIER_SYNC_COMPUTE_SHADING.0 as u32,
                 sync_after: D3D12_BARRIER_SYNC_NONE.0 as u32,
@@ -3923,6 +4137,105 @@ mod tests {
         ];
         emit_barrier_groups(list, 1, true, &glob_barriers, &[]);
         assert!(!hl.uav_dirty(), "global barrier must clear uav_dirty");
+
+        // 4. Non-UAV `DEFAULT` buffer (`D3D12_RESOURCE_FLAG_NONE`) + `COMPUTE` command list
+        //    sanitization validated live on RTX 3090 D3D12 Debug Layer (`Close() == Ok`).
+        //    Keep `_non_uav_buf` alive until after `ExecuteCommandLists` + fence wait!
+        // SAFETY: creating a small non-UAV buffer and compute command list on live Debug Layer device.
+        let _non_uav_buf = unsafe {
+            let mut non_uav_buf: Option<ID3D12Resource> = None;
+            host.device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_DEFAULT,
+                        ..Default::default()
+                    },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                        Width: 4096,
+                        Height: 1,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                            Count: 1,
+                            Quality: 0,
+                        },
+                        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                        Flags: D3D12_RESOURCE_FLAG_NONE,
+                        ..Default::default()
+                    },
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut non_uav_buf,
+                )
+                .expect("non-UAV DEFAULT buffer");
+            let non_uav_buf = non_uav_buf.unwrap();
+            hl.list.CopyBufferRegion(&non_uav_buf, 0, &src_buf, 0, 256);
+            let list7: ID3D12GraphicsCommandList7 = hl.list.cast().expect("ID3D12GraphicsCommandList7");
+            let (sb, sa, ab, aa) = enhanced::sanitize_pair_with_uav(
+                (D3D12_BARRIER_SYNC_COPY.0 | D3D12_BARRIER_SYNC_COMPUTE_SHADING.0) as u32,
+                D3D12_BARRIER_SYNC_PIXEL_SHADING.0 as u32,
+                (D3D12_BARRIER_ACCESS_COPY_DEST.0 | D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0) as u32,
+                D3D12_BARRIER_ACCESS_SHADER_RESOURCE.0 as u32,
+                D3D12_COMMAND_LIST_TYPE_DIRECT,
+                true,
+                false,
+            )
+            .expect("non-UAV buffer barrier must sanitize cleanly");
+            let b = [D3D12_BUFFER_BARRIER {
+                SyncBefore: sb,
+                SyncAfter: sa,
+                AccessBefore: ab,
+                AccessAfter: aa,
+                pResource: std::mem::transmute_copy(&non_uav_buf),
+                Offset: 0,
+                Size: u64::MAX,
+            }];
+            let g = [D3D12_BARRIER_GROUP {
+                Type: D3D12_BARRIER_TYPE_BUFFER,
+                NumBarriers: 1,
+                Anonymous: D3D12_BARRIER_GROUP_0 {
+                    pBufferBarriers: b.as_ptr(),
+                },
+            }];
+            list7.Barrier(&g);
+
+            // Compute command list: graphics sync bits (`PIXEL_SHADING` / `DRAW`) must sanitize cleanly.
+            let comp_alloc: ID3D12CommandAllocator = host
+                .device
+                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE)
+                .expect("compute allocator");
+            let comp_list: ID3D12GraphicsCommandList7 = host
+                .device
+                .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, &comp_alloc, None)
+                .expect("compute list");
+            let (csb, csa, cab, caa) = enhanced::sanitize_pair(
+                D3D12_BARRIER_SYNC_COMPUTE_SHADING.0 as u32,
+                D3D12_BARRIER_SYNC_PIXEL_SHADING.0 as u32,
+                D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0 as u32,
+                D3D12_BARRIER_ACCESS_SHADER_RESOURCE.0 as u32,
+                D3D12_COMMAND_LIST_TYPE_COMPUTE,
+                false,
+            )
+            .expect("compute list barrier with graphics after-sync must sanitize");
+            let cg = [D3D12_GLOBAL_BARRIER {
+                SyncBefore: csb,
+                SyncAfter: csa,
+                AccessBefore: cab,
+                AccessAfter: caa,
+            }];
+            let cgroup = [D3D12_BARRIER_GROUP {
+                Type: D3D12_BARRIER_TYPE_GLOBAL,
+                NumBarriers: 1,
+                Anonymous: D3D12_BARRIER_GROUP_0 {
+                    pGlobalBarriers: cg.as_ptr(),
+                },
+            }];
+            comp_list.Barrier(&cgroup);
+            comp_list.Close().expect("compute list Close() must succeed");
+            non_uav_buf
+        };
 
         // Close and execute on a live Direct queue to force full GPU + Debug Layer validation.
         close(list);

@@ -1066,13 +1066,26 @@ fn record_level(
         if first && !sources.is_empty() {
             let pre: Vec<D3D12_BUFFER_BARRIER> = sources
                 .iter()
-                .map(|src| {
+                .filter_map(|src| {
+                    // `D3D12_HEAP_TYPE_UPLOAD` buffers are read-only on the GPU
+                    // (`COPY_DEST` is illegal on UPLOAD heaps); skip pre-barrier.
+                    let mut heap = D3D12_HEAP_PROPERTIES::default();
+                    // SAFETY: plain COM query on live buffer.
+                    if unsafe { src.GetHeapProperties(Some(&mut heap), None) }.is_ok()
+                        && heap.Type == D3D12_HEAP_TYPE_UPLOAD
+                    {
+                        return None;
+                    }
                     // SAFETY: plain COM query on live buffer.
                     let has_uav = unsafe { src.GetDesc() }
                         .Flags
                         .contains(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
-                    let ab = if has_uav { ACCESS_WRITE_BUF } else { ACCESS_WRITE_BUF_NO_UAV };
-                    buffer_barrier(src, SYNC_WRITE_BUF, SYNC_READ_BUF, ab, ACCESS_READ_SRC)
+                    let (sb, ab) = if has_uav {
+                        (SYNC_WRITE_BUF, ACCESS_WRITE_BUF)
+                    } else {
+                        (D3D12_BARRIER_SYNC_COPY, ACCESS_WRITE_BUF_NO_UAV)
+                    };
+                    Some(buffer_barrier(src, sb, SYNC_READ_BUF, ab, ACCESS_READ_SRC))
                 })
                 .collect();
             // SAFETY: open command list and live buffers.
@@ -1090,6 +1103,9 @@ fn record_level(
                               cur: &mut WriteMode,
                               was_read: &mut bool,
                               force_uav: bool| {
+            if target == WriteMode::None {
+                return;
+            }
             let (sa, aa) = target.sync_access();
             if *was_read {
                 let b = [buffer_barrier(
@@ -1104,7 +1120,8 @@ fn record_level(
                 *was_read = false;
                 *cur = target;
             } else if *cur == WriteMode::None {
-                let b = [buffer_barrier(between, SYNC_ALL_BUF, sa, ACCESS_ALL_BUF, aa)];
+                let ab = if between_uav { ACCESS_ALL_BUF } else { ACCESS_ALL_BUF_NO_UAV };
+                let b = [buffer_barrier(between, SYNC_ALL_BUF, sa, ab, aa)];
                 // SAFETY: open command list and live `between`.
                 unsafe { emit_enhanced(&list7, &b) };
                 *cur = target;
@@ -1210,6 +1227,9 @@ fn record_level(
         for dst in &dests {
             let raw = dst.as_raw() as usize;
             let first_mode = first_write_mode_of(raw);
+            if first_mode == WriteMode::None {
+                continue;
+            }
             let (sa, aa) = first_mode.sync_access();
             if source_set.contains(&raw) {
                 mid.push(buffer_barrier(dst, SYNC_READ_BUF, sa, ACCESS_READ_SRC, aa));
@@ -1314,9 +1334,11 @@ fn record_level(
                 }
             }
             flush_dst(&mut wave, &mut cur_mode, &mut bound_compute, &mut jobs_buf, &mut keep_old, need_uav_sep);
-            let (sb, ab) = cur_mode.sync_access();
-            let aa = if has_uav { ACCESS_ALL_BUF } else { ACCESS_ALL_BUF_NO_UAV };
-            post.push(buffer_barrier(dst, sb, SYNC_ALL_BUF, ab, aa));
+            if cur_mode != WriteMode::None {
+                let (sb, ab) = cur_mode.sync_access();
+                let aa = if has_uav { ACCESS_ALL_BUF } else { ACCESS_ALL_BUF_NO_UAV };
+                post.push(buffer_barrier(dst, sb, SYNC_ALL_BUF, ab, aa));
+            }
         }
 
         // 5. Post-Phase-2 targeted destination barriers.
@@ -1328,19 +1350,34 @@ fn record_level(
     // --- Legacy ResourceBarrier fallback (targeted per-buffer UAV barriers, zero UAV(NULL)) ---
     let common = D3D12_RESOURCE_STATE_COMMON;
     let generic_read = D3D12_RESOURCE_STATE_GENERIC_READ;
+    let is_upload_heap = |res: &ID3D12Resource| -> bool {
+        let mut heap = D3D12_HEAP_PROPERTIES::default();
+        // SAFETY: plain COM query on live buffer.
+        unsafe { res.GetHeapProperties(Some(&mut heap), None) }.is_ok()
+            && heap.Type == D3D12_HEAP_TYPE_UPLOAD
+    };
     let mut pre = Vec::new();
     if first {
         for src in &sources {
-            pre.push(uav_barrier(src));
+            // SAFETY: plain COM query on live buffer.
+            if unsafe { src.GetDesc() }
+                .Flags
+                .contains(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
+            {
+                pre.push(uav_barrier(src));
+            }
         }
         for dst in &dests {
-            if !source_set.contains(&(dst.as_raw() as usize)) {
+            let raw = dst.as_raw() as usize;
+            if !source_set.contains(&raw) && *dest_uav.get(&raw).unwrap_or(&false) {
                 pre.push(uav_barrier(dst));
             }
         }
     }
     for src in &sources {
-        pre.push(transition(src, common, generic_read));
+        if !is_upload_heap(src) {
+            pre.push(transition(src, common, generic_read));
+        }
     }
     if !pre.is_empty() {
         // SAFETY: open command list and live buffers.
@@ -1451,6 +1488,9 @@ fn record_level(
         mid.push(transition(between, between_state, generic_read));
     }
     for src in &sources {
+        if is_upload_heap(src) {
+            continue;
+        }
         let raw = src.as_raw() as usize;
         if dest_set.contains(&raw) {
             mid.push(transition(src, generic_read, first_write_mode_of(raw).legacy_state()));
@@ -2264,14 +2304,16 @@ mod tests {
     fn live_rtx3090_card_steps_batched_copy_debug_layer() {
         use windows::Win32::Graphics::Direct3D12::{
             D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_QUEUE_DESC, D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
-            D3D12_FENCE_FLAG_NONE, D3D12_HEAP_FLAG_NONE, D3D12_HEAP_PROPERTIES, D3D12_HEAP_TYPE_CUSTOM,
-            D3D12_HEAP_TYPE_DEFAULT, D3D12_MEMORY_POOL_L0, D3D12_MESSAGE, D3D12_MESSAGE_SEVERITY_CORRUPTION,
+            D3D12_FEATURE_D3D12_OPTIONS16, D3D12_FEATURE_DATA_D3D12_OPTIONS16, D3D12_FENCE_FLAG_NONE,
+            D3D12_HEAP_FLAG_NONE, D3D12_HEAP_PROPERTIES, D3D12_HEAP_TYPE_CUSTOM,
+            D3D12_HEAP_TYPE_DEFAULT, D3D12_HEAP_TYPE_GPU_UPLOAD, D3D12_HEAP_TYPE_UPLOAD,
+            D3D12_MEMORY_POOL_L0, D3D12_MESSAGE, D3D12_MESSAGE_SEVERITY_CORRUPTION,
             D3D12_MESSAGE_SEVERITY_ERROR, D3D12_RESOURCE_DESC, D3D12_RESOURCE_DIMENSION_BUFFER,
             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_NONE,
-            D3D12_RESOURCE_STATE_COMMON, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12CreateDevice,
-            D3D12GetDebugInterface, ID3D12CommandAllocator, ID3D12CommandList, ID3D12CommandQueue,
-            ID3D12Debug, ID3D12Device, ID3D12Fence, ID3D12GraphicsCommandList, ID3D12InfoQueue,
-            ID3D12Resource,
+            D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_GENERIC_READ,
+            D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12CreateDevice, D3D12GetDebugInterface,
+            ID3D12CommandAllocator, ID3D12CommandList, ID3D12CommandQueue, ID3D12Debug,
+            ID3D12Device, ID3D12Fence, ID3D12GraphicsCommandList, ID3D12InfoQueue, ID3D12Resource,
         };
 
         // SAFETY: standalone D3D12 Debug-Layer device + queue + buffers for live validation.
@@ -2383,6 +2425,77 @@ mod tests {
             let (dst_big, p_big) = make_shared(DST_BIG_SZ as u64, true);
             let (dst_ovl, p_ovl) = make_shared(DST_OVL_SZ as u64, true);
             let (dst_nouav, p_nouav) = make_shared(DST_NOUAV_SZ as u64, false);
+
+            // Additional non-UAV source buffers covering the exact Phase 9B.1
+            // `Close() -> E_INVALIDARG` regression shapes:
+            // (1) non-UAV `DEFAULT` `src` populated via `CopyBufferRegion`
+            // (2) non-UAV `GPU_UPLOAD` `src` (exact `GpuReadOnly` ReBAR shape)
+            // (3) non-UAV `UPLOAD` `src` (verifying `UPLOAD` pre-barrier skip)
+            const NOUAV_SRC_SZ: usize = 64 << 10;
+            let make_buf = |heap_type, init_state, allow_uav| -> ID3D12Resource {
+                let heap = D3D12_HEAP_PROPERTIES { Type: heap_type, ..Default::default() };
+                let desc = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: NOUAV_SRC_SZ as u64,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    Flags: if allow_uav {
+                        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
+                    } else {
+                        D3D12_RESOURCE_FLAG_NONE
+                    },
+                    ..Default::default()
+                };
+                let mut res: Option<ID3D12Resource> = None;
+                device
+                    .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, init_state, None, &mut res)
+                    .expect("CreateCommittedResource(nouav_src)");
+                res.unwrap()
+            };
+            let src_default_nouav = make_buf(D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, false);
+            let src_upload_stage = make_buf(D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, false);
+            let mut p_stage = std::ptr::null_mut();
+            src_upload_stage.Map(0, None, Some(&mut p_stage)).expect("Map(upload_stage)");
+            let ref_default_nouav: Vec<u8> = (0..NOUAV_SRC_SZ)
+                .map(|i| ((i.wrapping_mul(41) ^ (i >> 6) ^ 0x3C) & 0xff) as u8)
+                .collect();
+            std::ptr::copy_nonoverlapping(ref_default_nouav.as_ptr(), p_stage.cast::<u8>(), NOUAV_SRC_SZ);
+            // Populate `src_default_nouav` via `CopyBufferRegion` on the same list
+            // right before `record_level` so the non-UAV `COPY_DEST -> SRV|COPY_SOURCE`
+            // barrier is live-validated by the D3D12 Debug Layer.
+            list.CopyBufferRegion(&src_default_nouav, 0, &src_upload_stage, 0, NOUAV_SRC_SZ as u64);
+
+            let mut o16 = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
+            let has_gpu_upload = device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS16,
+                    (&raw mut o16).cast(),
+                    size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS16>() as u32,
+                )
+                .is_ok()
+                && o16.GPUUploadHeapSupported.as_bool();
+            let src_gpu_upload_nouav = if has_gpu_upload {
+                make_buf(D3D12_HEAP_TYPE_GPU_UPLOAD, D3D12_RESOURCE_STATE_COMMON, false)
+            } else {
+                make_buf(D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, false)
+            };
+            let mut p_gpu_up = std::ptr::null_mut();
+            src_gpu_upload_nouav.Map(0, None, Some(&mut p_gpu_up)).expect("Map(gpu_upload_nouav)");
+            let ref_gpu_upload_nouav: Vec<u8> = (0..NOUAV_SRC_SZ)
+                .map(|i| ((i.wrapping_mul(53) ^ (i >> 5) ^ 0x71) & 0xff) as u8)
+                .collect();
+            std::ptr::copy_nonoverlapping(ref_gpu_upload_nouav.as_ptr(), p_gpu_up.cast::<u8>(), NOUAV_SRC_SZ);
+
+            let src_upload_nouav = make_buf(D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, false);
+            let mut p_up_src = std::ptr::null_mut();
+            src_upload_nouav.Map(0, None, Some(&mut p_up_src)).expect("Map(upload_nouav)");
+            let ref_upload_nouav: Vec<u8> = (0..NOUAV_SRC_SZ)
+                .map(|i| ((i.wrapping_mul(67) ^ (i >> 4) ^ 0x9E) & 0xff) as u8)
+                .collect();
+            std::ptr::copy_nonoverlapping(ref_upload_nouav.as_ptr(), p_up_src.cast::<u8>(), NOUAV_SRC_SZ);
 
             let s0 = std::slice::from_raw_parts_mut(p_src0, SRC_SZ);
             let s1 = std::slice::from_raw_parts_mut(p_src1, SRC_SZ);
@@ -2501,7 +2614,8 @@ mod tests {
                 );
             }
 
-            // C. Non-UAV destination buffer (must automatically fall back to CopyBufferRegion).
+            // C. Non-UAV destination buffer + non-UAV DEFAULT / GPU_UPLOAD / UPLOAD source buffers
+            //    (both 4-byte aligned compute-copied and unaligned CopyBufferRegion fallback).
             push_op(
                 &mut reads_l0,
                 &mut writes_l0,
@@ -2528,6 +2642,101 @@ mod tests {
                 4096,
                 19,
             );
+            push_op(
+                &mut reads_l0,
+                &mut writes_l0,
+                &mut ref_between,
+                &mut cursor,
+                &src_default_nouav,
+                &ref_default_nouav,
+                0x100,
+                &dst_nouav,
+                &mut ref_nouav,
+                8192,
+                2048,
+            );
+            push_op(
+                &mut reads_l0,
+                &mut writes_l0,
+                &mut ref_between,
+                &mut cursor,
+                &src_default_nouav,
+                &ref_default_nouav,
+                0x1003,
+                &dst_nouav,
+                &mut ref_nouav,
+                10240,
+                29,
+            );
+            push_op(
+                &mut reads_l0,
+                &mut writes_l0,
+                &mut ref_between,
+                &mut cursor,
+                &src_gpu_upload_nouav,
+                &ref_gpu_upload_nouav,
+                0x200,
+                &dst_nouav,
+                &mut ref_nouav,
+                12288,
+                2048,
+            );
+            push_op(
+                &mut reads_l0,
+                &mut writes_l0,
+                &mut ref_between,
+                &mut cursor,
+                &src_gpu_upload_nouav,
+                &ref_gpu_upload_nouav,
+                0x2005,
+                &dst_nouav,
+                &mut ref_nouav,
+                14336,
+                23,
+            );
+            push_op(
+                &mut reads_l0,
+                &mut writes_l0,
+                &mut ref_between,
+                &mut cursor,
+                &src_upload_nouav,
+                &ref_upload_nouav,
+                0x300,
+                &dst_nouav,
+                &mut ref_nouav,
+                16384,
+                1024,
+            );
+            // Also read non-UAV DEFAULT & GPU_UPLOAD sources into UAV `dst_big` (batched compute path).
+            push_op(
+                &mut reads_l0,
+                &mut writes_l0,
+                &mut ref_between,
+                &mut cursor,
+                &src_default_nouav,
+                &ref_default_nouav,
+                0x400,
+                &dst_big,
+                &mut ref_big,
+                dst_pos,
+                1024,
+            );
+            dst_pos += 1024;
+            push_op(
+                &mut reads_l0,
+                &mut writes_l0,
+                &mut ref_between,
+                &mut cursor,
+                &src_gpu_upload_nouav,
+                &ref_gpu_upload_nouav,
+                0x500,
+                &dst_big,
+                &mut ref_big,
+                dst_pos,
+                1024,
+            );
+            dst_pos += 1024;
+            let _ = dst_pos;
 
             // D. Same-buffer swap on `src0` (reads `[0xF0000..+512)` and `[0xF1000..+512)`, swaps them).
             let at_sw0 = cursor;
