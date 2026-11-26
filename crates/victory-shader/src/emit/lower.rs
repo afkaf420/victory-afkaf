@@ -1195,6 +1195,30 @@ impl<'a> Lower<'a> {
             }
             Some(self.handle((b, i), &src, false, (11, 0))?)
         };
+        if sub.is_none()
+            && let Some(h) = h
+        {
+            let c = self.cur;
+            let (u, mask, al) = (
+                self.s.m.undef(self.s.t.i32),
+                self.s.m.i8((1u8 << n) - 1),
+                self.s.m.i32(4),
+            );
+            let r = self.s.op(
+                c,
+                "rawBufferLoad.f32",
+                Attr::ReadOnly,
+                self.s.t.res_ret,
+                139,
+                &[h, off, u, mask, al],
+            );
+            for k in 0..n {
+                let x = self.s.m.extract(c, r, k);
+                let x = self.as_int(x);
+                self.write(inst, Reg::V(reg + k as u8), x, guard);
+            }
+            return Ok(());
+        }
         let dword = |l: &mut Self, byte: V| -> Result<V, Why> {
             match h {
                 None => l.code_dword(byte),
@@ -3188,7 +3212,24 @@ impl<'a> Lower<'a> {
     /// `0 × anything = 0`, as in D3D9.
     fn legacy_mul(&mut self, a: V, b: V) -> V {
         let c = self.cur;
+        let fa = self.s.m.float_value(a);
+        let fb = self.s.m.float_value(b);
+        if fa.is_some_and(|x| x == 0.0) || fb.is_some_and(|x| x == 0.0) {
+            return self.s.m.f32(0);
+        }
+        // `x * x` is bit-for-bit identical to IEEE `fmul` across all 2^32 f32
+        // patterns (`(±0)^2 = +0`, `(±Inf)^2 = +Inf`, `NaN^2 = NaN`).
+        if self.s.m.same_bits(a, b) {
+            return self.s.m.bin(c, Bin::Mul, a, b);
+        }
         let m = self.s.m.bin(c, Bin::Mul, a, b);
+        // A finite non-zero constant can never produce `0 * Inf` or `0 * NaN`,
+        // so plain IEEE `fmul` matches without 0-check overhead and unlocks FFMA.
+        if fa.is_some_and(|x| x.is_finite() && x != 0.0)
+            || fb.is_some_and(|x| x.is_finite() && x != 0.0)
+        {
+            return m;
+        }
         let zero = self.s.m.f32(0);
         let az = self.s.m.cmp(c, pred::OEQ, a, zero);
         let bz = self.s.m.cmp(c, pred::OEQ, b, zero);
@@ -5602,73 +5643,6 @@ impl<'a> Lower<'a> {
         // The host's table of strides by heap slot tells a buffer view
         // (not 0) from anything else, which is still read as a constant
         // buffer; only the load that fits the slot runs.
-        let picked = match kind {
-            None => self.slot_stride(src)?,
-            Some(_) => None,
-        };
-        if let Some(stride) = picked {
-            let zero = self.s.m.i32(0);
-            let is_buffer = self.s.m.cmp(self.cur, pred::NE, stride, zero);
-            let at = self.begin_guarded(Some(is_buffer));
-            let h = self.handle(site, src, false, (11, 0))?;
-            let mut raw = Vec::new();
-            for k in 0..count {
-                let b = self.cur;
-                let off = self.s.m.i32(4 * k);
-                let a = self.s.m.bin(b, Bin::Add, addr, off);
-                let mask = self.s.m.i8(1);
-                let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
-                let r = self.s.op(
-                    b,
-                    "rawBufferLoad.f32",
-                    Attr::ReadOnly,
-                    self.s.t.res_ret,
-                    139,
-                    &[h, a, u, mask, al],
-                );
-                let x = self.s.m.extract(b, r, 0);
-                let x = self.as_int(x);
-                raw.push((x, zero));
-            }
-            let raw = self.end_guarded(at, &raw);
-            let other = self.s.m.cmp(self.cur, pred::EQ, stride, zero);
-            let at = self.begin_guarded(Some(other));
-            let h = self.handle(site, src, false, (13, 0x1_0000))?;
-            let mut both = Vec::new();
-            for (k, &r) in raw.iter().enumerate() {
-                let b = self.cur;
-                let off = self.s.m.i32(4 * k as u32);
-                let a = self.s.m.bin(b, Bin::Add, addr, off);
-                let x = self.cbuffer_dword(h, a);
-                both.push((x, r));
-            }
-            let both = self.end_guarded(at, &both);
-            self.write_smem_words(inst, code, both, coherent);
-            return Ok(());
-        }
-        if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
-            let h = self.handle(site, src, false, (11, 0))?;
-            let mut loaded = Vec::with_capacity(count as usize);
-            for k in 0..count {
-                let off = self.s.m.i32(4 * k);
-                let a = self.s.m.bin(c, Bin::Add, addr, off);
-                let mask = self.s.m.i8(1);
-                let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
-                let r = self.s.op(
-                    c,
-                    "rawBufferLoad.f32",
-                    Attr::ReadOnly,
-                    self.s.t.res_ret,
-                    139,
-                    &[h, a, u, mask, al],
-                );
-                let x = self.s.m.extract(c, r, 0);
-                loaded.push(self.as_int(x));
-            }
-            self.write_smem_words(inst, code, loaded, coherent);
-            return Ok(());
-        }
-        let h = self.handle(site, src, false, (13, 0x1_0000))?;
         let constant = match addr {
             V::Const(_)
                 if matches!(soffset, Operand::Scalar { code: NULL, .. }) && extra.is_none() =>
@@ -5677,6 +5651,140 @@ impl<'a> Lower<'a> {
             }
             _ => None,
         };
+        let picked = match kind {
+            None => self.slot_stride(src)?,
+            Some(_) => None,
+        };
+        if let Some(stride) = picked {
+            let zero = self.s.m.i32(0);
+            let is_buffer = self.s.m.cmp(self.cur, pred::NE, stride, zero);
+            let head = self.cur;
+            let (raw_blk, cbuf_blk, join_blk) = (
+                self.s.m.new_block(),
+                self.s.m.new_block(),
+                self.s.m.new_block(),
+            );
+            self.s
+                .m
+                .terminate(head, Term::CondBr(is_buffer, raw_blk, cbuf_blk));
+            // Raw SRV path: 4-wide 128-bit `rawBufferLoad` chunks.
+            self.cur = raw_blk;
+            let h = self.handle(site, src, false, (11, 0))?;
+            let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
+            let mut raw = Vec::with_capacity(count as usize);
+            let mut k = 0u32;
+            while k < count {
+                let b = self.cur;
+                let chunk = (count - k).min(4);
+                let a = if k == 0 {
+                    addr
+                } else {
+                    let off = self.s.m.i32(4 * k);
+                    self.s.m.bin(b, Bin::Add, addr, off)
+                };
+                let mask = self.s.m.i8((1u8 << chunk) - 1);
+                let r = self.s.op(
+                    b,
+                    "rawBufferLoad.f32",
+                    Attr::ReadOnly,
+                    self.s.t.res_ret,
+                    139,
+                    &[h, a, u, mask, al],
+                );
+                for ch in 0..chunk {
+                    let x = self.s.m.extract(b, r, ch);
+                    raw.push(self.as_int(x));
+                }
+                k += chunk;
+            }
+            let raw_end = self.cur;
+            self.s.m.terminate(raw_end, Term::Br(join_blk));
+            // Constant-buffer path: reuse 16-byte rows when offset is constant.
+            self.cur = cbuf_blk;
+            let h = self.handle(site, src, false, (13, 0x1_0000))?;
+            let mut rows: HashMap<u32, V> = HashMap::new();
+            let mut cbuf = Vec::with_capacity(count as usize);
+            for k in 0..count {
+                let b = self.cur;
+                let x = match constant {
+                    Some(base) => {
+                        let byte = base + 4 * k;
+                        let row = match rows.get(&(byte >> 4)) {
+                            Some(&r) => r,
+                            None => {
+                                let ri = self.s.m.i32(byte >> 4);
+                                let r = self.s.op(
+                                    b,
+                                    "cbufferLoadLegacy.i32",
+                                    Attr::ReadOnly,
+                                    self.s.t.cbuf_ret,
+                                    59,
+                                    &[h, ri],
+                                );
+                                rows.insert(byte >> 4, r);
+                                r
+                            }
+                        };
+                        self.s.m.extract(b, row, (byte >> 2) & 3)
+                    }
+                    None => {
+                        let a = if k == 0 {
+                            addr
+                        } else {
+                            let off = self.s.m.i32(4 * k);
+                            self.s.m.bin(b, Bin::Add, addr, off)
+                        };
+                        self.cbuffer_dword(h, a)
+                    }
+                };
+                cbuf.push(x);
+            }
+            let cbuf_end = self.cur;
+            self.s.m.terminate(cbuf_end, Term::Br(join_blk));
+            self.cur = join_blk;
+            let mut both = Vec::with_capacity(count as usize);
+            for (r, c_val) in raw.into_iter().zip(cbuf) {
+                let ty = self.s.m.type_of(r);
+                let phi = self.s.m.phi(join_blk, ty);
+                self.s.m.set_phi(phi, vec![(r, raw_end), (c_val, cbuf_end)]);
+                both.push(phi);
+            }
+            self.write_smem_words(inst, code, both, coherent);
+            return Ok(());
+        }
+        if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
+            let h = self.handle(site, src, false, (11, 0))?;
+            let c = self.cur;
+            let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
+            let mut loaded = Vec::with_capacity(count as usize);
+            let mut k = 0u32;
+            while k < count {
+                let chunk = (count - k).min(4);
+                let a = if k == 0 {
+                    addr
+                } else {
+                    let off = self.s.m.i32(4 * k);
+                    self.s.m.bin(c, Bin::Add, addr, off)
+                };
+                let mask = self.s.m.i8((1u8 << chunk) - 1);
+                let r = self.s.op(
+                    c,
+                    "rawBufferLoad.f32",
+                    Attr::ReadOnly,
+                    self.s.t.res_ret,
+                    139,
+                    &[h, a, u, mask, al],
+                );
+                for ch in 0..chunk {
+                    let x = self.s.m.extract(c, r, ch);
+                    loaded.push(self.as_int(x));
+                }
+                k += chunk;
+            }
+            self.write_smem_words(inst, code, loaded, coherent);
+            return Ok(());
+        }
+        let h = self.handle(site, src, false, (13, 0x1_0000))?;
         let mut rows: HashMap<u32, V> = HashMap::new();
         let mut loaded = Vec::with_capacity(count as usize);
         for k in 0..count {

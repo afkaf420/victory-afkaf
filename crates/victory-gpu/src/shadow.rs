@@ -105,6 +105,11 @@ struct Card {
     /// this card copy, disabling `copy_diff64` so CPU resets to prior byte
     /// values (e.g. zeroing a GPU-written counter) always upload full dirty pages.
     gpu_written: AtomicBool,
+    /// Highest `Host::fence` value of a graphics submission that uploaded to
+    /// (`COPY_DEST`) or declared a shader write (`UNORDERED_ACCESS`) to this
+    /// card copy. Used by `Host::relay_card_back` to issue zero-wait readbacks
+    /// on the dedicated COPY queue whenever `last_gpu_fence <= completed`.
+    last_gpu_fence: AtomicU64,
 }
 
 /// Whether the host copies of big title buffers are in the card's own
@@ -3137,6 +3142,22 @@ impl Shadow {
         self.card.is_some()
     }
 
+    /// Records that graphics submission `fence` uploads to or declares a UAV
+    /// write on this card copy (`Host::card_before`).
+    pub(crate) fn note_gpu_write_fence(&self, fence: u64) {
+        if let Some(card) = &self.card {
+            card.last_gpu_fence.fetch_max(fence, Ordering::Release);
+        }
+    }
+
+    /// Highest `Host::fence` value of a graphics submission that writes this
+    /// card copy (0 if none recorded).
+    pub(crate) fn last_gpu_write_fence(&self) -> u64 {
+        self.card
+            .as_ref()
+            .map_or(0, |c| c.last_gpu_fence.load(Ordering::Acquire))
+    }
+
     /// Whether this copy is eligible for 64-byte cacheline diffing
     /// ([`Shadow::copy_diff64`]): strictly read-only card-backed windows that
     /// have never been written by the GPU.
@@ -3566,6 +3587,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     sent: Mutex::default(),
                     size,
                     gpu_written: AtomicBool::new(false),
+                    last_gpu_fence: AtomicU64::new(0),
                 };
                 (on_card, Some(card))
             }
@@ -3783,6 +3805,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 sent: Mutex::default(),
                 size: len,
                 gpu_written: AtomicBool::new(false),
+                last_gpu_fence: AtomicU64::new(0),
             };
             (on_card, Some(card))
         }
@@ -3822,6 +3845,7 @@ pub(crate) fn test_card_shadow(len: u64) -> Option<Arc<Shadow>> {
         sent: Mutex::default(),
         size: len,
         gpu_written: AtomicBool::new(false),
+        last_gpu_fence: AtomicU64::new(0),
     });
     Some(Arc::new(s))
 }
@@ -4094,6 +4118,7 @@ mod window_tests {
                 sent: Mutex::default(),
                 size: PAGE as u64,
                 gpu_written: AtomicBool::new(false),
+                last_gpu_fence: std::sync::atomic::AtomicU64::new(0),
             });
             s
         };

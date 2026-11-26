@@ -54,6 +54,7 @@ static const uint GROUPS = 1u << 20;
 void main(uint3 id : SV_DispatchThreadID) {
     uint eff_count = records;
     bool ahead = (has_count & 2u) != 0;
+    bool spec_tail = ahead && id.x > 0u;
     if ((has_count & 1u) != 0) {
         eff_count = min(eff_count, count_buf.Load(count_offset));
     }
@@ -66,7 +67,9 @@ void main(uint3 id : SV_DispatchThreadID) {
     if (kind <= 1) {
         // Draws: vertex or index count, then instances.
         uint2 asked = src_args.Load2(src_at);
-        if (ahead && (asked.x > (1u << 24) || asked.y > (1u << 24))) {
+        if ((ahead && (asked.x > (1u << 24) || asked.y > (1u << 24)))
+            || (spec_tail && (asked.x == 0u || asked.y == 0u)))
+        {
             asked = uint2(0, 0);
         }
         uint count = min(asked.x, 1u << 24);
@@ -82,20 +85,25 @@ void main(uint3 id : SV_DispatchThreadID) {
         cost = g.x * g.y * g.z * 64u;
         groups = g;
     } else {
-        // Mesh dispatches: the console's are one-dimensional.
+        // Mesh dispatches: the console's are one-dimensional (groups_x, 1, 1).
         uint3 g = src_args.Load3(src_at);
-        // Ahead of its draw, a record over the most a dispatch runs is a
-        // slot the title has not filled (the title leaves all
-        // ones there): empty, and not counted below either.
-        if (ahead && g.x > 65535u) {
+        // Ahead of its draw, speculative tail slots past the active draw array
+        // may hold unfilled sentinels (0xFFFF_FFFF) or adjacent sub-allocations
+        // (e.g. 0x7FFF / 0xFFFF 16-bit indices where y/z != 1). Reject invalid
+        // speculative slots without charging the list budget or polluting
+        // mesh-dispatch diagnostics; slot 0 (guaranteed drawn) is always clamped.
+        bool skip_mesh = (ahead && g.x > 65535u)
+            || (spec_tail && (g.y != 1u || g.z != 1u));
+        if (skip_mesh) {
             g = uint3(0, 0, 0);
+        } else {
+            // Diagnostics, in the budget buffer's next words: the largest
+            // group count a mesh record asked for, and the groups asked in all.
+            uint was;
+            budget.InterlockedMax(4, g.x, was);
+            budget.InterlockedAdd(8, min(g.x, 1u << 24), was);
+            g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
         }
-        // Diagnostics, in the budget buffer's next words: the largest
-        // group count a mesh record asked for, and the groups asked in all.
-        uint was;
-        budget.InterlockedMax(4, g.x, was);
-        budget.InterlockedAdd(8, min(g.x, 1u << 24), was);
-        g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
         cost = g.x * g.y * g.z * 128u;
         groups = g;
     }
@@ -1467,6 +1475,64 @@ void main() {
                 "D3D12 Debug Layer reported {} error(s): {errors:?}",
                 errors.len()
             );
+        }
+    }
+
+    /// Speculative `bound_ahead` (`ahead=true`) tail slots past the active mesh
+    /// draw array may contain unrelated heap data such as `0x7FFF` (`32767`) or
+    /// `0xFFFF` (`65535`) with `y/z != 1`. Verify they are zeroed without
+    /// charging the list budget or polluting mesh-dispatch diagnostics.
+    #[test]
+    fn ahead_speculative_mesh_tail_rejects_non_1d_garbage_without_polluting_stats() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        const KIND_MESH: u32 = 10;
+        const STRIDE: u32 = 32;
+        const RECORDS: u32 = 4;
+        let (src_buf, src_ptr, _) = warp.shared_buffer(u64::from(STRIDE * RECORDS));
+        let (dst_buf, dst_ptr, _) = warp.shared_buffer(u64::from(STRIDE * RECORDS));
+        let (_budget_buf, budget_ptr, budget_gpu) = warp.shared_buffer(64);
+        // SAFETY: zeroed shared buffers mapped for 4x32B records + 64B budget.
+        unsafe {
+            std::ptr::write_bytes(src_ptr, 0, (STRIDE * RECORDS) as usize);
+            std::ptr::write_bytes(dst_ptr, 0, (STRIDE * RECORDS) as usize);
+            std::ptr::write_bytes(budget_ptr, 0, 64);
+            let words = std::slice::from_raw_parts_mut(src_ptr.cast::<u32>(), (STRIDE * RECORDS / 4) as usize);
+            // Slot 0 (active draw): valid 1D mesh (12, 1, 1)
+            words[0] = 12; words[1] = 1; words[2] = 1;
+            // Slot 1 (speculative tail): adjacent 16-bit 0x7FFF + float (y != 1)
+            words[8] = 32767; words[9] = 0x3F80_0000; words[10] = 0;
+            // Slot 2 (speculative tail): adjacent 0xFFFF sentinel pair (y != 1)
+            words[16] = 65535; words[17] = 65535; words[18] = 0;
+            // Slot 3 (speculative tail): unfilled 0xFFFF_FFFF
+            words[24] = u32::MAX; words[25] = 1; words[26] = 1;
+        }
+        assert!(record_clamp_as(
+            &warp.clamp,
+            &warp.list,
+            &dst_buf,
+            D3D12_RESOURCE_STATE_COMMON,
+            budget_gpu,
+            (&src_buf, 0),
+            None,
+            (KIND_MESH, STRIDE, RECORDS),
+            true,
+            true,
+        ));
+        done_on(&warp.list, &dst_buf);
+        warp.submit_and_wait();
+        // SAFETY: GPU finished writing `dst_buf` and `budget_buf`.
+        unsafe {
+            let out = std::slice::from_raw_parts(dst_ptr.cast::<u32>(), (STRIDE * RECORDS / 4) as usize);
+            assert_eq!((out[0], out[1], out[2]), (12, 1, 1));
+            assert_eq!((out[8], out[9], out[10]), (0, 0, 0), "non-1D 32767 tail must be zeroed");
+            assert_eq!((out[16], out[17], out[18]), (0, 0, 0), "non-1D 65535 tail must be zeroed");
+            assert_eq!((out[24], out[25], out[26]), (0, 0, 0), "0xFFFF_FFFF tail must be zeroed");
+            let stats = std::slice::from_raw_parts(budget_ptr.cast::<u32>(), 3);
+            assert_eq!(stats[0], 12 * 128, "only active slot 0 must charge budget");
+            assert_eq!(stats[1], 12, "largest mesh group count must not be polluted by 32767/65535 tails");
+            assert_eq!(stats[2], 12, "total mesh group count must not be inflated by tails");
         }
     }
 }

@@ -326,6 +326,40 @@ impl Module {
         }
     }
 
+    /// The value of a 32-bit float constant (including an `i32 -> f32` bitcast
+    /// of an integer constant); `None` for anything else.
+    pub fn float_value(&self, v: V) -> Option<f32> {
+        match v {
+            V::Const(i) => match self.consts[i as usize].1 {
+                Const::Float(bits) => Some(f32::from_bits(bits)),
+                _ => None,
+            },
+            V::Inst(id) => match self.insts[id as usize].op {
+                Op::Cast(Cast::Bitcast, V::Const(i)) => match self.consts[i as usize].1 {
+                    Const::Int(bits) => Some(f32::from_bits(bits as u32)),
+                    _ => None,
+                },
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Whether two 32-bit values represent the exact same bit pattern
+    /// (identical SSA values or two bitcasts of the same underlying value).
+    pub fn same_bits(&self, a: V, b: V) -> bool {
+        let unwrap = |mut v: V| -> V {
+            while let V::Inst(id) = v {
+                match self.insts[id as usize].op {
+                    Op::Cast(Cast::Bitcast, src) => v = src,
+                    _ => break,
+                }
+            }
+            v
+        };
+        a == b || unwrap(a) == unwrap(b)
+    }
+
     /// Gives constant `old` the content of `new` (both stay valid).
     pub fn replace_const(&mut self, old: V, new: V) {
         if let (V::Const(o), V::Const(n)) = (old, new) {

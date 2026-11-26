@@ -156,8 +156,11 @@ struct Window {
     scratch: ID3D12Resource,
 }
 
-/// The most records clamped in one pass ([`windows`]).
-const WINDOW_MOST: u64 = 256;
+/// The most records clamped in one pass ([`windows`]). Kept at 64 so
+/// speculative ahead clamping delivers up to 64x fewer clamp dispatches
+/// without overshooting hundreds of slots past short draw lists into
+/// adjacent heap sub-allocations.
+const WINDOW_MOST: u64 = 64;
 
 /// Whether indirect draws that read record after record of one argument
 /// buffer are clamped a window at a time (`VICTORY_INDIRECT_WINDOW`; on by
@@ -1538,7 +1541,7 @@ impl State {
             .entry(std::ptr::from_ref(host) as usize)
             .or_insert_with(|| (0, Ranges::new()));
         let changed = host.buffer_changes();
-        let slots = if *passes % 16 == 0 {
+        let slots = if *passes % 64 == 0 {
             ranges.clear();
             host.buffer_slots()
         } else {
