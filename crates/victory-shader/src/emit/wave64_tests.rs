@@ -1971,3 +1971,62 @@ fn wave_local_drops_unused_exchange_lds_and_entry_barrier() {
         assert!((got & 0xFF) < 32, "local lane must be in 0..32 for lane {t}, got {}", got & 0xFF);
     }
 }
+
+/// Phase 9A.1 regression test: under `with_local_waves` with zero LDS
+/// (`halves == None`), when a lane-mask ballot defined in block 0 is first read
+/// as data (`s_bcnt1_i32_b64`) in a LATER block (`self.cur > at`), `console_lane()`
+/// must still emit `waveGetLaneIndex` in the entry block so `exchange_halves(at, ...)`
+/// never creates a forward reference outside a phi (`bitcode.rs:959`).
+#[test]
+fn wave_local_zero_lds_earlier_block_ballot_has_no_forward_reference() {
+    let words = [
+        // Block 0: compute lane mask in s[16:17] (`v_cmp_lt_u32 s[16:17], v0, 4`)
+        0xD48A_0010,
+        (132 << 9) | (256 + 0), // v_cmp_lt_u32 s[16:17], v0, 4 (VOP3B? no: VOP3A sd=16)
+        // Unconditional branch to block 1 so `self.cur > at (block 0)` when mask is read!
+        0xBF82_0000, // s_branch +0 (splits into a second IR block!)
+        // Block 1: read s[16:17] as data (`s_bcnt1_i32_b64 s18, s[16:17]`), triggering
+        // `exchange_halves(at = block 0, ...)` from `self.cur = block 1`!
+        0xBE92_1010, // s_bcnt1_i32_b64 s18, s[16:17] (SOP1 op=0x10)
+        0x7E0C_0212, // v_mov_b32 v6, s18
+        // UAV[v0] = v6
+        0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+        (0x38 << 26) | (0x1C << 18) | (1 << 12),
+        (128 << 24) | (2 << 16) | (6 << 8) | 2,
+    ];
+    let mut native = native_of(&words, true, 128);
+    if let StageIo::Cs(ref mut cs) = native.io {
+        cs.threads = [8, 16, 1];
+        cs.rsrc2 = (5 << 1) | (1 << 11);
+    }
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    assert!(p.blocks.len() >= 2, "must have >= 2 blocks so self.cur > at");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let was_w = lower::TEST_HOST_WAVE.replace(Some(32));
+    let mut l = lower::with_local_waves(|| {
+        lower::lower(&lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        })
+    })
+    .expect("lower wave_local earlier-block ballot must not panic with forward reference");
+    lower::TEST_HOST_WAVE.set(was_w);
+    assert_eq!(l.lds_dwords, 0);
+    assert_eq!(l.barriers, 0);
+    assert_eq!(l.atomic_rmws, 0);
+    if let Ok(mut v) =
+        validator::Validator::load(validator::Validator::default_path().as_deref())
+    {
+        v.validate(&mut l.dxil)
+            .expect("earlier-block ballot DXIL validation failed");
+    }
+}

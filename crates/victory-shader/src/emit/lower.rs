@@ -3554,16 +3554,24 @@ impl<'a> Lower<'a> {
     /// This thread's console lane (0..63): its relabelled thread index (`thread_id`), whose host
     /// wave holds a 32-aligned run of console lanes. Without `exchange`: the host lane.
     fn console_lane(&mut self) -> V {
-        if self.exchange.is_none() || (self.local && self.halves.is_none()) {
+        if self.exchange.is_none() {
             return self.lane_index();
         }
         if let Some(v) = self.clane {
             return v;
         }
         let e = self.s.entry;
-        let f = self.console_thread();
-        let k63 = self.s.m.i32(63);
-        let cl = self.s.m.bin(e, Bin::And, f, k63);
+        // Must always emit in `self.s.entry` (not `self.cur`) because callers
+        // such as `exchange_multi(at, ...)` materialize exchanges into earlier
+        // blocks `at < self.cur`.
+        let cl = if self.local && self.halves.is_none() {
+            self.s
+                .op(e, "waveGetLaneIndex", Attr::ReadOnly, self.s.t.i32, 111, &[])
+        } else {
+            let f = self.console_thread();
+            let k63 = self.s.m.i32(63);
+            self.s.m.bin(e, Bin::And, f, k63)
+        };
         self.s.flags |= flags::WAVE_OPS;
         self.clane = Some(cl);
         cl
