@@ -1177,3 +1177,77 @@ fn per_lane_self_loop_and_latch_are_not_all_lanes_and_emit_no_loop_sync() {
     assert!(all_d[skip_join], "acyclic diamond merge must stay all_lanes");
     assert!(all_d[uniform_latch], "uniform loop latch must stay all_lanes");
 }
+
+/// A 64-thread Wave64 CS with an LDS write and LDS read inside the same
+/// per-lane branch region cannot lower to Wave32 without widening (all
+/// non-widened retries keep `WaveSize=64`, which Wave32 hosts refuse with
+/// `E_INVALIDARG`). Last-resort widening in `emit::emit()` rescues it cleanly
+/// to `WaveSize=32`, validates with `dxil.dll`, builds a live PSO, and runs
+/// accurately on the RTX 3090 without setting `VICTORY_WAVE_WIDE=1`.
+#[test]
+fn last_resort_widen_rescues_wave64_lds_conflict_on_wave32() {
+    let words = [
+        // Divergent branch: lanes with v0 < s0 enter and do LDS write + LDS read.
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_000B, // s_cbranch_execz +11 dwords (to restore exec)
+        0x3404_0082, // v_lshlrev_b32 v2, 2, v0 (byte offset = t * 4)
+        0x4A06_0001, // v_add_nc_u32 v3, s1, v0 (val = s1 + t)
+        0xD834_0000,
+        0x0000_0302, // ds_write_b32 v2, v3
+        0xBF8A_0000, // s_barrier
+        // Read partner lane (t ^ 32)'s LDS slot:
+        0x3A08_00A0, // v_xor_b32 v4, 32, v0
+        0x3408_0882, // v_lshlrev_b32 v4, 2, v4
+        0xD8D8_0000,
+        0x0500_0004, // ds_read_b32 v5, v4
+        (0x38 << 26) | (0x1C << 18) | (1 << 12),
+        (128 << 24) | (2 << 16) | (5 << 8) | 2, // buffer_store_dword v5, v2, s[8:11], 0 offen
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+    ];
+    let mut native = native_of(&words, true, 64);
+    native.io = StageIo::Cs(ComputeIo {
+        rsrc2: (5 << 1) | (1 << 15), // 5 user SGPRs + 512 B LDS
+        threads: [64, 1, 1],
+    });
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let empty_dxbc = super::container::build(&[]);
+    let container = crate::dxbc::Container::parse(&empty_dxbc).expect("empty container");
+
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let shader = super::emit(&container, &native, &p, &st, &io, &res)
+        .expect("last-resort widen should rescue Wave64 LDS conflict on Wave32");
+    lower::TEST_HOST_WAVE.set(was);
+
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy)
+            .expect("rescued Wave64 CS DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else { return };
+    let (root, pso) = host
+        .compute_pipeline(&shader)
+        .expect("Wave32 host must accept rescued shader (WaveSize <= 32)");
+    let ud = [64u32, 100, 0, 0];
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(ud.to_vec()))],
+                views: &[View::RawUav(64)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .expect("dispatch rescued shader");
+    for t in 0..64u32 {
+        assert_eq!(out[0][t as usize], 100 + (t ^ 32), "lane {t}");
+    }
+}

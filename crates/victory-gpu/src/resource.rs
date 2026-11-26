@@ -1468,21 +1468,33 @@ pub(crate) fn room_lately() -> bool {
     room
 }
 
-/// The share of the card's budget, in percent, up to which host copies of
-/// textures picked by index are made ([`room`]): 90 unless
-/// `VICTORY_TEXTURE_ROOM_PERCENT` says another (50 to 97). At 90 about a
-/// tenth of the budget, 1,020 MB of 10,200, stays unused while thousands of
-/// textures wait (runs 170-174); the card copies of title buffers from
-/// 1 MiB up take 449 MB more of the card than before (941 against 492),
-/// and 94 gives the textures about that much back.
+/// Resolves `VICTORY_TEXTURE_ROOM_PERCENT`: honors an explicit override
+/// (clamped to `50..=97`), otherwise defaults to `94` on high-VRAM GPUs
+/// (>= 16 GiB dedicated VRAM, leaving ~1.4 GiB headroom on 24 GiB cards)
+/// and `90` on smaller GPUs.
 #[cfg(windows)]
-fn room_percent() -> u64 {
+fn resolve_room_percent(env: Option<&str>, high_vram: bool) -> u64 {
+    let default = if high_vram { 94 } else { 90 };
+    env.and_then(|v| v.trim().parse::<u64>().ok())
+        .map_or(default, |percent| percent.clamp(50, 97))
+}
+
+/// The share of the card's budget, in percent, up to which host copies of
+/// textures picked by index are made ([`room`]): 94 on high-VRAM GPUs
+/// (>= 16 GiB dedicated VRAM) or 90 on smaller GPUs unless
+/// `VICTORY_TEXTURE_ROOM_PERCENT` says another (50 to 97). At 90 about a
+/// tenth of the budget, 1,020 MB of 10,200 (or 2,274 MB of 22,737 on a
+/// 24 GiB card), stays unused while thousands of textures wait (runs
+/// 170-174); the card copies of title buffers from 1 MiB up take 449 MB
+/// more of the card than before (941 against 492), and 94 gives the
+/// textures about that much back while preserving >1 GiB headroom on
+/// 24 GiB cards.
+#[cfg(windows)]
+pub(crate) fn room_percent() -> u64 {
     static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *PERCENT.get_or_init(|| {
-        std::env::var("VICTORY_TEXTURE_ROOM_PERCENT")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(90, |percent| percent.clamp(50, 97))
+        let env = std::env::var("VICTORY_TEXTURE_ROOM_PERCENT").ok();
+        resolve_room_percent(env.as_deref(), crate::host::high_vram())
     })
 }
 
@@ -4014,5 +4026,18 @@ float4 lit() : SV_Target { return 1.0; }
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn room_percent_scales_for_high_vram_and_respects_overrides() {
+        use super::resolve_room_percent;
+        assert_eq!(resolve_room_percent(None, false), 90);
+        assert_eq!(resolve_room_percent(None, true), 94);
+        assert_eq!(resolve_room_percent(Some("92"), true), 92);
+        assert_eq!(resolve_room_percent(Some(" 85 "), false), 85);
+        assert_eq!(resolve_room_percent(Some("10"), true), 50);
+        assert_eq!(resolve_room_percent(Some("99"), false), 97);
+        assert_eq!(resolve_room_percent(Some("invalid"), true), 94);
     }
 }

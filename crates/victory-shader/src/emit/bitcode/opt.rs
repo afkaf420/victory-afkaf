@@ -73,6 +73,11 @@ pub(crate) struct Usage {
     pub heap_samplers: bool,
     /// A 64-bit atomic.
     pub atomic64: bool,
+    /// Bitmask of input signature element IDs referenced by live input-read
+    /// intrinsics (`u64::MAX` if an index >= 64 or non-constant is seen).
+    pub live_inputs: u64,
+    /// Whether `attributeAtVertex` (pull-model barycentric evaluation) is live.
+    pub barycentrics_attr: bool,
 }
 
 /// What makes two instructions without an effect the same value.
@@ -451,7 +456,63 @@ impl Module {
                     (Bin::Or, _, Some(m)) if m == all => Some(b),
                     (Bin::Or, Some(m), _) if m == all => Some(a),
                     (Bin::And | Bin::Or, _, _) if a == b => Some(a),
-                    _ => None,
+                    _ => {
+                        // Drop a dead masked half of `or(and(x, c1), y)` when an
+                        // outer shift or mask discards every bit in `c1` (common
+                        // after 16-bit VALU writes that preserve the high 16 bits
+                        // of a dead register such as an entry barycentric VGPR).
+                        let dead_or_side = |or_v: V, kills: &dyn Fn(u64) -> bool| -> Option<V> {
+                            let V::Inst(oi) = or_v else { return None };
+                            let Op::Bin(Bin::Or, p, q) = self.insts[oi as usize].op else {
+                                return None;
+                            };
+                            let masked_dead = |side: V| -> bool {
+                                let V::Inst(ai) = side else { return false };
+                                let Op::Bin(Bin::And, x, y) = self.insts[ai as usize].op else {
+                                    return false;
+                                };
+                                self.int_k(x).is_some_and(|(_, m)| kills(m))
+                                    || self.int_k(y).is_some_and(|(_, m)| kills(m))
+                            };
+                            if masked_dead(p) {
+                                Some(q)
+                            } else if masked_dead(q) {
+                                Some(p)
+                            } else {
+                                None
+                            }
+                        };
+                        match (op, ka, kb) {
+                            (Bin::Shl, _, Some(k)) if k < u64::from(bits) => {
+                                let k = k as u32;
+                                if let Some(keep) = dead_or_side(a, &|c1| (c1 << k) & all == 0) {
+                                    self.insts[i as usize].op = Op::Bin(Bin::Shl, keep, b);
+                                    *changed = true;
+                                }
+                            }
+                            (Bin::LShr, _, Some(k)) if k < u64::from(bits) => {
+                                let k = k as u32;
+                                if let Some(keep) = dead_or_side(a, &|c1| (c1 & all) >> k == 0) {
+                                    self.insts[i as usize].op = Op::Bin(Bin::LShr, keep, b);
+                                    *changed = true;
+                                }
+                            }
+                            (Bin::And, _, Some(m)) => {
+                                if let Some(keep) = dead_or_side(a, &|c1| (c1 & m) == 0) {
+                                    self.insts[i as usize].op = Op::Bin(Bin::And, keep, b);
+                                    *changed = true;
+                                }
+                            }
+                            (Bin::And, Some(m), _) => {
+                                if let Some(keep) = dead_or_side(b, &|c1| (c1 & m) == 0) {
+                                    self.insts[i as usize].op = Op::Bin(Bin::And, a, keep);
+                                    *changed = true;
+                                }
+                            }
+                            _ => {}
+                        }
+                        None
+                    }
                 }
             }
             Op::Cmp(p, a, b) if p <= pred::TRUE => {
@@ -1015,6 +1076,19 @@ impl Module {
                     u.typed_uav_loads |= args.get(1).and_then(|&h| annotation(h)).is_none_or(
                         |(kind, components)| kind & 0x1000 != 0 && components >> 8 & 0xff > 1,
                     );
+                } else if name.starts_with("loadInput")
+                    || name.starts_with("evalSnapped")
+                    || name.starts_with("evalSampleIndex")
+                    || name.starts_with("evalCentroid")
+                    || name.starts_with("attributeAtVertex")
+                {
+                    if name.starts_with("attributeAtVertex") {
+                        u.barycentrics_attr = true;
+                    }
+                    match args.get(1).and_then(|&id| self.int_k(id)) {
+                        Some((_, id)) if id < 64 => u.live_inputs |= 1u64 << id,
+                        _ => u.live_inputs = u64::MAX,
+                    }
                 }
             }
         }

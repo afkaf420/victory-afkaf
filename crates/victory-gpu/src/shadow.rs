@@ -265,14 +265,29 @@ fn card_room_kept_on() -> bool {
     })
 }
 
+/// Maximum VRAM reserved ahead of time by [`card_room_kept`] for the
+/// world-load burst of title-buffer card copies (1 GiB). High-VRAM GPUs raise
+/// `VICTORY_CARD_BUFFERS_MB` to 4 GiB as a growth ceiling, not a burst
+/// reservation; reserving the entire 4 GiB ceiling would hold ~3.1 GiB of
+/// phantom VRAM away from the texture queue after the ~950 MiB burst lands.
+const CARD_ROOM_RESERVE_CAP: u64 = 1024 << 20;
+
+fn resolve_card_room_kept_bytes(limit: u64, used: u64, enabled: bool) -> u64 {
+    if !enabled {
+        return 0;
+    }
+    limit.min(CARD_ROOM_RESERVE_CAP).saturating_sub(used)
+}
+
 /// The bytes of the card's memory the texture queue leaves free for card
 /// copies of title buffers not made yet ([`card_room_kept_on`]): 0 with
 /// the switch off or without card copies.
 pub(crate) fn card_room_kept() -> u64 {
-    if !card_room_kept_on() || !cards() {
-        return 0;
-    }
-    card_limits().1.saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed))
+    resolve_card_room_kept_bytes(
+        card_limits().1,
+        CARD_BYTES[0].load(Ordering::Relaxed),
+        card_room_kept_on() && cards(),
+    )
 }
 
 /// The copies in the card's memory.
@@ -327,9 +342,9 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
     // shrinks by the copies' bytes, at most `card_limits`' second number.
     // (With `card_room_kept_on` the texture queue kept this copy's room
     // free, and the copy may go up to the queue's own line.)
-    let tenths = if card_room_kept_on() { 9 } else { 8 };
+    let percent = if card_room_kept_on() { crate::resource::room_percent() } else { 80 };
     if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 10 * tenths
+        && used + size > budget / 100 * percent
     {
         return None;
     }
@@ -2797,12 +2812,14 @@ impl Shadow {
                         return true;
                     }
                     *runs_left -= runs.len();
+                    let mut dirty_runs = Vec::with_capacity(runs.len());
                     for (r, m) in runs {
                         held[r..r + m].copy_from_slice(&title[r..r + m]);
-                        self.card_changed(at + r, at + r + m);
+                        dirty_runs.push((at + r, at + r + m));
                         MERGED[1].fetch_add(1, Ordering::Relaxed);
                         MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
                     }
+                    self.card_changed_runs(&dirty_runs);
                 } else {
                     let Some(snapshot) = before.as_mut() else {
                         return true;
@@ -3894,6 +3911,26 @@ mod window_tests {
         assert_eq!(resolve_card_windows_bytes(Some("1024"), false), 1024 << 20);
         assert!(!resolve_card_room_kept(Some("0"), true));
         assert!(resolve_card_room_kept(Some("1"), false));
+    }
+
+    /// `card_room_kept` caps ahead-of-time reservation to 1 GiB even when
+    /// `VICTORY_CARD_BUFFERS_MB` is raised to 4 GiB on high-VRAM GPUs, so
+    /// unused buffer headroom never locks ~3 GiB away from the texture queue.
+    #[test]
+    fn card_room_kept_caps_reservation_to_avoid_phantom_vram_hold() {
+        use super::resolve_card_room_kept_bytes;
+        let mib = 1u64 << 20;
+        // 4 GiB growth ceiling with 0 used reserves only 1 GiB for the burst.
+        assert_eq!(resolve_card_room_kept_bytes(4096 * mib, 0, true), 1024 * mib);
+        // After ~950 MiB world-load buffer burst, only 74 MiB remains reserved (not 3,146 MiB!).
+        assert_eq!(resolve_card_room_kept_bytes(4096 * mib, 950 * mib, true), 74 * mib);
+        // Once >= 1 GiB is allocated, reservation drops cleanly to 0.
+        assert_eq!(resolve_card_room_kept_bytes(4096 * mib, 1024 * mib, true), 0);
+        assert_eq!(resolve_card_room_kept_bytes(4096 * mib, 2000 * mib, true), 0);
+        // Smaller explicit limits are respected verbatim.
+        assert_eq!(resolve_card_room_kept_bytes(512 * mib, 100 * mib, true), 412 * mib);
+        // Disabled switch always returns 0.
+        assert_eq!(resolve_card_room_kept_bytes(4096 * mib, 0, false), 0);
     }
 
     /// 64-byte cacheline diffing updates only changed cachelines, coalesces

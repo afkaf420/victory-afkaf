@@ -518,6 +518,26 @@ impl Shader {
                     self.flags &= !flag;
                 }
             }
+            // Drop dead trailing `SV_Barycentrics` inputs (e.g. a 16-bit VALU
+            // write to an entry barycentric VGPR whose preserved high 16 bits
+            // were eliminated by optimisation) so pixel shaders do not declare
+            // spurious `BARYCENTRICS` requirements that restrict PSO state.
+            while self.pixel
+                && let Some(last) = self.inputs.last()
+                && last.kind == 28
+                && {
+                    let id = self.inputs.len() - 1;
+                    id < 64 && used.live_inputs & (1u64 << id) == 0
+                }
+            {
+                self.inputs.pop();
+            }
+            if self.pixel
+                && !used.barycentrics_attr
+                && !self.inputs.iter().any(|e| e.kind == 28)
+            {
+                self.flags &= !flags::BARYCENTRICS;
+            }
         }
         let mut resources = None;
         let mut bindings = Vec::new();

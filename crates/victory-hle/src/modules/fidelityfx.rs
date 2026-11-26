@@ -27,6 +27,7 @@
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+use std::collections::HashSet;
 use std::ffi::{c_char, c_void};
 use std::mem::offset_of;
 use std::path::{Path, PathBuf};
@@ -70,6 +71,7 @@ pub const FFX_API_QUERY_DESC_TYPE_UPSCALE_GETRENDERRESOLUTIONFROMQUALITYMODE: u6
 pub const FFX_API_QUERY_DESC_TYPE_UPSCALE_GETJITTERPHASECOUNT: u64 = 0x0001_0004;
 pub const FFX_API_QUERY_DESC_TYPE_UPSCALE_GETJITTEROFFSET: u64 = 0x0001_0005;
 pub const FFX_API_DISPATCH_DESC_TYPE_UPSCALE_GENERATEREACTIVEMASK: u64 = 0x0001_0006;
+pub const FFX_API_CONFIGURE_DESC_TYPE_UPSCALE_KEYVALUE: u64 = 0x0001_0007;
 pub const FFX_API_QUERY_DESC_TYPE_UPSCALE_GPU_MEMORY_USAGE: u64 = 0x0001_0008;
 pub const FFX_API_QUERY_DESC_TYPE_UPSCALE_GPU_MEMORY_USAGE_V2: u64 = 0x0001_0009;
 pub const FFX_API_QUERY_DESC_TYPE_UPSCALE_GET_RESOURCE_REQUIREMENTS: u64 = 0x0001_000A;
@@ -303,6 +305,15 @@ pub struct FfxQueryDescUpscaleGetResourceRequirements {
     pub header: FfxApiHeader,
     pub required_resources: u64,
     pub optional_resources: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct FfxConfigureDescUpscaleKeyValue {
+    pub header: FfxApiHeader,
+    pub key: u64,
+    pub u64_val: u64,
+    pub ptr: *mut c_void,
 }
 
 const _: () = {
@@ -679,6 +690,51 @@ pub fn ffx_state_to_d3d12(state: u32) -> u32 {
     out
 }
 
+/// Converts a host `D3D12_RESOURCE_STATES` bitmask back to `FfxApiResourceState`
+/// so PC FSR 3.1 sees the exact state `host_texture_for_upscaler` transitioned
+/// into when the console descriptor left `state == 0`.
+pub fn d3d12_state_to_ffx(d3d_state: u32) -> u32 {
+    if d3d_state == D3D12_STATE_COMMON {
+        return FFX_API_RESOURCE_STATE_COMMON;
+    }
+    let mut out = 0u32;
+    if d3d_state & D3D12_STATE_UNORDERED_ACCESS != 0 {
+        out |= FFX_API_RESOURCE_STATE_UNORDERED_ACCESS;
+    }
+    if d3d_state & D3D12_STATE_NON_PIXEL_SHADER_RESOURCE != 0 {
+        out |= FFX_API_RESOURCE_STATE_COMPUTE_READ;
+    }
+    if d3d_state & D3D12_STATE_PIXEL_SHADER_RESOURCE != 0 {
+        out |= FFX_API_RESOURCE_STATE_PIXEL_READ;
+    }
+    if d3d_state & D3D12_STATE_COPY_SOURCE != 0 {
+        out |= FFX_API_RESOURCE_STATE_COPY_SRC;
+    }
+    if d3d_state & D3D12_STATE_COPY_DEST != 0 {
+        out |= FFX_API_RESOURCE_STATE_COPY_DEST;
+    }
+    if d3d_state & D3D12_STATE_INDIRECT_ARGUMENT != 0 {
+        out |= FFX_API_RESOURCE_STATE_INDIRECT_ARGUMENT;
+    }
+    if d3d_state & D3D12_STATE_RENDER_TARGET != 0 {
+        out |= FFX_API_RESOURCE_STATE_RENDER_TARGET;
+    }
+    if d3d_state & D3D12_STATE_DEPTH_WRITE != 0 {
+        out |= FFX_API_RESOURCE_STATE_DEPTH_ATTACHMENT;
+    }
+    if out == 0 {
+        FFX_API_RESOURCE_STATE_COMMON
+    } else {
+        out
+    }
+}
+
+/// True if `dxgi` is a typeless DXGI format whose concrete view format may be
+/// specified by the console `FfxApiResourceDescription::format`.
+fn is_typeless_dxgi(dxgi: u32) -> bool {
+    matches!(dxgi, 1 | 9 | 15 | 19 | 23 | 27 | 33 | 39 | 44 | 48 | 53 | 60 | 90)
+}
+
 /// Converts a `DXGI_FORMAT` raw value to `FfxApiSurfaceFormat` (matching
 /// `ffxApiGetSurfaceFormatDX12` in FidelityFX API).
 pub fn dxgi_to_ffx_surface_format(dxgi: u32) -> u32 {
@@ -729,6 +785,7 @@ pub fn dxgi_to_ffx_surface_format(dxgi: u32) -> u32 {
 
 /// Builds a PC `FfxApiResourceDescription` from a host [`TextureDesc`].
 pub fn ffx_desc_from_host(desc: TextureDesc) -> FfxApiResourceDescription {
+    const D3D12_FLAG_ALLOW_DEPTH_STENCIL: u32 = 0x2;
     const D3D12_FLAG_ALLOW_UAV: u32 = 0x4;
     if desc.dimension == 1 {
         return FfxApiResourceDescription {
@@ -743,9 +800,11 @@ pub fn ffx_desc_from_host(desc: TextureDesc) -> FfxApiResourceDescription {
         };
     }
     let mut usage = match desc.dxgi_format {
-        40 | 55 => 1 << 2,      // D32_FLOAT / D16_UNORM -> DEPTHTARGET
-        20 | 45 => (1 << 2) | (1 << 5), // D32S8 / D24S8 -> DEPTH | STENCIL
-        _ => 0,                 // READ_ONLY
+        40 | 55 => 1 << 2,                     // D32_FLOAT / D16_UNORM -> DEPTHTARGET
+        19 | 20 | 44 | 45 => (1 << 2) | (1 << 5), // D32S8 / D24S8 (incl. typeless) -> DEPTH | STENCIL
+        39 | 53 if desc.flags & D3D12_FLAG_ALLOW_DEPTH_STENCIL != 0 => 1 << 2,
+        _ if desc.flags & D3D12_FLAG_ALLOW_DEPTH_STENCIL != 0 => 1 << 2,
+        _ => 0, // READ_ONLY
     };
     if desc.flags & D3D12_FLAG_ALLOW_UAV != 0 {
         usage |= 1 << 1; // UAV
@@ -920,6 +979,8 @@ mod runtime {
         unsafe extern "system" fn(context: *mut *mut c_void, desc: *mut FfxApiHeader) -> u32;
     type PfnFfxDispatch =
         unsafe extern "system" fn(context: *mut *mut c_void, desc: *const FfxApiHeader) -> u32;
+    type PfnFfxConfigure =
+        unsafe extern "system" fn(context: *mut *mut c_void, desc: *const FfxApiHeader) -> u32;
 
     struct Fsr3Runtime {
         _module: usize,
@@ -927,6 +988,7 @@ mod runtime {
         destroy_context: PfnFfxDestroyContext,
         query: PfnFfxQuery,
         dispatch: PfnFfxDispatch,
+        configure: Option<PfnFfxConfigure>,
     }
 
     // SAFETY: DLL module handle and exported C function pointers are process-wide.
@@ -1234,7 +1296,7 @@ mod runtime {
         Dlss(StreamlineRuntime),
     }
 
-    enum UpscalerContext {
+    enum UpscalerContextInner {
         Fsr3 {
             pc_ctx: *mut c_void,
         },
@@ -1243,6 +1305,28 @@ mod runtime {
             flags: u32,
             max_upscale: FfxApiDimensions2D,
         },
+    }
+
+    // SAFETY: `pc_ctx` is only ever accessed while holding `UpscalerContext::inner`.
+    unsafe impl Send for UpscalerContextInner {}
+
+    struct UpscalerContext {
+        inner: Mutex<UpscalerContextInner>,
+    }
+
+    /// Registry of live `Box<UpscalerContext>` pointers allocated by `create_context`
+    /// so stale/double-destroyed/bogus context pointers never trigger UAF.
+    fn live_contexts() -> &'static Mutex<HashSet<usize>> {
+        static LIVE: OnceLock<Mutex<HashSet<usize>>> = OnceLock::new();
+        LIVE.get_or_init(|| Mutex::new(HashSet::new()))
+    }
+
+    fn is_live_context(raw: *mut c_void) -> bool {
+        !raw.is_null()
+            && live_contexts()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&(raw as usize))
     }
 
     unsafe fn load_dll(path: &Path) -> Option<usize> {
@@ -1275,12 +1359,13 @@ mod runtime {
         // SAFETY: `path` is a user-supplied PC FidelityFX loader DLL.
         let module = unsafe { load_dll(path) }?;
         // SAFETY: standard C exports of `amd_fidelityfx_loader_dx12.dll`.
-        let (create_context, destroy_context, query, dispatch) = unsafe {
+        let (create_context, destroy_context, query, dispatch, configure) = unsafe {
             (
                 proc_addr(module, "ffxCreateContext")?,
                 proc_addr(module, "ffxDestroyContext")?,
                 proc_addr(module, "ffxQuery")?,
                 proc_addr(module, "ffxDispatch")?,
+                proc_addr(module, "ffxConfigure"),
             )
         };
         Some(Fsr3Runtime {
@@ -1289,6 +1374,7 @@ mod runtime {
             destroy_context,
             query,
             dispatch,
+            configure,
         })
     }
 
@@ -1541,10 +1627,22 @@ mod runtime {
             };
         };
         tracked.push((this, wanted));
+        let mut ffx_desc = ffx_desc_from_host(desc);
+        // Preserve depth/stencil usage bits reported by the console descriptor, and
+        // prefer the title's concrete view format when the host texture is typeless.
+        ffx_desc.usage |= console_res.description.usage & ((1 << 2) | (1 << 5));
+        if is_typeless_dxgi(desc.dxgi_format) && console_res.description.format != 0 {
+            ffx_desc.format = console_res.description.format;
+        }
+        let ffx_state = if console_res.state != 0 {
+            console_res.state
+        } else {
+            d3d12_state_to_ffx(wanted)
+        };
         FfxApiResource {
             resource: host_ptr,
-            description: ffx_desc_from_host(desc),
-            state: console_res.state,
+            description: ffx_desc,
+            state: ffx_state,
             _pad: 0,
         }
     }
@@ -1585,9 +1683,16 @@ mod runtime {
                     );
                     return rc;
                 }
-                let boxed = Box::new(UpscalerContext::Fsr3 { pc_ctx });
+                let boxed = Box::new(UpscalerContext {
+                    inner: Mutex::new(UpscalerContextInner::Fsr3 { pc_ctx }),
+                });
+                let raw = Box::into_raw(boxed).cast::<c_void>();
+                live_contexts()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(raw as usize);
                 // SAFETY: checked non-null.
-                unsafe { *context = Box::into_raw(boxed).cast() };
+                unsafe { *context = raw };
                 tracing::info!(
                     render = ?max_render,
                     upscale = ?max_upscale,
@@ -1651,13 +1756,20 @@ mod runtime {
                         return FFX_API_RETURN_ERROR_RUNTIME_ERROR;
                     }
                 }
-                let boxed = Box::new(UpscalerContext::Dlss {
-                    viewport_id,
-                    flags,
-                    max_upscale,
+                let boxed = Box::new(UpscalerContext {
+                    inner: Mutex::new(UpscalerContextInner::Dlss {
+                        viewport_id,
+                        flags,
+                        max_upscale,
+                    }),
                 });
+                let raw = Box::into_raw(boxed).cast::<c_void>();
+                live_contexts()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(raw as usize);
                 // SAFETY: checked non-null.
-                unsafe { *context = Box::into_raw(boxed).cast() };
+                unsafe { *context = raw };
                 tracing::info!(
                     viewport_id,
                     ?quality,
@@ -1679,20 +1791,29 @@ mod runtime {
         if raw.is_null() {
             return FFX_API_RETURN_OK;
         }
-        // SAFETY: allocated by `Box::into_raw` in `create_context`.
-        let boxed = unsafe { Box::from_raw(raw.cast::<UpscalerContext>()) };
+        let existed = live_contexts()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&(raw as usize));
         // SAFETY: checked non-null.
         unsafe { *context = null_mut() };
+        if !existed {
+            tracing::warn!("ffxDestroyContext called with stale or unknown context handle");
+            return FFX_API_RETURN_ERROR_PARAMETER;
+        }
+        // SAFETY: validated present in `LIVE_CONTEXTS`; allocated by `Box::into_raw` in `create_context`.
+        let boxed = unsafe { Box::from_raw(raw.cast::<UpscalerContext>()) };
+        let inner = boxed.inner.into_inner().unwrap_or_else(|e| e.into_inner());
 
-        match *boxed {
-            UpscalerContext::Fsr3 { mut pc_ctx, .. } => {
+        match inner {
+            UpscalerContextInner::Fsr3 { mut pc_ctx } => {
                 if let Some(BackendRuntime::Fsr3(fsr)) = active_runtime() {
                     // SAFETY: valid PC FSR context handle.
                     return unsafe { (fsr.destroy_context)(&raw mut pc_ctx, null()) };
                 }
                 FFX_API_RETURN_OK
             }
-            UpscalerContext::Dlss { viewport_id, .. } => {
+            UpscalerContextInner::Dlss { viewport_id, .. } => {
                 if let Some(BackendRuntime::Dlss(sl)) = active_runtime()
                     && let Some(free_fn) = sl.sl_free_resources
                 {
@@ -1713,6 +1834,46 @@ mod runtime {
         }
     }
 
+    pub fn configure(context: *mut *mut c_void, desc: *const FfxApiHeader) -> u32 {
+        if desc.is_null() {
+            return FFX_API_RETURN_ERROR_PARAMETER;
+        }
+        // SAFETY: checked non-null.
+        let desc_type = unsafe { (*desc).type_ };
+        if let Some(BackendRuntime::Fsr3(fsr)) = active_runtime()
+            && let Some(cfg_fn) = fsr.configure
+            && desc_type == FFX_API_CONFIGURE_DESC_TYPE_UPSCALE_KEYVALUE
+        {
+            // SAFETY: `desc_type` identifies `FfxConfigureDescUpscaleKeyValue`.
+            let mut copy = unsafe { *(desc.cast::<FfxConfigureDescUpscaleKeyValue>()) };
+            copy.header.p_next = null_mut();
+            if !context.is_null() {
+                // SAFETY: checked non-null.
+                let raw = unsafe { *context };
+                if !raw.is_null() {
+                    if !is_live_context(raw) {
+                        return FFX_API_RETURN_ERROR_PARAMETER;
+                    }
+                    // SAFETY: validated live context.
+                    let ctx_obj = unsafe { &*(raw.cast::<UpscalerContext>()) };
+                    let mut guard = ctx_obj.inner.lock().unwrap_or_else(|e| e.into_inner());
+                    if let UpscalerContextInner::Fsr3 { pc_ctx } = &mut *guard {
+                        // SAFETY: serialized per-context call with sanitized pNext.
+                        return unsafe { cfg_fn(pc_ctx, &raw const copy.header) };
+                    }
+                    return FFX_API_RETURN_OK;
+                }
+            }
+            // SAFETY: global configure with null context and sanitized pNext.
+            return unsafe { cfg_fn(null_mut(), &raw const copy.header) };
+        }
+        tracing::debug!(
+            desc_type = format_args!("{desc_type:#x}"),
+            "ffxConfigure: ignoring unsupported or backend-specific configure descriptor"
+        );
+        FFX_API_RETURN_OK
+    }
+
     pub fn query(context: *mut *mut c_void, desc: *mut FfxApiHeader) -> u32 {
         if desc.is_null() {
             return FFX_API_RETURN_ERROR_PARAMETER;
@@ -1723,28 +1884,29 @@ mod runtime {
         // Apply optional quality-mode override before answering ratio/resolution queries.
         let quality_override = config().quality_override.map(UpscaleQuality::ffx_mode);
 
-        // If PC FSR 3.1 is active, forward queries directly whenever possible
-        // (rewriting any console device pointer on global version/memory queries).
+        // If PC FSR 3.1 is active, forward known ABI queries using sanitized local
+        // copies (`p_next = null_mut()`) so a console `p_next` chain carrying a
+        // console `ID3D12Device*` or console version override can never reach PC DLLs.
         if let Some(BackendRuntime::Fsr3(fsr)) = active_runtime() {
-            let mut pc_ctx = if !context.is_null() {
+            let ctx_ref = if !context.is_null() {
                 // SAFETY: checked non-null.
                 let raw = unsafe { *context };
                 if !raw.is_null() {
-                    // SAFETY: allocated by `create_context`.
-                    match unsafe { &*(raw.cast::<UpscalerContext>()) } {
-                        UpscalerContext::Fsr3 { pc_ctx, .. } => *pc_ctx,
-                        UpscalerContext::Dlss { .. } => null_mut(),
+                    if !is_live_context(raw) {
+                        return FFX_API_RETURN_ERROR_PARAMETER;
                     }
+                    // SAFETY: validated in `LIVE_CONTEXTS`.
+                    Some(unsafe { &*(raw.cast::<UpscalerContext>()) })
                 } else {
-                    null_mut()
+                    None
                 }
             } else {
-                null_mut()
+                None
             };
-            let ctx_ptr = if pc_ctx.is_null() {
-                null_mut()
-            } else {
-                &raw mut pc_ctx
+            let mut ctx_guard = ctx_ref.map(|c| c.inner.lock().unwrap_or_else(|e| e.into_inner()));
+            let ctx_ptr: *mut *mut c_void = match ctx_guard.as_deref_mut() {
+                Some(UpscalerContextInner::Fsr3 { pc_ctx }) => pc_ctx,
+                _ => null_mut(),
             };
 
             let fsr_rc = match desc_type {
@@ -1753,6 +1915,28 @@ mod runtime {
                     let mut copy = unsafe { *(desc.cast::<FfxQueryDescGetVersions>()) };
                     copy.header.p_next = null_mut();
                     copy.device = host_device_raw().unwrap_or(null_mut());
+                    // SAFETY: valid copied query struct.
+                    unsafe { (fsr.query)(ctx_ptr, &raw mut copy.header) }
+                }
+                FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION => {
+                    // SAFETY: `desc_type` identifies `FfxQueryGetProviderVersion`.
+                    let mut copy = unsafe { *(desc.cast::<FfxQueryGetProviderVersion>()) };
+                    copy.header.p_next = null_mut();
+                    // SAFETY: valid copied query struct.
+                    let rc = unsafe { (fsr.query)(ctx_ptr, &raw mut copy.header) };
+                    if rc == FFX_API_RETURN_OK {
+                        // SAFETY: write back in-place output fields without altering caller pNext.
+                        let out = unsafe { &mut *(desc.cast::<FfxQueryGetProviderVersion>()) };
+                        out.version_id = copy.version_id;
+                        out.version_name = copy.version_name;
+                    }
+                    rc
+                }
+                FFX_API_QUERY_DESC_TYPE_UPSCALE_GPU_MEMORY_USAGE => {
+                    // SAFETY: `desc_type` identifies `FfxQueryDescUpscaleGetGpuMemoryUsage`.
+                    let mut copy =
+                        unsafe { *(desc.cast::<FfxQueryDescUpscaleGetGpuMemoryUsage>()) };
+                    copy.header.p_next = null_mut();
                     // SAFETY: valid copied query struct.
                     unsafe { (fsr.query)(ctx_ptr, &raw mut copy.header) }
                 }
@@ -1776,6 +1960,7 @@ mod runtime {
                 FFX_API_QUERY_DESC_TYPE_UPSCALE_GETUPSCALERATIOFROMQUALITYMODE => {
                     // SAFETY: `desc_type` identifies ratio query.
                     let mut copy = unsafe { *(desc.cast::<FfxQueryDescUpscaleGetRatio>()) };
+                    copy.header.p_next = null_mut();
                     if let Some(q) = quality_override {
                         copy.quality_mode = q;
                     }
@@ -1785,18 +1970,54 @@ mod runtime {
                 FFX_API_QUERY_DESC_TYPE_UPSCALE_GETRENDERRESOLUTIONFROMQUALITYMODE => {
                     // SAFETY: `desc_type` identifies render-res query.
                     let mut copy = unsafe { *(desc.cast::<FfxQueryDescUpscaleGetRenderRes>()) };
+                    copy.header.p_next = null_mut();
                     if let Some(q) = quality_override {
                         copy.quality_mode = q;
                     }
                     // SAFETY: valid copied query struct.
                     unsafe { (fsr.query)(ctx_ptr, &raw mut copy.header) }
                 }
-                _ => {
-                    // SAFETY: `desc` has the exact same ABI on PC for jitter, memory usage,
-                    // provider version, and resource requirements.
-                    unsafe { (fsr.query)(ctx_ptr, desc) }
+                FFX_API_QUERY_DESC_TYPE_UPSCALE_GETJITTERPHASECOUNT => {
+                    // SAFETY: `desc_type` identifies jitter-phase query.
+                    let mut copy =
+                        unsafe { *(desc.cast::<FfxQueryDescUpscaleGetJitterPhaseCount>()) };
+                    copy.header.p_next = null_mut();
+                    // SAFETY: valid copied query struct.
+                    unsafe { (fsr.query)(ctx_ptr, &raw mut copy.header) }
+                }
+                FFX_API_QUERY_DESC_TYPE_UPSCALE_GETJITTEROFFSET => {
+                    // SAFETY: `desc_type` identifies jitter-offset query.
+                    let mut copy = unsafe { *(desc.cast::<FfxQueryDescUpscaleGetJitterOffset>()) };
+                    copy.header.p_next = null_mut();
+                    // SAFETY: valid copied query struct.
+                    unsafe { (fsr.query)(ctx_ptr, &raw mut copy.header) }
+                }
+                FFX_API_QUERY_DESC_TYPE_UPSCALE_GET_RESOURCE_REQUIREMENTS => {
+                    // SAFETY: `desc_type` identifies resource-requirements query.
+                    let mut copy =
+                        unsafe { *(desc.cast::<FfxQueryDescUpscaleGetResourceRequirements>()) };
+                    copy.header.p_next = null_mut();
+                    // SAFETY: valid copied query struct.
+                    let rc = unsafe { (fsr.query)(ctx_ptr, &raw mut copy.header) };
+                    if rc == FFX_API_RETURN_OK {
+                        // SAFETY: write back in-place output fields without altering caller pNext.
+                        let out = unsafe {
+                            &mut *(desc.cast::<FfxQueryDescUpscaleGetResourceRequirements>())
+                        };
+                        out.required_resources = copy.required_resources;
+                        out.optional_resources = copy.optional_resources;
+                    }
+                    rc
+                }
+                other => {
+                    tracing::debug!(
+                        desc_type = format_args!("{other:#x}"),
+                        "ffxQuery: refusing to forward unknown query descriptor to PC FSR3"
+                    );
+                    FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE
                 }
             };
+            drop(ctx_guard);
             if fsr_rc == FFX_API_RETURN_OK || !ctx_ptr.is_null() {
                 return fsr_rc;
             }
@@ -1873,40 +2094,62 @@ mod runtime {
                 {
                     // SAFETY: checked non-null.
                     let raw = unsafe { *context };
-                    if !raw.is_null()
-                        && let UpscalerContext::Dlss { viewport_id, .. } =
-                            unsafe { &*(raw.cast::<UpscalerContext>()) }
+                    if is_live_context(raw)
                         && let Some(dev) = host_device_raw()
                         && let Ok((_, Some(get_state))) = sl.ensure_device(dev)
                     {
-                        let vp = SlViewportHandle {
-                            base: SlBaseStructure {
-                                next: null_mut(),
-                                struct_type: SL_GUID_VIEWPORT_HANDLE,
-                                struct_version: SL_STRUCT_V1,
-                            },
-                            value: *viewport_id,
-                            _pad: 0,
-                        };
-                        let mut state = SlDlssState {
-                            base: SlBaseStructure {
-                                next: null_mut(),
-                                struct_type: SL_GUID_DLSS_STATE,
-                                struct_version: SL_STRUCT_V1,
-                            },
-                            estimated_vram_usage_in_bytes: 0,
-                        };
-                        // SAFETY: valid viewport and output state struct.
-                        // Streamline lazily allocates NGX DLSS resources on the first
-                        // `slEvaluateFeature`, reporting 0 before that; keep the
-                        // fallback estimate until NGX reports a live allocation.
-                        if unsafe { get_state(&raw const vp, &raw mut state) } == SL_RESULT_OK
-                            && state.estimated_vram_usage_in_bytes > 0
-                        {
-                            total = state.estimated_vram_usage_in_bytes;
+                        // SAFETY: validated live context in `LIVE_CONTEXTS`.
+                        let ctx_obj = unsafe { &*(raw.cast::<UpscalerContext>()) };
+                        let guard = ctx_obj.inner.lock().unwrap_or_else(|e| e.into_inner());
+                        if let UpscalerContextInner::Dlss { viewport_id, .. } = &*guard {
+                            let vp = SlViewportHandle {
+                                base: SlBaseStructure {
+                                    next: null_mut(),
+                                    struct_type: SL_GUID_VIEWPORT_HANDLE,
+                                    struct_version: SL_STRUCT_V1,
+                                },
+                                value: *viewport_id,
+                                _pad: 0,
+                            };
+                            let mut state = SlDlssState {
+                                base: SlBaseStructure {
+                                    next: null_mut(),
+                                    struct_type: SL_GUID_DLSS_STATE,
+                                    struct_version: SL_STRUCT_V1,
+                                },
+                                estimated_vram_usage_in_bytes: 0,
+                            };
+                            // SAFETY: valid viewport and output state struct.
+                            // Streamline lazily allocates NGX DLSS resources on the first
+                            // `slEvaluateFeature`, reporting 0 before that; keep the
+                            // fallback estimate until NGX reports a live allocation.
+                            if unsafe { get_state(&raw const vp, &raw mut state) } == SL_RESULT_OK
+                                && state.estimated_vram_usage_in_bytes > 0
+                            {
+                                total = state.estimated_vram_usage_in_bytes;
+                            }
                         }
                     }
                 }
+                // SAFETY: checked non-null.
+                unsafe {
+                    *q.gpu_memory_usage_upscaler = FfxApiEffectMemoryUsage {
+                        total_usage_in_bytes: total,
+                        aliasable_usage_in_bytes: 0,
+                    };
+                }
+                FFX_API_RETURN_OK
+            }
+            FFX_API_QUERY_DESC_TYPE_UPSCALE_GPU_MEMORY_USAGE_V2 => {
+                // SAFETY: `desc_type` identifies GPU memory usage v2 query.
+                let q = unsafe { &*(desc.cast::<FfxQueryDescUpscaleGetGpuMemoryUsageV2>()) };
+                if q.gpu_memory_usage_upscaler.is_null() {
+                    return FFX_API_RETURN_ERROR_PARAMETER;
+                }
+                // Conservative VRAM estimate scaling modestly with upscale area.
+                let pixels = u64::from(q.max_upscale_size.width.max(1))
+                    .saturating_mul(u64::from(q.max_upscale_size.height.max(1)));
+                let total = (pixels.saturating_mul(32)).max(64u64 << 20);
                 // SAFETY: checked non-null.
                 unsafe {
                     *q.gpu_memory_usage_upscaler = FfxApiEffectMemoryUsage {
@@ -1928,7 +2171,10 @@ mod runtime {
                 // SAFETY: `desc_type` identifies provider-version query.
                 let q = unsafe { &mut *(desc.cast::<FfxQueryGetProviderVersion>()) };
                 q.version_id = 0x0003_0001_0005;
-                q.version_name = c"victory-pc-dlss".as_ptr();
+                q.version_name = match active_runtime() {
+                    Some(BackendRuntime::Fsr3(_)) => c"victory-pc-fsr3".as_ptr(),
+                    _ => c"victory-pc-dlss".as_ptr(),
+                };
                 FFX_API_RETURN_OK
             }
             FFX_API_QUERY_DESC_TYPE_GET_VERSIONS => {
@@ -1937,6 +2183,10 @@ mod runtime {
                 if q.output_count.is_null() {
                     return FFX_API_RETURN_ERROR_PARAMETER;
                 }
+                let label = match active_runtime() {
+                    Some(BackendRuntime::Fsr3(_)) => c"victory-pc-fsr3".as_ptr(),
+                    _ => c"victory-pc-dlss".as_ptr(),
+                };
                 // SAFETY: checked non-null.
                 let cap = unsafe { *q.output_count };
                 if cap >= 1 {
@@ -1946,7 +2196,7 @@ mod runtime {
                     }
                     if !q.version_names.is_null() {
                         // SAFETY: caller provided space for at least 1 entry.
-                        unsafe { *q.version_names = c"victory-pc-dlss".as_ptr() };
+                        unsafe { *q.version_names = label };
                     }
                 }
                 // SAFETY: checked non-null.
@@ -1963,16 +2213,18 @@ mod runtime {
         }
         // SAFETY: checked non-null.
         let raw_ctx = unsafe { *context };
-        if raw_ctx.is_null() {
+        if !is_live_context(raw_ctx) {
             return FFX_API_RETURN_ERROR_PARAMETER;
         }
-        // SAFETY: allocated by `create_context`.
-        let ctx = unsafe { &mut *(raw_ctx.cast::<UpscalerContext>()) };
+        // SAFETY: validated live in `LIVE_CONTEXTS`; interior `Mutex` prevents
+        // aliased `&mut` UB across concurrent `ffxQuery` / `ffxDispatch` calls.
+        let ctx_obj = unsafe { &*(raw_ctx.cast::<UpscalerContext>()) };
+        let mut ctx_guard = ctx_obj.inner.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: checked non-null.
         let desc_type = unsafe { (*desc).type_ };
 
-        match (ctx, active_runtime()) {
-            (UpscalerContext::Fsr3 { pc_ctx, .. }, Some(BackendRuntime::Fsr3(fsr))) => {
+        match (&mut *ctx_guard, active_runtime()) {
+            (UpscalerContextInner::Fsr3 { pc_ctx }, Some(BackendRuntime::Fsr3(fsr))) => {
                 match desc_type {
                     FFX_API_DISPATCH_DESC_TYPE_UPSCALE => {
                         // SAFETY: `desc_type` identifies `FfxDispatchDescUpscale`.
@@ -2027,6 +2279,21 @@ mod runtime {
                             D3D12_STATE_UNORDERED_ACCESS,
                             &mut tracked,
                         );
+                        if pc_desc.color.resource.is_null()
+                            || pc_desc.depth.resource.is_null()
+                            || pc_desc.motion_vectors.resource.is_null()
+                            || pc_desc.output.resource.is_null()
+                        {
+                            tracing::warn!(
+                                color = !pc_desc.color.resource.is_null(),
+                                depth = !pc_desc.depth.resource.is_null(),
+                                mvec = !pc_desc.motion_vectors.resource.is_null(),
+                                output = !pc_desc.output.resource.is_null(),
+                                "PC FSR 3.1 ffxDispatch aborted: required texture failed to unwrap"
+                            );
+                            host_upscaler_post_dispatch(console_list, &tracked);
+                            return FFX_API_RETURN_ERROR_PARAMETER;
+                        }
                         if let Some((w, h)) = config().output_override {
                             // Never exceed the actual host output texture bounds.
                             let max_w = pc_desc.output.description.width.max(1);
@@ -2071,6 +2338,13 @@ mod runtime {
                             D3D12_STATE_UNORDERED_ACCESS,
                             &mut tracked,
                         );
+                        if pc_desc.color_opaque_only.resource.is_null()
+                            || pc_desc.color_pre_upscale.resource.is_null()
+                            || pc_desc.out_reactive.resource.is_null()
+                        {
+                            host_upscaler_post_dispatch(console_list, &tracked);
+                            return FFX_API_RETURN_ERROR_PARAMETER;
+                        }
                         // SAFETY: unwrapped host D3D12 resources & command list.
                         let rc = unsafe { (fsr.dispatch)(pc_ctx, &raw const pc_desc.header) };
                         host_upscaler_post_dispatch(console_list, &tracked);
@@ -2080,11 +2354,10 @@ mod runtime {
                 }
             }
             (
-                UpscalerContext::Dlss {
+                UpscalerContextInner::Dlss {
                     viewport_id,
                     flags: ctx_flags,
                     max_upscale,
-                    ..
                 },
                 Some(BackendRuntime::Dlss(sl)),
             ) => {
@@ -2116,11 +2389,13 @@ mod runtime {
                 let Some((mut sl_color, color_td)) =
                     unwrap_sl(in_desc.color, D3D12_STATE_NON_PIXEL_SHADER_RESOURCE, &mut tracked)
                 else {
+                    host_upscaler_post_dispatch(console_list, &tracked);
                     return FFX_API_RETURN_ERROR_PARAMETER;
                 };
                 let Some((mut sl_depth, depth_td)) =
                     unwrap_sl(in_desc.depth, D3D12_STATE_NON_PIXEL_SHADER_RESOURCE, &mut tracked)
                 else {
+                    host_upscaler_post_dispatch(console_list, &tracked);
                     return FFX_API_RETURN_ERROR_PARAMETER;
                 };
                 let Some((mut sl_mvec, mvec_td)) = unwrap_sl(
@@ -2128,11 +2403,13 @@ mod runtime {
                     D3D12_STATE_NON_PIXEL_SHADER_RESOURCE,
                     &mut tracked,
                 ) else {
+                    host_upscaler_post_dispatch(console_list, &tracked);
                     return FFX_API_RETURN_ERROR_PARAMETER;
                 };
                 let Some((mut sl_out, out_td)) =
                     unwrap_sl(in_desc.output, D3D12_STATE_UNORDERED_ACCESS, &mut tracked)
                 else {
+                    host_upscaler_post_dispatch(console_list, &tracked);
                     return FFX_API_RETURN_ERROR_PARAMETER;
                 };
                 let mut sl_exposure = unwrap_sl(
@@ -2467,6 +2744,63 @@ mod runtime {
             mem.total_usage_in_bytes >> 20,
             mem.aliasable_usage_in_bytes >> 20
         );
+
+        // Exercise live `GET_VERSIONS`, `GPU_MEMORY_USAGE_V2`, and `GET_RESOURCE_REQUIREMENTS`
+        // directly against `amd_fidelityfx_loader_dx12.dll` to validate exact C ABI layout.
+        let mut ver_count = 0u64;
+        let mut q_vers = FfxQueryDescGetVersions {
+            header: FfxApiHeader {
+                type_: FFX_API_QUERY_DESC_TYPE_GET_VERSIONS,
+                p_next: null_mut(),
+            },
+            create_desc_type: FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE,
+            device: host_device,
+            output_count: &raw mut ver_count,
+            version_ids: null_mut(),
+            version_names: null_mut(),
+        };
+        assert_eq!(
+            unsafe { (fsr.query)(null_mut(), &raw mut q_vers.header) },
+            FFX_API_RETURN_OK
+        );
+        assert!(ver_count >= 1, "PC FSR3 loader must report at least 1 upscale provider version");
+
+        let mut mem_v2 = FfxApiEffectMemoryUsage::default();
+        let mut q_mem_v2 = FfxQueryDescUpscaleGetGpuMemoryUsageV2 {
+            header: FfxApiHeader {
+                type_: FFX_API_QUERY_DESC_TYPE_UPSCALE_GPU_MEMORY_USAGE_V2,
+                p_next: null_mut(),
+            },
+            device: host_device,
+            max_render_size: FfxApiDimensions2D {
+                width: 1280,
+                height: 720,
+            },
+            max_upscale_size: FfxApiDimensions2D {
+                width: 2560,
+                height: 1440,
+            },
+            flags: FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE,
+            _pad: 0,
+            gpu_memory_usage_upscaler: &raw mut mem_v2,
+        };
+        let rc_v2 = unsafe { (fsr.query)(null_mut(), &raw mut q_mem_v2.header) };
+        if rc_v2 == FFX_API_RETURN_OK {
+            assert!(mem_v2.total_usage_in_bytes > 0);
+        }
+
+        let mut q_req = FfxQueryDescUpscaleGetResourceRequirements {
+            header: FfxApiHeader {
+                type_: FFX_API_QUERY_DESC_TYPE_UPSCALE_GET_RESOURCE_REQUIREMENTS,
+                p_next: null_mut(),
+            },
+            required_resources: 0,
+            optional_resources: 0,
+        };
+        let rc_req = unsafe { (fsr.query)(&raw mut pc_ctx, &raw mut q_req.header) };
+        if rc_req == FFX_API_RETURN_OK {
+            assert_ne!(q_req.required_resources, 0);
+        }
 
         assert_eq!(
             unsafe { (fsr.destroy_context)(&raw mut pc_ctx, null()) },
@@ -2908,11 +3242,24 @@ pub extern "system" fn ffxDispatch(context: *mut *mut c_void, desc: *const FfxAp
     }
 }
 
+pub extern "system" fn ffxConfigure(context: *mut *mut c_void, desc: *const FfxApiHeader) -> u32 {
+    #[cfg(windows)]
+    {
+        runtime::configure(context, desc)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (context, desc);
+        FFX_API_RETURN_OK
+    }
+}
+
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "fidelityfx",
         dlls: &["amd_fidelityfx_loader_xbox.dll"],
         exports: vec![
+            hle_export!(ffxConfigure),
             hle_export!(ffxCreateContext),
             hle_export!(ffxDestroyContext),
             hle_export!(ffxQuery),
@@ -3078,13 +3425,14 @@ mod tests {
     }
 
     #[test]
-    fn hle_module_exports_exact_four_static_symbols() {
+    fn hle_module_exports_all_five_loader_symbols() {
         let m = module();
         assert!(m.serves("amd_fidelityfx_loader_xbox.dll"));
         let names: Vec<&str> = m.exports.iter().map(|e| e.name).collect();
         assert_eq!(
             names,
             vec![
+                "ffxConfigure",
                 "ffxCreateContext",
                 "ffxDestroyContext",
                 "ffxQuery",
@@ -3103,6 +3451,15 @@ mod tests {
         assert_eq!(
             ffx_state_to_d3d12(FFX_API_RESOURCE_STATE_COMPUTE_READ | FFX_API_RESOURCE_STATE_PIXEL_READ),
             D3D12_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_STATE_PIXEL_SHADER_RESOURCE
+        );
+        assert_eq!(d3d12_state_to_ffx(D3D12_STATE_COMMON), FFX_API_RESOURCE_STATE_COMMON);
+        assert_eq!(
+            d3d12_state_to_ffx(D3D12_STATE_UNORDERED_ACCESS),
+            FFX_API_RESOURCE_STATE_UNORDERED_ACCESS
+        );
+        assert_eq!(
+            d3d12_state_to_ffx(D3D12_STATE_NON_PIXEL_SHADER_RESOURCE),
+            FFX_API_RESOURCE_STATE_COMPUTE_READ
         );
         assert_eq!(dxgi_to_ffx_surface_format(10), 4); // R16G16B16A16_FLOAT
         assert_eq!(dxgi_to_ffx_surface_format(40), 28); // D32_FLOAT -> R32_FLOAT
@@ -3123,6 +3480,78 @@ mod tests {
         assert_eq!(desc.format, 4);
         assert_eq!((desc.width, desc.height), (3840, 2160));
         assert_eq!(desc.usage, 1 << 1);
+
+        // Typeless depth-stencil texture (`R32_TYPELESS` + `ALLOW_DEPTH_STENCIL`) must set DEPTHTARGET.
+        let depth_td = TextureDesc {
+            dimension: 3,
+            width: 2560,
+            height: 1440,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            dxgi_format: 39, // DXGI_FORMAT_R32_TYPELESS
+            flags: 0x2,      // D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL
+        };
+        let depth_desc = ffx_desc_from_host(depth_td);
+        assert_eq!(depth_desc.usage, 1 << 2, "typeless depth texture must carry DEPTHTARGET usage");
+    }
+
+    #[test]
+    fn stale_context_handles_and_gpu_mem_v2_query_with_console_pnext_are_safe() {
+        // Stale / bogus context handles must return ERROR_PARAMETER rather than dereferencing.
+        let mut bogus = 0x1234_5678usize as *mut c_void;
+        let hdr = FfxApiHeader {
+            type_: FFX_API_DISPATCH_DESC_TYPE_UPSCALE,
+            p_next: null_mut(),
+        };
+        assert_eq!(ffxDispatch(&raw mut bogus, &raw const hdr), FFX_API_RETURN_ERROR_PARAMETER);
+        let mut q_phase = FfxQueryDescUpscaleGetJitterPhaseCount {
+            header: FfxApiHeader {
+                type_: FFX_API_QUERY_DESC_TYPE_UPSCALE_GETJITTERPHASECOUNT,
+                p_next: null_mut(),
+            },
+            render_width: 1280,
+            display_width: 2560,
+            out_phase_count: null_mut(),
+        };
+        assert_eq!(
+            ffxQuery(&raw mut bogus, &raw mut q_phase.header),
+            FFX_API_RETURN_ERROR_PARAMETER
+        );
+        assert_eq!(ffxDestroyContext(&raw mut bogus, null()), FFX_API_RETURN_ERROR_PARAMETER);
+        assert!(bogus.is_null());
+
+        // `ffxQuery(NULL, GPU_MEMORY_USAGE_V2)` with a bogus console `p_next` pointer
+        // must never crash or forward the console `p_next` chain into PC DLLs.
+        let mut mem = FfxApiEffectMemoryUsage::default();
+        let mut q_v2 = FfxQueryDescUpscaleGetGpuMemoryUsageV2 {
+            header: FfxApiHeader {
+                type_: FFX_API_QUERY_DESC_TYPE_UPSCALE_GPU_MEMORY_USAGE_V2,
+                p_next: 0xDEAD_BEEFusize as *mut FfxApiHeader,
+            },
+            device: 0xCAFE_BABEusize as *mut c_void,
+            max_render_size: FfxApiDimensions2D {
+                width: 1920,
+                height: 1080,
+            },
+            max_upscale_size: FfxApiDimensions2D {
+                width: 3840,
+                height: 2160,
+            },
+            flags: FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE,
+            _pad: 0,
+            gpu_memory_usage_upscaler: &raw mut mem,
+        };
+        assert_eq!(ffxQuery(null_mut(), &raw mut q_v2.header), FFX_API_RETURN_OK);
+        assert!(mem.total_usage_in_bytes > 0);
+        // Caller's `p_next` must remain untouched in caller memory.
+        assert_eq!(q_v2.header.p_next as usize, 0xDEAD_BEEF);
+
+        // `ffxConfigure` with unknown console descriptor returns OK cleanly.
+        let cfg_hdr = FfxApiHeader {
+            type_: 0x0200_9999,
+            p_next: 0xDEAD_BEEFusize as *mut FfxApiHeader,
+        };
+        assert_eq!(ffxConfigure(null_mut(), &raw const cfg_hdr), FFX_API_RETURN_OK);
     }
 
     #[cfg(windows)]

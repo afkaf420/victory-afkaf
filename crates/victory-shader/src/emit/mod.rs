@@ -427,11 +427,15 @@ pub fn emit(
                 }
             }
         }
-        // Off unless asked for (`VICTORY_WAVE_WIDE=1`), for a console wave run as two host
-        // waves: widening puts cross-half syncs inside branches and loops, so keep it opt-in
-        // until verified deadlock-free. The 32-lane programs' form below, which has no
-        // barrier, stays on.
+        // Eager widening (before approximate local waves) stays opt-in via
+        // `VICTORY_WAVE_WIDE=1` so working compute shaders keep their fast
+        // barrier-free local-wave path. If every non-widened path below still
+        // fails to reach <=32 lanes (returning WaveSize=64, which a Wave32 host
+        // refuses with E_INVALIDARG, or an emit error), a last-resort widen
+        // rescues those residual shaders unless `VICTORY_WAVE_WIDE=0`.
         let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
+        let wide_allowed = std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0");
+        let mut deep = None;
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
@@ -442,7 +446,7 @@ pub fn emit(
                 // lane runs, where the two host waves can exchange.
                 // (`VICTORY_WAVE_DEEP_SKIPS=0` turns deep skips off; `VICTORY_WAVE_WIDE=1` turns wide branches on.)
                 let deep_on = std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0");
-                let deep = if deep_on { form(ir::without_skips(p, true)) } else { None };
+                deep = if deep_on { form(ir::without_skips(p, true)) } else { None };
                 if let Some((p, st, io, res)) = &deep {
                     let again = emit_program(c, native, p, st, io, res);
                     report("without skips, scalars followed", &again);
@@ -510,6 +514,24 @@ pub fn emit(
                 report("local waves (APPROXIMATE, any mask)", &local);
                 if done(&local) {
                     return local.map(|(shader, _)| shader);
+                }
+            }
+        }
+        // Last-resort rescue: every non-widened path above failed to drop below
+        // WaveSize=64 (which the Wave32 host GPU refuses with E_INVALIDARG) or
+        // stopped on a cross-half exchange where not every lane runs.
+        if !wide_on && wide_allowed {
+            let bases = [
+                deep.as_ref().map(|f| &f.0),
+                forms[1].1.as_ref().map(|f| &f.0),
+                forms[0].1.as_ref().map(|f| &f.0),
+                Some(p),
+            ];
+            if let Some(base) = bases.into_iter().flatten().next() {
+                let again = widen(c, native, base, why);
+                report("wave-wide branches (last resort)", &again);
+                if done(&again) {
+                    return again.map(|(shader, _)| shader);
                 }
             }
         }
@@ -1788,5 +1810,35 @@ mod barycentric_tests {
         let [e0, e1] = exp_mrt0(4);
         let words = [0xC812_0000, e0, e1, S_ENDPGM];
         assert!(pixel(&words, PERSP_CENTER).is_err());
+    }
+
+    /// A 16-bit write (`v_cvt_f16_f32`) targeting an entry barycentric VGPR
+    /// (`v1`, j) preserves its upper 16 bits, but an outer `<< 16` discards
+    /// them completely: `bitcode::opt` eliminates the dead barycentric read
+    /// and `finish()` drops both `SV_Barycentrics` and `flags::BARYCENTRICS`.
+    #[test]
+    fn dead_high_half_of_16bit_write_to_barycentric_vgpr_drops_sv_barycentrics() {
+        let [e0, e1] = exp_mrt0(3);
+        let words = [
+            0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+            0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
+            0x7E02_1502, // v_cvt_f16_f32 v1, v2 (overwrites low 16 bits of v1)
+            0x3406_0290, // v_lshlrev_b32 v3, 16, v1 (discards preserved upper 16 bits)
+            e0,
+            e1,
+            S_ENDPGM,
+        ];
+        let shader = pixel(&words, PERSP_CENTER).unwrap();
+        let (features, inputs) = parts(&shader);
+        assert_eq!(
+            features & 0x2_0000,
+            0,
+            "spurious Barycentrics feature must be pruned"
+        );
+        assert!(
+            inputs.iter().all(|e| e.kind != 28),
+            "spurious SV_Barycentrics input must be pruned: {inputs:?}"
+        );
+        validate(&shader);
     }
 }

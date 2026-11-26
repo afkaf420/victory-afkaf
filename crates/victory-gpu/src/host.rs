@@ -2232,10 +2232,16 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 "#;
 
+/// Resolves a boolean environment knob that defaults ON and can be disabled
+/// explicitly with `"0"`.
+fn resolve_default_on(env: Option<&str>) -> bool {
+    env.map(str::trim).is_none_or(|v| v != "0")
+}
+
 /// Whether the pieces hashed again after ranges were sent up to a copy in
 /// the card's memory are hashed in runs of pieces that touch, each piece
-/// once (`VICTORY_CARD_REHASH_RUNS=1`; off by default), and not in a pass
-/// per range sent up.
+/// once (`VICTORY_CARD_REHASH_RUNS`; on by default, set `=0` to disable),
+/// and not in a pass per range sent up.
 ///
 /// These passes are ours, they run on the card before every submission's
 /// lists, and no timing so far names them: each walks its 64 KiB pieces
@@ -2246,7 +2252,7 @@ void main(uint3 id : SV_DispatchThreadID) {
 /// a fetch that finds nothing and loses no shader write.
 fn rehash_runs() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_REHASH_RUNS").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| resolve_default_on(std::env::var("VICTORY_CARD_REHASH_RUNS").ok().as_deref()))
 }
 
 /// Since the last frame-rate line, of our own passes over copies in the
@@ -2255,16 +2261,77 @@ fn rehash_runs() -> bool {
 static CARD_PASSES: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// Whether what shaders wrote to copies in the card's memory is merged
-/// into title memory on several threads (`VICTORY_WIDE_MERGE=1`; off by
-/// default). The pieces the card's compare found differing come down in
-/// one fetch and were then merged one after the other on the thread that
-/// settles: about 630 pieces and 40 MB a frame (run 104), each compared
-/// with the copy's CPU side byte by byte and put into title memory through
-/// the kernel. A piece is its own bytes of its copy and of title memory,
-/// so eight threads take an eighth of them each.
+/// into title memory on several threads (`VICTORY_WIDE_MERGE`; on by
+/// default, set `=0` to disable). The pieces the card's compare found
+/// differing come down in one fetch and were then merged one after the
+/// other on the thread that settles: about 630-980 pieces and 40-64 MB a
+/// frame, each compared with the copy's CPU side byte by byte and put into
+/// title memory through the kernel. A piece is its own bytes of its copy
+/// and of title memory, so up to eight threads share them in parallel.
 fn wide_merge() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_MERGE").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| resolve_default_on(std::env::var("VICTORY_WIDE_MERGE").ok().as_deref()))
+}
+
+/// Coalesces consecutive fetched pieces `(key, lo, hi, dst_at)` that belong to
+/// the same copy (`key`) and are contiguous in both source VRAM and destination
+/// readback memory into `(first_piece_idx, src_lo, byte_len, dst_at)` DMA spans.
+fn coalesce_fetch_spans<K: Copy + Eq>(pieces: &[(K, usize, usize, u64)]) -> Vec<(usize, usize, u64, u64)> {
+    let mut spans: Vec<(usize, usize, u64, u64)> = Vec::new();
+    for (idx, &(key, lo, hi, at)) in pieces.iter().enumerate() {
+        let len = (hi - lo) as u64;
+        if let Some(last) = spans.last_mut()
+            && pieces[last.0].0 == key
+            && last.1 as u64 + last.2 == lo as u64
+            && last.3 + last.2 == at
+        {
+            last.2 += len;
+        } else {
+            spans.push((idx, lo, len, at));
+        }
+    }
+    spans
+}
+
+/// Partitions `items` into at most `max_buckets` non-empty buckets such that
+/// all items sharing the same `key` stay in the same bucket (avoiding
+/// per-shadow lock contention during parallel merges), balanced via
+/// longest-processing-time-first (largest groups placed first into the
+/// lightest bucket).
+fn partition_shadow_groups<T>(items: Vec<T>, key: impl Fn(&T) -> usize, max_buckets: usize) -> Vec<Vec<T>> {
+    if items.is_empty() || max_buckets <= 1 {
+        return if items.is_empty() { Vec::new() } else { vec![items] };
+    }
+    let mut groups: Vec<(usize, Vec<T>)> = Vec::new();
+    for item in items {
+        let k = key(&item);
+        if let Some(last) = groups.last_mut()
+            && last.0 == k
+        {
+            last.1.push(item);
+        } else if let Some(found) = groups.iter_mut().find(|g| g.0 == k) {
+            found.1.push(item);
+        } else {
+            groups.push((k, vec![item]));
+        }
+    }
+    if groups.len() <= 1 {
+        return groups.into_iter().map(|(_, g)| g).collect();
+    }
+    groups.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+    let nbuckets = groups.len().min(max_buckets);
+    let mut buckets: Vec<Vec<T>> = (0..nbuckets).map(|_| Vec::new()).collect();
+    for (_, group) in groups {
+        let lightest = buckets
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, b)| b.len())
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        buckets[lightest].extend(group);
+    }
+    buckets.retain(|b| !b.is_empty());
+    buckets
 }
 
 /// One declared range of a copy in the card's memory, in a submission.
@@ -2845,6 +2912,26 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
     None
 }
 
+/// Resolves `VICTORY_MERGE_RUNS`: maximum changed byte runs merged into
+/// card-backed copies under in-flight shader writes per submission before
+/// falling back to a full pipeline settle (default 8,192; clamped 64..=65,536).
+///
+/// The old hardcoded cap of 512 overflowed on half of all submissions when
+/// ~800 tiny changed runs (~90 KiB/frame) arrived per submission, triggering
+/// 125 ms full settles (`WHY_STALE`: 62.4 ms/frame) for a few KiB of edits.
+fn resolve_merge_runs_limit(env: Option<&str>) -> usize {
+    env.and_then(|v| v.trim().parse::<usize>().ok())
+        .map_or(8192, |n| n.clamp(64, 65_536))
+}
+
+fn merge_runs_limit() -> usize {
+    static LIMIT: OnceLock<usize> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let env = std::env::var("VICTORY_MERGE_RUNS").ok();
+        resolve_merge_runs_limit(env.as_deref())
+    })
+}
+
 /// With flights in the air, after the submission's write-watch asking:
 /// whether `runs` refresh a range of a host copy that a flight's shaders
 /// may write and that the title wrote since it was last copied. The
@@ -2872,7 +2959,7 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
         // settle is still due where that could not be done. At most this
         // many changed runs go up to copies in the card's memory, each a
         // copy of its own there.
-        let mut runs_left = 512;
+        let mut runs_left = merge_runs_limit();
         return spans.iter().any(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left));
     }
     spans.iter().any(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from))
@@ -3348,9 +3435,10 @@ mod late_tests {
 /// mapped now fails the joined copy as a whole (it then goes page by page,
 /// zeros for what cannot be read, as a single copy does), where before
 /// only the copy that held it did.
+/// (`VICTORY_JOIN_COPIES`; on by default, set `=0` to disable).
 fn join_copies() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_JOIN_COPIES").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| resolve_default_on(std::env::var("VICTORY_JOIN_COPIES").ok().as_deref()))
 }
 
 /// Since the last frame-rate line: title buffer copies recorded, and those
@@ -4552,8 +4640,7 @@ impl Host {
             let work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
             work.as_ref().map(|work| (work.differs.1, (work.differs.2 / 4) as usize))
         };
-        let mut pieces: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64)> = Vec::new();
-        let mut total = 0u64;
+        let mut raw_pieces: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
         if let Some((differs, dwords)) = differs {
             // SAFETY: the mapping of the results. The compares of these
             // plans have run, and their dwords are given to no other plan
@@ -4580,19 +4667,34 @@ impl Host {
                         }
                         let (lo, hi) = r.shadow.card_piece(&r.span, p);
                         if lo < hi && seen.insert((copy, lo, hi)) {
-                            pieces.push((r.shadow.clone(), lo, hi, total));
-                            total += (hi - lo) as u64;
+                            raw_pieces.push((r.shadow.clone(), lo, hi));
                         }
                     }
                     crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
                 }
             }
         }
-        if pieces.is_empty() {
+        if raw_pieces.is_empty() {
             // Nothing to fetch: every send so far is older than the next fetch.
             crate::shadow::relay_fetched(*QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
             return;
         }
+        // Sort by (shadow pointer, offset) so adjacent 64 KiB pieces of the
+        // same copy sit contiguously in both source VRAM and destination
+        // readback memory, letting `coalesce_fetch_spans` collapse hundreds of
+        // 64 KiB `CopyBufferRegion` calls into a few contiguous DMA bursts
+        // while keeping per-piece granularity for `card_merge_relay`.
+        raw_pieces.sort_unstable_by_key(|(s, lo, hi)| (std::sync::Arc::as_ptr(s) as usize, *lo, *hi));
+        let mut pieces: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64)> =
+            Vec::with_capacity(raw_pieces.len());
+        let mut span_keys: Vec<(usize, usize, usize, u64)> = Vec::with_capacity(raw_pieces.len());
+        let mut total = 0u64;
+        for (shadow, lo, hi) in raw_pieces {
+            span_keys.push((std::sync::Arc::as_ptr(&shadow) as usize, lo, hi, total));
+            pieces.push((shadow, lo, hi, total));
+            total += (hi - lo) as u64;
+        }
+        let spans = coalesce_fetch_spans(&span_keys);
         if fetch.is_none() {
             *fetch = self.make_relay_fetch();
         }
@@ -4616,8 +4718,8 @@ impl Host {
             (|| -> windows::core::Result<u64> {
                 allocator.Reset()?;
                 list.Reset(&allocator, None)?;
-                for (shadow, lo, hi, at) in &pieces {
-                    list.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
+                for &(piece_idx, src_lo, len, dst_at) in &spans {
+                    list.CopyBufferRegion(&buffer, dst_at, &pieces[piece_idx].0.buffer, src_lo as u64, len);
                 }
                 list.Close()?;
                 let lists = [Some(list.cast::<ID3D12CommandList>()?)];
@@ -4649,16 +4751,64 @@ impl Host {
             CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
             CARD_STATS[6].fetch_add(us, Ordering::Relaxed);
         }
-        let mut title = Vec::new();
-        let mut written = 0;
-        for (shadow, lo, hi, at) in &pieces {
-            // SAFETY: the mapping of the fetched bytes, `total` of them;
-            // the copy into it has run.
-            let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
-            let merged = shadow.card_merge_relay(*lo, gpu, after, &mut title);
-            shadow.walls_merged(gpu.len(), merged);
-            written += merged;
-        }
+        let written = if wide_merge() && pieces.len() >= 8 {
+            // Group pieces by `Shadow` so each worker owns disjoint shadows
+            // (zero `self.before` mutex contention) while balancing largest
+            // buffers across up to 8 threads via LPT bin-packing.
+            let buckets = partition_shadow_groups(pieces, |(s, ..)| std::sync::Arc::as_ptr(s) as usize, 8);
+            if buckets.len() > 1 {
+                let total_written = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let jobs: Vec<Box<dyn FnOnce() + Send>> = buckets
+                    .into_iter()
+                    .map(|bucket| {
+                        let total_written = total_written.clone();
+                        Box::new(move || {
+                            let mut title = Vec::new();
+                            let mut local = 0usize;
+                            for (shadow, lo, hi, at) in bucket {
+                                // SAFETY: the mapping of the fetched bytes (`total` of them);
+                                // the copy into it has completed and `wide_run` joins before
+                                // `buffer` can be reused or dropped.
+                                let gpu = unsafe { std::slice::from_raw_parts((data + at as usize) as *const u8, hi - lo) };
+                                let merged = shadow.card_merge_relay(lo, gpu, after, &mut title);
+                                shadow.walls_merged(gpu.len(), merged);
+                                local += merged;
+                            }
+                            total_written.fetch_add(local, Ordering::Relaxed);
+                        }) as Box<dyn FnOnce() + Send>
+                    })
+                    .collect();
+                crate::shadow::wide_run(jobs);
+                total_written.load(Ordering::Relaxed)
+            } else {
+                let mut title = Vec::new();
+                let mut written = 0usize;
+                for bucket in buckets {
+                    for (shadow, lo, hi, at) in bucket {
+                        // SAFETY: the mapping of the fetched bytes, `total` of them;
+                        // the copy into it has run.
+                        let gpu = unsafe { std::slice::from_raw_parts((data + at as usize) as *const u8, hi - lo) };
+                        let merged = shadow.card_merge_relay(lo, gpu, after, &mut title);
+                        shadow.walls_merged(gpu.len(), merged);
+                        written += merged;
+                    }
+                }
+                written
+            }
+        } else {
+            let mut title = Vec::new();
+            let mut written = 0usize;
+            for (shadow, lo, hi, at) in &pieces {
+                // SAFETY: the mapping of the fetched bytes, `total` of them;
+                // the copy into it has run.
+                let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
+                let merged = shadow.card_merge_relay(*lo, gpu, after, &mut title);
+                shadow.walls_merged(gpu.len(), merged);
+                written += merged;
+            }
+            written
+        };
+        let _ = buffer;
         COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         // Sends up to `after` are of no use to any later merge.
         crate::shadow::relay_fetched(after);
@@ -8092,5 +8242,71 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(ram_idle_ms(Some(0)), 2_000);
         // Missing falls back to normal
         assert_eq!(ram_idle_ms(None), 10_000);
+    }
+
+    #[test]
+    fn coalesce_fetch_spans_merges_contiguous_same_shadow_pieces() {
+        use super::coalesce_fetch_spans;
+        const P: usize = 65_536;
+        // Shadow 1: 3 contiguous pieces, gap, 1 piece. Shadow 2: 2 contiguous pieces.
+        let pieces = vec![
+            (1usize, 0, P, 0u64),
+            (1, P, 2 * P, P as u64),
+            (1, 2 * P, 3 * P, (2 * P) as u64),
+            (1, 5 * P, 6 * P, (3 * P) as u64),
+            (2, 0, P, (4 * P) as u64),
+            (2, P, 2 * P, (5 * P) as u64),
+        ];
+        assert_eq!(
+            coalesce_fetch_spans(&pieces),
+            vec![
+                (0, 0, (3 * P) as u64, 0),
+                (3, 5 * P, P as u64, (3 * P) as u64),
+                (4, 0, (2 * P) as u64, (4 * P) as u64),
+            ]
+        );
+        assert!(coalesce_fetch_spans::<usize>(&[]).is_empty());
+    }
+
+    #[test]
+    fn partition_shadow_groups_keeps_same_shadow_together_and_balances() {
+        use super::partition_shadow_groups;
+        // 4 shadows with sizes 6, 4, 3, 2 packed across 3 workers -> [6], [4, 2], [3] (or [6], [4], [3, 2])
+        let mut items = Vec::new();
+        for i in 0..6 { items.push((10usize, i)); }
+        for i in 0..4 { items.push((20usize, i)); }
+        for i in 0..3 { items.push((30usize, i)); }
+        for i in 0..2 { items.push((40usize, i)); }
+        let buckets = partition_shadow_groups(items, |&(k, _)| k, 3);
+        assert_eq!(buckets.len(), 3);
+        // Total preserved.
+        assert_eq!(buckets.iter().map(Vec::len).sum::<usize>(), 15);
+        // Every shadow key appears in strictly one bucket (zero lock contention).
+        let mut seen_keys = std::collections::HashSet::new();
+        for bucket in &buckets {
+            let keys: std::collections::HashSet<usize> = bucket.iter().map(|&(k, _)| k).collect();
+            for k in keys {
+                assert!(seen_keys.insert(k), "shadow key {k} split across multiple buckets");
+            }
+        }
+        assert_eq!(seen_keys.len(), 4);
+        // Heaviest bucket is bounded by the largest single shadow (6).
+        assert_eq!(buckets.iter().map(Vec::len).max(), Some(6));
+    }
+
+    #[test]
+    fn phase_7a_smart_defaults_and_merge_runs_limit() {
+        use super::{resolve_default_on, resolve_merge_runs_limit};
+        assert!(resolve_default_on(None));
+        assert!(resolve_default_on(Some("1")));
+        assert!(resolve_default_on(Some("true")));
+        assert!(!resolve_default_on(Some("0")));
+        assert!(!resolve_default_on(Some(" 0 ")));
+
+        assert_eq!(resolve_merge_runs_limit(None), 8192);
+        assert_eq!(resolve_merge_runs_limit(Some("2048")), 2048);
+        assert_eq!(resolve_merge_runs_limit(Some("10")), 64);
+        assert_eq!(resolve_merge_runs_limit(Some("999999")), 65_536);
+        assert_eq!(resolve_merge_runs_limit(Some("bogus")), 8192);
     }
 }

@@ -32,8 +32,8 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
 use windows_sys::Win32::System::Memory::{
-    MEM_COMMIT, MEM_FREE, MEM_PRIVATE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_READWRITE,
-    VirtualAlloc, VirtualQuery,
+    MEM_COMMIT, MEM_FREE, MEM_MAPPED, MEM_PRIVATE, MEM_RESERVE, MEMORY_BASIC_INFORMATION,
+    PAGE_READWRITE, VirtualAlloc, VirtualQuery,
 };
 use windows_sys::Win32::System::Threading::{CreateEventW, GetCurrentProcess, ResetEvent, SetEvent};
 
@@ -488,7 +488,7 @@ struct Lane {
     unsubmitted: Vec<Command>,
     /// Submitted, by sequence number: reads not started, status entries
     /// not written, reads running, and failures not yet reported.
-    reads: VecDeque<(u64, Request)>,
+    reads: VecDeque<(u64, OwnedRequest)>,
     statuses: VecDeque<(u64, Status)>,
     running: BTreeSet<u64>,
     failures: BTreeMap<u64, HRESULT>,
@@ -518,7 +518,7 @@ unsafe impl Send for Lane {}
 struct Job {
     lane: u64,
     seq: u64,
-    request: Request,
+    request: OwnedRequest,
     staging: u64,
 }
 
@@ -526,8 +526,8 @@ struct Job {
 unsafe impl Send for Job {}
 
 /// Computes DirectStorage worker pool size: honors `VICTORY_DSTORAGE_WORKERS`
-/// (`1..=32`) when set, otherwise scales `4..=8` (1 per physical core on
-/// 8C/16T CPUs so decompression saturates NVMe without starving render/submit).
+/// (`1..=32`) when set, otherwise scales `4..=16` (matching `available_parallelism`
+/// up to 16 threads so deferred page-array retries cannot starve streaming).
 fn worker_count_for(available_threads: usize, env_override: Option<&str>) -> usize {
     if let Some(n) = env_override
         .and_then(|v| v.trim().parse::<usize>().ok())
@@ -535,7 +535,7 @@ fn worker_count_for(available_threads: usize, env_override: Option<&str>) -> usi
     {
         return n.clamp(1, 32);
     }
-    available_threads.clamp(4, 8)
+    available_threads.clamp(4, 16)
 }
 
 /// The scheduler, with its workers started on first use; `None` if not
@@ -645,11 +645,28 @@ fn work(scheduler: &'static Scheduler) {
         };
         drop(lanes);
         let started = std::time::Instant::now();
-        let result = execute(&job.request);
-        walls_request(&job.request, &result, started);
+        let result = execute(&job.request.raw);
+        walls_request(&job.request.raw, &result, started);
+        // Snapshot error metadata and release any retained `Instance<File>`
+        // ref BEFORE taking `scheduler.lock()` (avoids lock inversion or
+        // `ReadProcessMemory` under the scheduler mutex).
+        let err_meta = result.err().map(|hr| {
+            (
+                hr,
+                lookup_filename(&job.request.raw),
+                read_request_name_safe(job.request.raw.name),
+            )
+        });
+        let done_meta = JobDone {
+            lane: job.lane,
+            seq: job.seq,
+            staging: job.staging,
+            request: job.request.raw,
+        };
+        drop(job);
         lanes = scheduler.lock();
-        lanes.finish(&job, result);
-        lanes.count(&job, started);
+        lanes.finish_done(&done_meta, result, err_meta);
+        lanes.count_done(&done_meta, started);
         if std::mem::take(&mut lanes.starved) {
             scheduler.work.notify_all();
         }
@@ -657,9 +674,16 @@ fn work(scheduler: &'static Scheduler) {
     }
 }
 
+struct JobDone {
+    lane: u64,
+    seq: u64,
+    staging: u64,
+    request: Request,
+}
+
 impl Lanes {
     /// Counts a finished request; every 5 s a debug line sums them up.
-    fn count(&mut self, job: &Job, started: std::time::Instant) {
+    fn count_done(&mut self, job: &JobDone, started: std::time::Instant) {
         let (requests, bytes, busy) = &mut self.done;
         *requests += 1;
         *bytes += u64::from(job.request.destination_size);
@@ -702,17 +726,16 @@ impl Lanes {
             .filter_map(|(&id, l)| Some((l.clock, l.reads.front()?.0, id)))
             .min()?;
         let lane = self.lanes.get_mut(&id)?;
-        let &(seq, request) = lane.reads.front()?;
-        let staging = staging_bytes(&request);
+        let staging = staging_bytes(&lane.reads.front()?.1.raw);
         if self.staged > 0 && self.staged + staging > self.staging {
             self.starved = true;
             self.refused += 1;
             return None;
         }
-        lane.reads.pop_front();
+        let (seq, request) = lane.reads.pop_front()?;
         lane.running.insert(seq);
         self.staged += staging;
-        let size = u64::from(request.destination_size.max(request.source_size)).max(1);
+        let size = u64::from(request.raw.destination_size.max(request.raw.source_size)).max(1);
         self.now = self.clock[class];
         self.clock[class] += size * COST[class];
         self.lane_now[class] = lane.clock;
@@ -725,13 +748,40 @@ impl Lanes {
         })
     }
 
+    #[cfg(test)]
     fn finish(&mut self, job: &Job, result: Result<(), HRESULT>) {
+        let err_meta = result.err().map(|hr| {
+            (
+                hr,
+                lookup_filename(&job.request.raw),
+                read_request_name_safe(job.request.raw.name),
+            )
+        });
+        let done = JobDone {
+            lane: job.lane,
+            seq: job.seq,
+            staging: job.staging,
+            request: job.request.raw,
+        };
+        self.finish_done(&done, result, err_meta);
+    }
+
+    fn finish_done(
+        &mut self,
+        job: &JobDone,
+        result: Result<(), HRESULT>,
+        err_meta: Option<(HRESULT, String, String)>,
+    ) {
         self.staged -= job.staging;
         if let Some(lane) = self.lanes.get_mut(&job.lane) {
             lane.running.remove(&job.seq);
             if let Err(hr) = result {
                 lane.failures.insert(job.seq, hr);
-                lane.record_error(hr, &job.request);
+                let (filename, request_name) = match err_meta {
+                    Some((_, f, n)) => (f, n),
+                    None => (String::new(), String::new()),
+                };
+                lane.record_error(hr, filename, request_name, &job.request);
             }
             lane.flush();
         }
@@ -849,13 +899,19 @@ impl Lane {
         self.error_event as HANDLE
     }
 
-    fn record_error(&mut self, hr: HRESULT, request: &Request) {
+    fn record_error(
+        &mut self,
+        hr: HRESULT,
+        filename: String,
+        request_name: String,
+        request: &Request,
+    ) {
         self.error_count = self.error_count.saturating_add(1);
         if self.first_error.is_none() {
             self.first_error = Some(FirstError {
                 hr,
-                filename: lookup_filename(request),
-                request_name: read_request_name_safe(request.name),
+                filename,
+                request_name,
                 request: *request,
             });
         }
@@ -914,9 +970,9 @@ fn close_lane(id: u64) {
         return;
     };
     lane.closed = true;
-    lane.unsubmitted.clear();
-    lane.reads.clear();
-    lane.statuses.clear(); // releases their arrays
+    let dropped_unsubmitted = std::mem::take(&mut lane.unsubmitted);
+    let dropped_reads = std::mem::take(&mut lane.reads);
+    let dropped_statuses = std::mem::take(&mut lane.statuses);
     while lanes.lanes.get(&id).is_some_and(|l| !l.running.is_empty()) {
         lanes = scheduler
             .finished
@@ -925,6 +981,9 @@ fn close_lane(id: u64) {
     }
     lanes.lanes.remove(&id);
     scheduler.finished.notify_all();
+    drop(lanes);
+    // Drop retained `File` and `StatusArray` refs outside `scheduler.lock()`.
+    drop((dropped_unsubmitted, dropped_reads, dropped_statuses));
 }
 
 /// A read request as the title builds it, 0x48 bytes.
@@ -962,8 +1021,49 @@ const MEMORY_SOURCE: u64 = 1 << 22;
 
 const PAGE: usize = 64 * 1024;
 
+/// A queued or running `Request` that retains an `AddRef` on its file source
+/// (`Instance<File>`) until completion, cancellation, or queue close so a
+/// title calling `file->Release()` immediately after `EnqueueRequest` cannot
+/// free the file object while a worker thread is still reading it.
+struct OwnedRequest {
+    raw: Request,
+    holds_file_ref: bool,
+}
+
+impl OwnedRequest {
+    fn from_enqueued(raw: Request) -> Self {
+        let holds_file_ref = raw.options & MEMORY_SOURCE == 0 && !raw.source.is_null();
+        if holds_file_ref {
+            add_ref_instance(raw.source.cast::<Instance<File>>());
+        }
+        Self {
+            raw,
+            holds_file_ref,
+        }
+    }
+
+    #[cfg(test)]
+    fn untracked(raw: Request) -> Self {
+        Self {
+            raw,
+            holds_file_ref: false,
+        }
+    }
+}
+
+impl Drop for OwnedRequest {
+    fn drop(&mut self) {
+        if self.holds_file_ref {
+            release_file(self.raw.source.cast_mut().cast::<Instance<File>>());
+        }
+    }
+}
+
+// SAFETY: same as `Lane`/`Job` (`Instance<File>` refcount is atomic).
+unsafe impl Send for OwnedRequest {}
+
 enum Command {
-    Read(Request),
+    Read(OwnedRequest),
     Status(Status),
 }
 
@@ -992,7 +1092,7 @@ extern "system" fn enqueue_request(this: QueueRef, request: *const Request) {
     let Some(&request) = (unsafe { request.as_ref() }) else {
         return;
     };
-    queue(this, Command::Read(request));
+    queue(this, Command::Read(OwnedRequest::from_enqueued(request)));
 }
 
 extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
@@ -1073,7 +1173,7 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
             destination_size = request.destination_size,
             intermediate_size = request.intermediate_size,
             tag = request.tag,
-            name = text(request.name),
+            name = read_request_name_safe(request.name),
             hr = format_args!("{:#010x}", hr as u32),
             "dstorage: request failed: {why}"
         );
@@ -1098,20 +1198,22 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
         // the views of a page protects other views from other threads) made
         // the read fail with ERROR_INVALID_USER_BUFFER, and the title stops
         // at the failed request (runs amd-C and amd-C2, seconds after the
-        // world's first frame). It is read beside and copied in: our copy
-        // faults into the guard like the title's own writes.
+        // world's first frame). Read into bounce scratch FIRST (outside
+        // `title_memory_reading()` so disk I/O never stalls `xmem` remaps),
+        // then copy in while holding `title_memory_reading()`.
         let bounce = options & (PAGE_DESTINATION | MEMORY_SOURCE) == 0;
-        return into_destination(request, size, |out| {
-            if !bounce {
-                return read_into(request, out).map(|()| size);
-            }
-            with_bounce_scratch(size, |data| {
+        if bounce {
+            return with_bounce_scratch(size, |data| {
                 read_into(request, data)?;
-                out.copy_from_slice(data);
-                Ok(size)
+                into_destination(request, size, |out| {
+                    out.copy_from_slice(data);
+                    Ok(size)
+                })
             })
-        })
-        .map_err(|hr| fail(hr, "copying"));
+            .map_err(|hr| fail(hr, "copying"));
+        }
+        return into_destination(request, size, |out| read_into(request, out).map(|()| size))
+            .map_err(|hr| fail(hr, "copying"));
     }
     let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
     let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
@@ -1330,17 +1432,41 @@ fn read_page_array(ptr: *const c_void, count: usize) -> Option<Vec<usize>> {
     (ok != 0 && read == byte_len).then_some(pages)
 }
 
+/// Retry budget for deferred page-array / placeholder destinations
+/// (`VICTORY_DSTORAGE_RETRIES`, default 12 tries, ~0.9 s total; 0 disables).
+fn dstorage_retries() -> u32 {
+    static RETRIES: OnceLock<u32> = OnceLock::new();
+    *RETRIES.get_or_init(|| {
+        std::env::var("VICTORY_DSTORAGE_RETRIES")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(12)
+    })
+}
+
+enum VirtualDestStatus {
+    Ready,
+    /// Uncommitted placeholder / reserved region awaiting concurrent `XMemMapPhysicalPages`.
+    RetryReserved,
+    /// Truly unmapped (`MEM_FREE`) or invalid address range.
+    Invalid,
+}
+
 /// Verifies a virtual destination range `[dest, dest + len)` is mapped and
-/// explicitly pre-commits any lazy `MEM_PRIVATE | MEM_RESERVE` pages before
-/// kernel or worker writes touch them. Returns `Err(E_INVALIDARG)` if any part
-/// of the destination is unmapped (`MEM_FREE`) or cannot be committed.
-fn ensure_virtual_destination_ready(dest: *mut c_void, len: usize) -> Result<(), HRESULT> {
+/// explicitly pre-commits any lazy `MEM_RESERVE` pages (both `MEM_PRIVATE`
+/// and `MEM_MAPPED` `SEC_RESERVE` views) before writes touch them.
+///
+/// Fails immediately (`Invalid`) ONLY on truly unmapped `MEM_FREE` / address
+/// overflow, and returns `RetryReserved` if a `MEM_RESERVE` placeholder
+/// cannot be committed directly (e.g. a placeholder awaiting a concurrent
+/// `XMemMapPhysicalPages` call on another thread).
+fn ensure_virtual_destination_ready(dest: *mut c_void, len: usize) -> VirtualDestStatus {
     if len == 0 {
-        return Ok(());
+        return VirtualDestStatus::Ready;
     }
     let start = dest as usize;
     let Some(end) = start.checked_add(len) else {
-        return Err(E_INVALIDARG);
+        return VirtualDestStatus::Invalid;
     };
     let mut cur = start;
     while cur < end {
@@ -1354,34 +1480,42 @@ fn ensure_virtual_destination_ready(dest: *mut c_void, len: usize) -> Result<(),
             )
         };
         if queried == 0 || mbi.RegionSize == 0 {
-            return Err(E_INVALIDARG);
+            return VirtualDestStatus::Invalid;
         }
         let region_end = (mbi.BaseAddress as usize).saturating_add(mbi.RegionSize);
         let sub_end = region_end.min(end);
         let sub_len = sub_end.saturating_sub(cur);
         match mbi.State {
             MEM_COMMIT => {}
-            MEM_RESERVE if mbi.Type == MEM_PRIVATE => {
-                // Pre-commit lazy-reserved private virtual pages so DirectStorage
-                // writes succeed without relying on user-mode VEH faults.
-                // SAFETY: commits only the subrange inside a valid private reservation.
-                let committed = unsafe {
-                    VirtualAlloc(cur as *mut c_void, sub_len, MEM_COMMIT, PAGE_READWRITE)
-                };
-                if committed.is_null() {
-                    tracing::debug!(
-                        addr = format_args!("{cur:#x}"),
-                        len = sub_len,
-                        "dstorage: pre-commit of reserved virtual destination failed"
-                    );
-                    return Err(E_INVALIDARG);
+            MEM_RESERVE => {
+                // Pre-commit lazy-reserved `MEM_PRIVATE` or `MEM_MAPPED` (`SEC_RESERVE`)
+                // views so DirectStorage writes succeed without failing valid title
+                // destinations. If `VirtualAlloc` refuses (e.g. a `MEM_RESERVE_PLACEHOLDER`
+                // awaiting `XMemMapPhysicalPages`), signal the caller to retry cleanly
+                // outside `title_memory_reading()` rather than failing immediately.
+                if mbi.Type == MEM_PRIVATE || mbi.Type == MEM_MAPPED {
+                    // SAFETY: commits only the subrange inside a valid reservation/view.
+                    let committed = unsafe {
+                        VirtualAlloc(cur as *mut c_void, sub_len, MEM_COMMIT, PAGE_READWRITE)
+                    };
+                    if committed.is_null() {
+                        tracing::debug!(
+                            addr = format_args!("{cur:#x}"),
+                            len = sub_len,
+                            mem_type = format_args!("{:#x}", mbi.Type),
+                            "dstorage: reserved virtual destination awaits mapping (placeholder/uncommitted)"
+                        );
+                        return VirtualDestStatus::RetryReserved;
+                    }
+                } else {
+                    return VirtualDestStatus::RetryReserved;
                 }
             }
-            MEM_FREE | _ => return Err(E_INVALIDARG),
+            MEM_FREE | _ => return VirtualDestStatus::Invalid,
         }
         cur = sub_end;
     }
-    Ok(())
+    VirtualDestStatus::Ready
 }
 
 /// Runs `fill` on the destination's first `len` bytes; `fill` returns how
@@ -1395,14 +1529,42 @@ fn into_destination(
     fill: impl FnOnce(&mut [u8]) -> Result<usize, HRESULT>,
 ) -> Result<(), HRESULT> {
     if request.options & PAGE_DESTINATION == 0 {
-        ensure_virtual_destination_ready(request.destination, len)?;
+        let retries = dstorage_retries();
+        let mut tries = 0u32;
+        let _reading = loop {
+            // Hold `title_memory_reading()` across both readiness check and the
+            // user-mode write so concurrent `xmem::unmap`/`map_section` calls
+            // (`title_memory_remapping()`) cannot split a view into a transient
+            // `MEM_RESERVE` placeholder under our feet.
+            let reading = victory_gpu::title_memory_reading();
+            match ensure_virtual_destination_ready(request.destination, len) {
+                VirtualDestStatus::Ready => break reading,
+                VirtualDestStatus::Invalid => return Err(E_INVALIDARG),
+                VirtualDestStatus::RetryReserved => {
+                    drop(reading);
+                    if tries >= retries {
+                        tracing::warn!(
+                            addr = format_args!("{:#x}", request.destination as usize),
+                            len,
+                            tries,
+                            "dstorage: reserved virtual destination never became committed"
+                        );
+                        return Err(E_INVALIDARG);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        (2u64 << tries.min(6)).min(128),
+                    ));
+                    tries += 1;
+                }
+            }
+        };
         // Opens the guarded blocks and tells the GPU side a placed texture
         // there changes. `fill` writes from user mode (a file read is read
         // beside first, see `execute`), so a block guarded again meanwhile
         // faults into the guard instead of failing the write.
         victory_gpu::kernel_will_write(request.destination as usize, len);
         // SAFETY: `ensure_virtual_destination_ready` verified `[destination, +len)`
-        // is committed and mapped; nothing else writes it until completion.
+        // is committed and mapped under `_reading`; nothing else writes it until completion.
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
         let filled = fill(out).map(drop);
         // Said again now that the bytes are there (upstream's c75fdba holds
@@ -1434,17 +1596,7 @@ fn into_destination(
     }
     with_stage_scratch(len, |data| {
         let n = fill(data)?;
-        // A page the title has just made, a deferred zero page-array entry, or a
-        // view the host refuses for a moment, comes right a little later: the
-        // write is tried again before the request fails (`VICTORY_DSTORAGE_RETRIES`,
-        // 12 tries, about 0.9 s in all; 0: not tried again).
-        static RETRIES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-        let retries = *RETRIES.get_or_init(|| {
-            std::env::var("VICTORY_DSTORAGE_RETRIES")
-                .ok()
-                .and_then(|v| v.trim().parse().ok())
-                .unwrap_or(12)
-        });
+        let retries = dstorage_retries();
         static RETRIED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
         let mut written = !pages.contains(&0)
             && super::xmem::write_physical(&pages, offset, &data[..n]);
@@ -1505,16 +1657,35 @@ extern "system" fn cancel_requests_with_tag(this: QueueRef, mask: u64, value: u6
     let Some(scheduler) = scheduler() else {
         return;
     };
-    let mut lanes = scheduler.lock();
-    let Some(lane) = lanes.lanes.get_mut(&id) else {
-        return;
-    };
-    let matches = |req: &Request| (req.tag & mask) == value;
-    lane.unsubmitted
-        .retain(|cmd| !matches!(cmd, Command::Read(r) if matches(r)));
-    lane.reads.retain(|(_, r)| !matches(r));
-    lane.flush();
-    scheduler.finished.notify_all();
+    let mut dropped_unsub: Vec<Command> = Vec::new();
+    let mut dropped_reads: Vec<OwnedRequest> = Vec::new();
+    {
+        let mut lanes = scheduler.lock();
+        let Some(lane) = lanes.lanes.get_mut(&id) else {
+            return;
+        };
+        let matches = |req: &Request| (req.tag & mask) == value;
+        let old_unsub = std::mem::take(&mut lane.unsubmitted);
+        for cmd in old_unsub {
+            if matches!(&cmd, Command::Read(r) if matches(&r.raw)) {
+                dropped_unsub.push(cmd);
+            } else {
+                lane.unsubmitted.push(cmd);
+            }
+        }
+        let old_reads = std::mem::take(&mut lane.reads);
+        for (seq, r) in old_reads {
+            if matches(&r.raw) {
+                dropped_reads.push(r);
+            } else {
+                lane.reads.push_back((seq, r));
+            }
+        }
+        lane.flush();
+        scheduler.finished.notify_all();
+    }
+    // Release any retained `Instance<File>` refs outside `scheduler.lock()`.
+    drop((dropped_unsub, dropped_reads));
 }
 
 /// Returns a duplicated handle to the queue's manual-reset error event; the
@@ -1939,7 +2110,7 @@ mod tests {
         let mut r = request(options, std::ptr::null_mut(), 0, std::ptr::null(), 0, 0);
         (r.destination_size, r.source_size) = (size, size);
         let lane = lanes.lanes.get_mut(&id).unwrap();
-        lane.unsubmitted.push(Command::Read(r));
+        lane.unsubmitted.push(Command::Read(OwnedRequest::untracked(r)));
     }
 
     #[test]
@@ -2481,9 +2652,111 @@ mod tests {
     fn worker_count_scales_for_multicore_and_respects_env() {
         assert_eq!(worker_count_for(2, None), 4);
         assert_eq!(worker_count_for(8, None), 8);
-        assert_eq!(worker_count_for(16, None), 8); // 7800X3D 8C/16T -> 8 workers (1/physical core)
+        assert_eq!(worker_count_for(16, None), 16); // 7800X3D 8C/16T -> 16 workers
+        assert_eq!(worker_count_for(32, None), 16);
         assert_eq!(worker_count_for(16, Some("12")), 12);
-        assert_eq!(worker_count_for(16, Some("0")), 8);
+        assert_eq!(worker_count_for(16, Some("0")), 16);
         assert_eq!(worker_count_for(16, Some("99")), 32);
+    }
+
+    #[test]
+    fn mapped_reserved_virtual_destination_and_deferred_placeholder_succeed() {
+        use crate::modules::xmem;
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+            SEC_RESERVE, UnmapViewOfFile,
+        };
+
+        // 1. A `MEM_MAPPED | MEM_RESERVE` (`SEC_RESERVE`) view must be committed
+        // cleanly by `ensure_virtual_destination_ready` instead of returning `E_INVALIDARG`.
+        let section = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE | SEC_RESERVE,
+                0,
+                PAGE as u32,
+                std::ptr::null(),
+            )
+        };
+        assert!(!section.is_null());
+        let view = unsafe { MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, PAGE) };
+        assert!(!view.Value.is_null());
+
+        let plain = pattern(4096);
+        let (_dir, file) = file_with(&plain);
+        let (queue, array) = (new_queue(0), status_array(2));
+
+        enqueue(queue, &request(0, view.Value, plain.len(), file, 0, plain.len()));
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), S_OK);
+        let seen = unsafe { std::slice::from_raw_parts(view.Value.cast::<u8>(), plain.len()) };
+        assert_eq!(seen, plain);
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view.Value });
+            CloseHandle(section);
+        }
+
+        // 2. A `MEM_RESERVE_PLACEHOLDER` mapped concurrently via `XMemMapPhysicalPages`
+        // shortly after submit retries cleanly (releasing `title_memory_reading()`
+        // between retries) and succeeds without dropping the read.
+        let mut page_num = [0usize; 1];
+        let mut count = 1usize;
+        assert_eq!(
+            xmem::XMemAllocatePhysicalPages(0, &mut count, page_num.as_mut_ptr()),
+            1
+        );
+        let placeholder = xmem::XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            PAGE,
+            0x2000 | 0x2040_0000, // reserve 64 KiB placeholder
+            0,
+            0x04,
+        );
+        assert!(!placeholder.is_null());
+
+        enqueue(queue, &request(0, placeholder, plain.len(), file, 0, plain.len()));
+        enqueue_status(queue, array, 1);
+        void(queue, 0x30);
+
+        let ph_addr = placeholder as usize;
+        let pn = page_num[0];
+        let mapper = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            assert_eq!(
+                xmem::XMemMapPhysicalPages(ph_addr as *mut c_void, 1, &pn) as usize,
+                ph_addr
+            );
+        });
+        assert_eq!(wait(array, 1), S_OK);
+        mapper.join().unwrap();
+        let seen_ph = unsafe { std::slice::from_raw_parts(placeholder.cast::<u8>(), plain.len()) };
+        assert_eq!(seen_ph, plain);
+        assert_eq!(
+            xmem::XMemMapPhysicalPages(placeholder, 1, std::ptr::null()),
+            placeholder
+        );
+        assert_eq!(xmem::XMemFreePhysicalPages(1, &page_num[0]), 1);
+        void(queue, 0x40);
+    }
+
+    #[test]
+    fn file_released_immediately_after_enqueue_completes_cleanly() {
+        let plain = pattern(65_536);
+        let (_dir, file) = file_with(&plain);
+        let (queue, array) = (new_queue(0), status_array(1));
+        let mut out = vec![0u8; plain.len()];
+
+        enqueue(queue, &request(0, out.as_mut_ptr().cast(), out.len(), file, 0, plain.len()));
+        enqueue_status(queue, array, 0);
+        // Title releases its own reference on the file BEFORE Submit/completion!
+        let rel: extern "system" fn(*mut c_void) -> u32 = call(file, 0x10);
+        assert_eq!(rel(file), 1, "queued request must retain a reference on Instance<File>");
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), S_OK);
+        assert_eq!(out, plain);
+        void(queue, 0x40);
     }
 }
