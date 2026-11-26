@@ -2622,15 +2622,22 @@ mod enhanced {
         | D3D12_BARRIER_ACCESS_COPY_DEST.0
         | D3D12_BARRIER_ACCESS_COPY_SOURCE.0;
 
-    const GLOBAL_ACCESS_MASK: i32 = BUFFER_ACCESS_MASK
-        | D3D12_BARRIER_ACCESS_RENDER_TARGET.0
+    /// Texture layout-exclusive accesses that require a `D3D12_TEXTURE_BARRIER`
+    /// layout transition and are therefore illegal on a `D3D12_GLOBAL_BARRIER`
+    /// when transitioning to/from another access (D3D12 Debug Layer `id=1331`).
+    /// `ensure_state()` already emits legacy `ResourceBarrier` transitions for
+    /// render-target, depth-stencil, resolve, and shading-rate textures.
+    const LAYOUT_EXCLUSIVE_ACCESS: i32 = D3D12_BARRIER_ACCESS_RENDER_TARGET.0
         | D3D12_BARRIER_ACCESS_DEPTH_STENCIL_WRITE.0
         | D3D12_BARRIER_ACCESS_DEPTH_STENCIL_READ.0
         | D3D12_BARRIER_ACCESS_RESOLVE_DEST.0
         | D3D12_BARRIER_ACCESS_RESOLVE_SOURCE.0
-        | D3D12_BARRIER_ACCESS_SHADING_RATE_SOURCE.0
+        | D3D12_BARRIER_ACCESS_SHADING_RATE_SOURCE.0;
+
+    const GLOBAL_ACCESS_MASK: i32 = (BUFFER_ACCESS_MASK
         | D3D12_BARRIER_ACCESS_RAYTRACING_ACCELERATION_STRUCTURE_READ.0
-        | D3D12_BARRIER_ACCESS_RAYTRACING_ACCELERATION_STRUCTURE_WRITE.0;
+        | D3D12_BARRIER_ACCESS_RAYTRACING_ACCELERATION_STRUCTURE_WRITE.0)
+        & !LAYOUT_EXCLUSIVE_ACCESS;
 
     const COMPUTE_ACCESS_MASK: i32 = D3D12_BARRIER_ACCESS_CONSTANT_BUFFER.0
         | D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0
@@ -2794,21 +2801,23 @@ mod enhanced {
             return (D3D12_BARRIER_SYNC(sync), D3D12_BARRIER_ACCESS_NO_ACCESS);
         }
         let mut access = raw_access & valid_access;
+        if access == 0 && raw_access != 0 {
+            // All raw access bits were stripped (e.g., layout-exclusive texture
+            // bits on a global barrier or UAV on a non-UAV buffer).
+            return (D3D12_BARRIER_SYNC_NONE, D3D12_BARRIER_ACCESS_NO_ACCESS);
+        }
         if (sync & SYNC_ALL) != 0 {
             return (D3D12_BARRIER_SYNC_ALL, D3D12_BARRIER_ACCESS(access));
         }
         let allowed = allowed_access_for_sync(sync, valid_access);
         if access == 0 {
-            if raw_access == 0 {
-                // `ACCESS_COMMON` is only valid with `SYNC_ALL`; narrow to the stage's legal accesses.
-                return if allowed != 0 {
-                    (D3D12_BARRIER_SYNC(sync), D3D12_BARRIER_ACCESS(allowed))
-                } else {
-                    (D3D12_BARRIER_SYNC_NONE, D3D12_BARRIER_ACCESS_NO_ACCESS)
-                };
-            }
-            // All raw access bits were stripped (e.g., texture-only bits on a buffer barrier).
-            return (D3D12_BARRIER_SYNC_NONE, D3D12_BARRIER_ACCESS_NO_ACCESS);
+            // `raw_access == 0` (`ACCESS_COMMON`) is only valid with `SYNC_ALL`;
+            // narrow to the stage's legal accesses.
+            return if allowed != 0 {
+                (D3D12_BARRIER_SYNC(sync), D3D12_BARRIER_ACCESS(allowed))
+            } else {
+                (D3D12_BARRIER_SYNC_NONE, D3D12_BARRIER_ACCESS_NO_ACCESS)
+            };
         }
         let missing = access & !allowed;
         if missing != 0 {
@@ -3858,6 +3867,86 @@ mod tests {
             "pure UAV -> SRV on non-UAV buffer must return None so caller emits global fallback"
         );
 
+        // Sanitizer: layout-exclusive texture accesses (`DEPTH_STENCIL_WRITE/READ`,
+        // `RENDER_TARGET`, `RESOLVE_*`, `SHADING_RATE_SOURCE`) are stripped from
+        // `D3D12_GLOBAL_BARRIER` (preventing D3D12 Debug Layer `id=1331`), while
+        // mixed `DEPTH_STENCIL_WRITE | UAV -> UAV` keeps the legal UAV barrier and
+        // `SYNC_ALL / ACCESS_COMMON -> SYNC_ALL / ACCESS_COMMON` stays intact.
+        for &(sb_raw, sa_raw, ab_raw, aa_raw) in &[
+            (
+                D3D12_BARRIER_SYNC_DEPTH_STENCIL.0 as u32,
+                D3D12_BARRIER_SYNC_COMPUTE_SHADING.0 as u32,
+                D3D12_BARRIER_ACCESS_DEPTH_STENCIL_WRITE.0 as u32,
+                D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0 as u32,
+            ),
+            (
+                D3D12_BARRIER_SYNC_ALL.0 as u32,
+                D3D12_BARRIER_SYNC_COMPUTE_SHADING.0 as u32,
+                D3D12_BARRIER_ACCESS_DEPTH_STENCIL_WRITE.0 as u32,
+                D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0 as u32,
+            ),
+            (
+                D3D12_BARRIER_SYNC_COMPUTE_SHADING.0 as u32,
+                D3D12_BARRIER_SYNC_DEPTH_STENCIL.0 as u32,
+                D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0 as u32,
+                D3D12_BARRIER_ACCESS_DEPTH_STENCIL_WRITE.0 as u32,
+            ),
+            (
+                D3D12_BARRIER_SYNC_RENDER_TARGET.0 as u32,
+                D3D12_BARRIER_SYNC_COMPUTE_SHADING.0 as u32,
+                D3D12_BARRIER_ACCESS_RENDER_TARGET.0 as u32,
+                D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0 as u32,
+            ),
+            (
+                D3D12_BARRIER_SYNC_DEPTH_STENCIL.0 as u32,
+                D3D12_BARRIER_SYNC_COMPUTE_SHADING.0 as u32,
+                D3D12_BARRIER_ACCESS_DEPTH_STENCIL_READ.0 as u32,
+                D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0 as u32,
+            ),
+            (
+                D3D12_BARRIER_SYNC_RESOLVE.0 as u32,
+                D3D12_BARRIER_SYNC_COMPUTE_SHADING.0 as u32,
+                D3D12_BARRIER_ACCESS_RESOLVE_DEST.0 as u32,
+                D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0 as u32,
+            ),
+        ] {
+            assert!(
+                enhanced::sanitize_pair(
+                    sb_raw,
+                    sa_raw,
+                    ab_raw,
+                    aa_raw,
+                    D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    false,
+                )
+                .is_none(),
+                "layout-exclusive global barrier ({ab_raw:#x} -> {aa_raw:#x}) must be rejected (id=1331)"
+            );
+        }
+        let (sb, sa, ab, aa) = enhanced::sanitize_pair(
+            (D3D12_BARRIER_SYNC_DEPTH_STENCIL.0 | D3D12_BARRIER_SYNC_COMPUTE_SHADING.0) as u32,
+            D3D12_BARRIER_SYNC_COMPUTE_SHADING.0 as u32,
+            (D3D12_BARRIER_ACCESS_DEPTH_STENCIL_WRITE.0 | D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0) as u32,
+            D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0 as u32,
+            D3D12_COMMAND_LIST_TYPE_DIRECT,
+            false,
+        )
+        .expect("mixed DEPTH_STENCIL_WRITE|UAV -> UAV must keep legal UAV barrier");
+        assert_eq!(sb, D3D12_BARRIER_SYNC_COMPUTE_SHADING);
+        assert_eq!(sa, D3D12_BARRIER_SYNC_COMPUTE_SHADING);
+        assert_eq!(ab, D3D12_BARRIER_ACCESS_UNORDERED_ACCESS);
+        assert_eq!(aa, D3D12_BARRIER_ACCESS_UNORDERED_ACCESS);
+        let (sb, sa, ab, aa) = enhanced::sanitize_pair(
+            D3D12_BARRIER_SYNC_ALL.0 as u32,
+            D3D12_BARRIER_SYNC_ALL.0 as u32,
+            D3D12_BARRIER_ACCESS_COMMON.0 as u32,
+            D3D12_BARRIER_ACCESS_COMMON.0 as u32,
+            D3D12_COMMAND_LIST_TYPE_DIRECT,
+            false,
+        )
+        .expect("SYNC_ALL/ACCESS_COMMON global barrier must remain intact");
+        assert_eq!((sb, sa, ab, aa), (D3D12_BARRIER_SYNC_ALL, D3D12_BARRIER_SYNC_ALL, D3D12_BARRIER_ACCESS_COMMON, D3D12_BARRIER_ACCESS_COMMON));
+
         // Sanitizer: mismatched VERTEX_SHADING + INDEX_BUFFER widens sync to cover INDEX_INPUT.
         let (sb, sa, ab, aa) = enhanced::sanitize_pair(
             D3D12_BARRIER_SYNC_COMPUTE_SHADING.0 as u32,
@@ -4067,7 +4156,109 @@ mod tests {
         barrier_groups(list, 1, (&raw const uav_tex_group).cast());
         assert!(!hl.uav_dirty(), "UAV-touching texture barriers must emit scoped global sync");
 
-        // 1c. Write-hazard buffer barrier whose shadow lookup misses (`addr=0`) still emits a
+        // 1c. Layout-exclusive texture transitions touching UAV (exact D3D12 Debug Layer `id=1331`
+        //     repros: `DEPTH_STENCIL_WRITE/READ`, `RENDER_TARGET`, `RESOLVE_DEST` <-> `UAV`) plus
+        //     mixed `DEPTH_STENCIL_WRITE|UAV -> UAV` and `DEPTH_STENCIL/NO_ACCESS -> COMPUTE/UAV`
+        //     must close and execute with 0 Debug Layer errors.
+        let layout_excl_tex = [
+            TitleTextureBarrier {
+                sync_before: D3D12_BARRIER_SYNC_DEPTH_STENCIL.0 as u32,
+                sync_after: D3D12_BARRIER_SYNC_COMPUTE_SHADING.0 as u32,
+                access_before: D3D12_BARRIER_ACCESS_DEPTH_STENCIL_WRITE.0 as u32,
+                access_after: D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0 as u32,
+                layout_before: D3D12_BARRIER_LAYOUT_DEPTH_STENCIL_WRITE.0 as u32,
+                layout_after: D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS.0 as u32,
+                resource: std::ptr::null(),
+                subresources: [0; 6],
+                flags: 0,
+            },
+            TitleTextureBarrier {
+                sync_before: D3D12_BARRIER_SYNC_ALL.0 as u32,
+                sync_after: D3D12_BARRIER_SYNC_COMPUTE_SHADING.0 as u32,
+                access_before: D3D12_BARRIER_ACCESS_DEPTH_STENCIL_WRITE.0 as u32,
+                access_after: D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0 as u32,
+                layout_before: D3D12_BARRIER_LAYOUT_DEPTH_STENCIL_WRITE.0 as u32,
+                layout_after: D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS.0 as u32,
+                resource: std::ptr::null(),
+                subresources: [0; 6],
+                flags: 0,
+            },
+            TitleTextureBarrier {
+                sync_before: D3D12_BARRIER_SYNC_COMPUTE_SHADING.0 as u32,
+                sync_after: D3D12_BARRIER_SYNC_DEPTH_STENCIL.0 as u32,
+                access_before: D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0 as u32,
+                access_after: D3D12_BARRIER_ACCESS_DEPTH_STENCIL_WRITE.0 as u32,
+                layout_before: D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS.0 as u32,
+                layout_after: D3D12_BARRIER_LAYOUT_DEPTH_STENCIL_WRITE.0 as u32,
+                resource: std::ptr::null(),
+                subresources: [0; 6],
+                flags: 0,
+            },
+            TitleTextureBarrier {
+                sync_before: D3D12_BARRIER_SYNC_RENDER_TARGET.0 as u32,
+                sync_after: D3D12_BARRIER_SYNC_COMPUTE_SHADING.0 as u32,
+                access_before: D3D12_BARRIER_ACCESS_RENDER_TARGET.0 as u32,
+                access_after: D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0 as u32,
+                layout_before: D3D12_BARRIER_LAYOUT_RENDER_TARGET.0 as u32,
+                layout_after: D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS.0 as u32,
+                resource: std::ptr::null(),
+                subresources: [0; 6],
+                flags: 0,
+            },
+            TitleTextureBarrier {
+                sync_before: D3D12_BARRIER_SYNC_DEPTH_STENCIL.0 as u32,
+                sync_after: D3D12_BARRIER_SYNC_COMPUTE_SHADING.0 as u32,
+                access_before: D3D12_BARRIER_ACCESS_DEPTH_STENCIL_READ.0 as u32,
+                access_after: D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0 as u32,
+                layout_before: D3D12_BARRIER_LAYOUT_DEPTH_STENCIL_READ.0 as u32,
+                layout_after: D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS.0 as u32,
+                resource: std::ptr::null(),
+                subresources: [0; 6],
+                flags: 0,
+            },
+            TitleTextureBarrier {
+                sync_before: D3D12_BARRIER_SYNC_RESOLVE.0 as u32,
+                sync_after: D3D12_BARRIER_SYNC_COMPUTE_SHADING.0 as u32,
+                access_before: D3D12_BARRIER_ACCESS_RESOLVE_DEST.0 as u32,
+                access_after: D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0 as u32,
+                layout_before: D3D12_BARRIER_LAYOUT_RESOLVE_DEST.0 as u32,
+                layout_after: D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS.0 as u32,
+                resource: std::ptr::null(),
+                subresources: [0; 6],
+                flags: 0,
+            },
+            TitleTextureBarrier {
+                sync_before: (D3D12_BARRIER_SYNC_DEPTH_STENCIL.0 | D3D12_BARRIER_SYNC_COMPUTE_SHADING.0) as u32,
+                sync_after: D3D12_BARRIER_SYNC_COMPUTE_SHADING.0 as u32,
+                access_before: (D3D12_BARRIER_ACCESS_DEPTH_STENCIL_WRITE.0 | D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0)
+                    as u32,
+                access_after: D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0 as u32,
+                layout_before: D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS.0 as u32,
+                layout_after: D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS.0 as u32,
+                resource: std::ptr::null(),
+                subresources: [0; 6],
+                flags: 0,
+            },
+            TitleTextureBarrier {
+                sync_before: D3D12_BARRIER_SYNC_DEPTH_STENCIL.0 as u32,
+                sync_after: D3D12_BARRIER_SYNC_COMPUTE_SHADING.0 as u32,
+                access_before: D3D12_BARRIER_ACCESS_NO_ACCESS.0 as u32,
+                access_after: D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0 as u32,
+                layout_before: D3D12_BARRIER_LAYOUT_DEPTH_STENCIL_WRITE.0 as u32,
+                layout_after: D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS.0 as u32,
+                resource: std::ptr::null(),
+                subresources: [0; 6],
+                flags: 0,
+            },
+        ];
+        let layout_excl_group = TitleBarrierGroup {
+            kind: BARRIER_TYPE_TEXTURE,
+            count: layout_excl_tex.len() as u32,
+            ptr: layout_excl_tex.as_ptr().cast(),
+        };
+        barrier_groups(list, 1, (&raw const layout_excl_group).cast());
+
+        // 1d. Write-hazard buffer barrier whose shadow lookup misses (`addr=0`) still emits a
         //     scoped global fallback even when `uav_dirty == false` (e.g. post-copy or loose buffer).
         let miss_buf = [DecodedBufferBarrier {
             sync_before: D3D12_BARRIER_SYNC_COPY.0 as u32,
@@ -4133,6 +4324,13 @@ mod tests {
                 sync_after: D3D12_BARRIER_SYNC_NONE.0 as u32,
                 access_before: D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0 as u32,
                 access_after: D3D12_BARRIER_ACCESS_NO_ACCESS.0 as u32,
+            },
+            // Layout-exclusive global barrier (`DEPTH_STENCIL_WRITE -> UAV`, `id=1331`) must be skipped cleanly.
+            TitleGlobalBarrier {
+                sync_before: D3D12_BARRIER_SYNC_DEPTH_STENCIL.0 as u32,
+                sync_after: D3D12_BARRIER_SYNC_COMPUTE_SHADING.0 as u32,
+                access_before: D3D12_BARRIER_ACCESS_DEPTH_STENCIL_WRITE.0 as u32,
+                access_after: D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0 as u32,
             },
         ];
         emit_barrier_groups(list, 1, true, &glob_barriers, &[]);

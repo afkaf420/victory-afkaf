@@ -85,14 +85,18 @@ thread_local! {
 /// that picks its sources by index: whatever was not on the card then was
 /// baked as nothing, once, for the run. On the console a texture is there
 /// when its bytes are.
+/// Byte cap for a one-shot decoration bake pass (`16 GiB`, TDR-safe via 128 MiB
+/// `cut_for_tdr_now` slices so 9k–16k cutscene texture bursts drain `due` to 0).
+const BAKE_TEXTURE_BYTES: u64 = 16 << 30;
+
 /// Resolves `(early_ms, bake_ms)` from optional env strings (`VICTORY_EARLY_TEXTURES_MS`
-/// default `12`, `VICTORY_BAKE_TEXTURES_MS` default `8000` — TDR-safe via 128 MiB
+/// default `12`, `VICTORY_BAKE_TEXTURES_MS` default `15000` — TDR-safe via 128 MiB
 /// `cut_for_tdr_now` slices so large cutscene-entry bake bursts drain `due` to 0).
 fn resolve_early_budgets(early_env: Option<&str>, bake_env: Option<&str>) -> (u64, u64) {
     let parse = |env: Option<&str>, default: u64| {
         env.and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default)
     };
-    (parse(early_env, 12), parse(bake_env, 8000))
+    (parse(early_env, 12), parse(bake_env, 15000))
 }
 
 fn early_budgets() -> (u64, u64) {
@@ -1904,7 +1908,7 @@ impl State {
         }
         let left = bake_ms.saturating_sub(EARLY_BAKED_MS.load(Ordering::Relaxed));
         let (total_ms, total_bytes, is_bake) = if bake && left > 0 {
-            (left, 2 << 30, true)
+            (left, BAKE_TEXTURE_BYTES, true)
         } else if first && early_ms > 0 {
             (early_ms, 64 << 20, false)
         } else {
@@ -2023,12 +2027,6 @@ impl State {
         pass: &mut EarlyPass,
         chunk_ops: u32,
     ) -> StepEarly {
-        let elapsed_ms = pass.started.elapsed().as_millis() as u64;
-        let left_ms = pass.total_ms.saturating_sub(elapsed_ms);
-        let left_bytes = pass.total_bytes.saturating_sub(pass.uploaded_bytes);
-        if left_ms == 0 || left_bytes == 0 {
-            return StepEarly::Done;
-        }
         let Some(heap) = self
             .heaps
             .iter()
@@ -2041,6 +2039,17 @@ impl State {
         let Some(host) = heap.host() else {
             return StepEarly::Done;
         };
+        let elapsed_ms = pass.started.elapsed().as_millis() as u64;
+        let left_ms = pass.total_ms.saturating_sub(elapsed_ms);
+        let left_bytes = pass.total_bytes.saturating_sub(pass.uploaded_bytes);
+        if left_ms == 0 || left_bytes == 0 {
+            if pass.bake {
+                crate::texture::BAKING.set(true);
+                self.flush_for_bake(list, host);
+                crate::texture::BAKING.set(false);
+            }
+            return StepEarly::Done;
+        }
         if pass.bake && pass.uploaded_bytes == 0 {
             crate::texture::BAKING.set(true);
             self.flush_for_bake(list, host);
@@ -2100,8 +2109,8 @@ impl State {
         }
         let left = bake_ms.saturating_sub(EARLY_BAKED_MS.load(Ordering::Relaxed));
         let budget: (u64, u64) = if bake && left > 0 {
-            // What a bake may read must be there now: up to 2 GiB.
-            (left, 2u64 << 30)
+            // What a bake may read must be there now: up to 16 GiB.
+            (left, BAKE_TEXTURE_BYTES)
         } else if first && early_ms > 0 {
             (early_ms, 64u64 << 20)
         } else {
@@ -4593,8 +4602,9 @@ mod state_tests {
 
     #[test]
     fn bake_early_pass_drains_over_4096_due_slots_under_128mib_without_premature_exit() {
-        assert_eq!(resolve_early_budgets(None, None), (12, 8000));
+        assert_eq!(resolve_early_budgets(None, None), (12, 15000));
         assert_eq!(resolve_early_budgets(Some("20"), Some("3000")), (20, 3000));
+        assert_eq!(BAKE_TEXTURE_BYTES, 16 << 30);
 
         // 8,527 due slots across 3 slices of <= 4,096 slots, each only 40 MiB (< 128 MiB -> !hit_cap).
         let slice1 = TextureChunkOutcome {
@@ -4605,9 +4615,15 @@ mod state_tests {
             handled: 4096,
         };
         assert_eq!(
-            early_pass_next_step(true, slice1, 40 << 20, 2 << 30, 500, 8000),
+            early_pass_next_step(true, slice1, 40 << 20, BAKE_TEXTURE_BYTES, 500, 15000),
             StepEarly::Continue { needs_cut: false },
             "bake must continue draining remaining 4,431 slots even when slice < 128 MiB"
+        );
+        // Large cutscene bursts exceeding 2 GiB (e.g. 3 GiB uploaded, 4,342 still due) must keep draining!
+        assert_eq!(
+            early_pass_next_step(true, slice1, 3 << 30, BAKE_TEXTURE_BYTES, 2500, 15000),
+            StepEarly::Continue { needs_cut: false },
+            "bake must keep draining past 2 GiB under 16 GiB cap"
         );
         // Non-bake early pass does NOT keep looping once !hit_cap.
         assert_eq!(
@@ -4623,7 +4639,7 @@ mod state_tests {
             handled: 1200,
         };
         assert_eq!(
-            early_pass_next_step(true, slice_capped, CHUNK_TEXTURE_BYTES, 2 << 30, 1200, 8000),
+            early_pass_next_step(true, slice_capped, CHUNK_TEXTURE_BYTES, BAKE_TEXTURE_BYTES, 1200, 15000),
             StepEarly::Continue { needs_cut: true }
         );
         // Zero remaining due slots ends cleanly.
@@ -4635,7 +4651,7 @@ mod state_tests {
             handled: 335,
         };
         assert_eq!(
-            early_pass_next_step(true, slice_done, 92 << 20, 2 << 30, 2100, 8000),
+            early_pass_next_step(true, slice_done, 92 << 20, BAKE_TEXTURE_BYTES, 2100, 15000),
             StepEarly::Done
         );
         // Zero progress or expired budget terminates safely (no infinite loop).
@@ -4647,11 +4663,11 @@ mod state_tests {
             handled: 0,
         };
         assert_eq!(
-            early_pass_next_step(true, stalled, 0, 2 << 30, 100, 8000),
+            early_pass_next_step(true, stalled, 0, BAKE_TEXTURE_BYTES, 100, 15000),
             StepEarly::Done
         );
         assert_eq!(
-            early_pass_next_step(true, slice1, 40 << 20, 2 << 30, 8000, 8000),
+            early_pass_next_step(true, slice1, 40 << 20, BAKE_TEXTURE_BYTES, 15000, 15000),
             StepEarly::Done
         );
     }
