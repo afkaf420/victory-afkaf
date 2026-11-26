@@ -333,7 +333,7 @@ fn resolve_list_chunk_ops(env: Option<&str>) -> u32 {
 }
 
 #[cfg(windows)]
-fn list_chunk_ops() -> u32 {
+pub(crate) fn list_chunk_ops() -> u32 {
     static LIMIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *LIMIT.get_or_init(|| {
         let env = std::env::var("VICTORY_LIST_CHUNK_OPS").ok();
@@ -341,12 +341,92 @@ fn list_chunk_ops() -> u32 {
     })
 }
 
-/// Whether `queue.rs` cuts lists (`VICTORY_WAIT_CUT != "0"`). TDR chunking
+/// Whether `queue.rs` cuts lists (`crate::queue::cuts()`). TDR chunking
 /// reuses `list.earlier` / `detach_parts`, so it runs only when cutting is on.
 #[cfg(windows)]
 fn cuts_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WAIT_CUT").is_none_or(|v| v != "0"))
+    crate::queue::cuts()
+}
+
+/// Unconditionally splits `this` into an independent TDR-safe submission chunk
+/// (when chunking and queue cutting are enabled and the current host list has
+/// recorded work). Used between chunked texture-upload bursts in
+/// [`flush_early_textures`]. Returns `true` if a new host list was opened.
+#[cfg(windows)]
+fn cut_for_tdr_now(this: This) -> bool {
+    let limit = list_chunk_ops();
+    if this.is_null() || limit == 0 || !cuts_enabled() {
+        return false;
+    }
+    // SAFETY: the title passes one of our lists; a list is recorded by one
+    // thread at a time and is not submitted while it records.
+    let list = unsafe { &mut *this.cast_mut().cast::<List>() };
+    let Some(current) = list.host.as_ref() else {
+        return false;
+    };
+    let ops = current.op_count();
+    if ops == 0 {
+        return false;
+    }
+    let Some(fresh) = fresh_list() else {
+        return false;
+    };
+    let mut state = list.state.lock().unwrap_or_else(|e| e.into_inner());
+    current.close();
+    static SPLITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if SPLITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+        tracing::info!(
+            parts = list.earlier.len() + 2,
+            ops,
+            limit,
+            "giant texture-upload pass split into TDR-safe submission chunk"
+        );
+    }
+    if let Some(done) = list.host.replace(fresh) {
+        let waits = std::mem::take(&mut list.gate);
+        list.earlier.push(Part {
+            waits,
+            host: done,
+            split: true,
+        });
+    }
+    if let Some(host) = list.host.as_ref() {
+        state.replay(host);
+    }
+    true
+}
+
+/// Runs the early / decoration-bake texture upload pass ahead of a graphics
+/// draw, splitting multi-thousand-copy upload storms (e.g. the 2 GiB bake
+/// burst) into separate TDR-safe `HostList` submission chunks so no single
+/// `ExecuteCommandLists` packet exceeds `VICTORY_LIST_CHUNK_OPS` or 128 MiB.
+#[cfg(windows)]
+fn flush_early_textures(this: This) {
+    if this.is_null() {
+        return;
+    }
+    let Some(mut pass) = ({
+        if host_list(this).is_none() {
+            return;
+        }
+        // SAFETY: the title passes one of our lists.
+        let state = unsafe { &(*this.cast::<List>()).state };
+        let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+        state.begin_early_textures()
+    }) else {
+        return;
+    };
+    let chunk_ops = if cuts_enabled() { list_chunk_ops() } else { 0 };
+    loop {
+        let mut more = false;
+        with_state(this, |list, s| {
+            more = s.step_early_textures(list, &mut pass, chunk_ops);
+        });
+        if !more || !cut_for_tdr_now(this) {
+            break;
+        }
+    }
+    crate::draw::State::finish_early_textures(pass);
 }
 
 /// Splits an oversized command list into independent submission chunks once it
@@ -1803,8 +1883,10 @@ mod state {
         first_instance: u32,
     ) {
         super::count_draw();
+        super::flush_early_textures(this);
         with_state(this, |list, s| {
-            s.draw(list, vertices, instances, first, first_instance)
+            s.draw(list, vertices, instances, first, first_instance);
+            s.clear_early_flushed();
         });
         super::maybe_cut_for_tdr(this);
     }
@@ -1821,7 +1903,11 @@ mod state {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(x, y, z, "a mesh dispatch with y or z groups"));
         }
-        with_state(this, |list, s| s.dispatch_mesh(list, x));
+        super::flush_early_textures(this);
+        with_state(this, |list, s| {
+            s.dispatch_mesh(list, x);
+            s.clear_early_flushed();
+        });
         super::maybe_cut_for_tdr(this);
     }
     /// `DispatchMeshX(x, flags, indirect arguments, payload)`.
@@ -1840,7 +1926,11 @@ mod state {
             ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
             return;
         }
-        with_state(this, |list, s| s.dispatch_mesh(list, x));
+        super::flush_early_textures(this);
+        with_state(this, |list, s| {
+            s.dispatch_mesh(list, x);
+            s.clear_early_flushed();
+        });
         super::maybe_cut_for_tdr(this);
     }
     pub(super) extern "system" fn draw_indexed(
@@ -1852,8 +1942,10 @@ mod state {
         first_instance: u32,
     ) {
         super::count_draw();
+        super::flush_early_textures(this);
         with_state(this, |list, s| {
-            s.draw_indexed(list, indices, instances, first, base, first_instance)
+            s.draw_indexed(list, indices, instances, first, base, first_instance);
+            s.clear_early_flushed();
         });
         super::maybe_cut_for_tdr(this);
     }
@@ -1931,8 +2023,12 @@ extern "system" fn execute_indirect(
         const DISPATCH: u32 = 2;
         const DISPATCH_SINGLE: u32 = 105;
         let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
+        if kind != DISPATCH {
+            flush_early_textures(this);
+        }
         with_state(this, |list, s| {
             ran = s.execute_indirect(list, (kind, stride, max), address, counter);
+            s.clear_early_flushed();
         });
     } else {
         #[cfg(all(windows, feature = "diagnostics"))]
@@ -2542,6 +2638,57 @@ mod tests {
             assert!(waits.is_empty());
             assert_eq!(taken.len(), 1);
             assert_eq!(order, vec![0]);
+            recycle(taken, &order);
+        }
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unbinding_targets_allows_normal_tdr_threshold_and_replay_clears_fresh_tables() {
+        if crate::host::host().is_none() {
+            return;
+        }
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let mut list = null;
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+            S_OK
+        );
+        // Bind a non-zero target handle -> active targets true; then unbind with
+        // OMSetRenderTargets(0, NULL, NULL) -> active targets must drop back to false.
+        let dummy_slot = [0u32; 32];
+        let dummy_rtv: u64 = dummy_slot.as_ptr() as u64;
+        state::targets(list, 1, &dummy_rtv, 0, std::ptr::null());
+        with_state(list, |_, s| {
+            assert!(s.has_active_targets(), "bound target handle must mark active targets");
+        });
+        state::targets(list, 0, std::ptr::null(), 0, std::ptr::null());
+        with_state(list, |_, s| {
+            assert!(
+                !s.has_active_targets(),
+                "OMSetRenderTargets(0, NULL, NULL) must clear has_active_targets()"
+            );
+        });
+        // After unbinding targets, 2 ops at limit=2 must split immediately (not wait for 4*limit=8).
+        for _ in 0..2 {
+            if let Some(hl) = host_list(list) {
+                hl.record_op();
+            }
+            maybe_cut_for_tdr_with_limit(list, 2);
+        }
+        assert!(cut_list(list), "list with unbound targets must split at normal limit");
+        close(list);
+        let parts = detach_parts(&[list]);
+        assert_eq!(parts.len(), 2);
+        for (_, taken, order) in parts {
             recycle(taken, &order);
         }
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);

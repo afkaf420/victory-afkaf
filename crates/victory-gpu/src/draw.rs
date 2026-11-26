@@ -106,6 +106,26 @@ const BAKE_PIXEL_SHADERS: [&str; 4] =
 /// made for a bake draw.
 pub(crate) static EARLY_TEXTURE_PASSES: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
+/// Shared frame and per-frame bake time counters for [`State::begin_early_textures`]
+/// and [`State::early_textures`].
+static EARLY_FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
+static EARLY_BAKED_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Maximum staged texture bytes uploaded into a single `HostList` chunk when
+/// `VICTORY_LIST_CHUNK_OPS` is active, preventing multi-gigabyte bake bursts
+/// from tripping Windows' 2.0 s WDDM TDR.
+const CHUNK_TEXTURE_BYTES: u64 = 128 << 20;
+
+/// Active early/bake texture upload pass split across TDR-safe `HostList`
+/// chunks by `list.rs::flush_early_textures`.
+pub(crate) struct EarlyPass {
+    bake: bool,
+    started: std::time::Instant,
+    total_ms: u64,
+    total_bytes: u64,
+    uploaded_bytes: u64,
+}
+
 /// Whether a buffer range a shader names through an unordered access view
 /// is given to shaders as written (snapshot before the submission, compare
 /// and write back after) only if that shader's code can store to buffers.
@@ -237,6 +257,9 @@ pub(crate) struct State {
     root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
     /// The list ran and its dynamic slots were given back.
     tables_gone: bool,
+    /// `list.rs::flush_early_textures` already drained the early/bake texture
+    /// pass ahead of the current draw (chunked into TDR-safe host lists).
+    early_flushed: bool,
 }
 
 impl Drop for State {
@@ -699,13 +722,19 @@ impl State {
     /// descriptors as they are now, not as they were when the title set
     /// the targets (a descriptor rewritten in between names another view).
     pub(crate) fn has_active_targets(&self) -> bool {
-        self.targets_set
+        !self.target_handles.is_empty() || self.depth_handle != 0
     }
 
     pub(crate) fn replay(&mut self, list: &HostList) {
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
+        // Cached dynamic descriptor tables point to CBVs in the previous host
+        // list's `scratch` upload chunks, which are recycled as soon as that
+        // chunk finishes on the GPU (`VICTORY_RELAY`). Drop the cache so this
+        // chunk allocates CBVs from its own scratch buffer.
+        self.fresh_tables.clear();
+        self.window = None;
         if self.topology_set {
             self.set_topology(list, self.topology);
         }
@@ -949,8 +978,11 @@ impl State {
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
-        // Textures picked by index, before anything asks for them.
-        self.early_textures(list, p, compute);
+        // Textures picked by index, before anything asks for them (unless
+        // `list.rs::flush_early_textures` already ran a chunked pass).
+        if !std::mem::take(&mut self.early_flushed) {
+            self.early_textures(list, p, compute);
+        }
         if crate::host::walls_trace() {
             self.walls_census(p, compute);
         }
@@ -1595,7 +1627,9 @@ impl State {
             }
             shadow.refresh(list, *from, to - from);
         }
-        self.heap_textures(list, heap, host);
+        let chunk_ops = crate::list::list_chunk_ops();
+        let chunk_bytes = if chunk_ops > 0 { CHUNK_TEXTURE_BYTES } else { u64::MAX };
+        self.heap_textures_chunked(list, heap, host, chunk_ops, chunk_bytes);
         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
         HEAP_BUFFER_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         static LOGGED: AtomicU64 = AtomicU64::new(0);
@@ -1615,8 +1649,121 @@ impl State {
         Some(gpu)
     }
 
+    /// Begins an early/bake texture upload pass ahead of a graphics draw so
+    /// `list.rs::flush_early_textures` can split multi-thousand-copy upload
+    /// storms (e.g. the 2 GiB decoration bake) across TDR-safe `HostList`
+    /// chunks before binding the draw.
+    pub(crate) fn begin_early_textures(&mut self) -> Option<EarlyPass> {
+        let (early_ms, bake_ms) = early_budgets();
+        if (early_ms == 0 && bake_ms == 0) || self.pipeline == 0 {
+            return None;
+        }
+        let frame = crate::frame::current();
+        if EARLY_FRAME.load(Ordering::Relaxed) == frame
+            && EARLY_BAKED_MS.load(Ordering::Relaxed) >= bake_ms
+        {
+            return None;
+        }
+        let p = crate::pipeline::host_pipeline(self.pipeline as This)?;
+        if p.compute {
+            return None;
+        }
+        let bake = bake_ms > 0
+            && p.stages
+                .iter()
+                .any(|s| BAKE_PIXEL_SHADERS.contains(&s.shader.hash.as_str()));
+        let first = EARLY_FRAME.swap(frame, Ordering::Relaxed) != frame;
+        if first {
+            EARLY_BAKED_MS.store(0, Ordering::Relaxed);
+        }
+        let left = bake_ms.saturating_sub(EARLY_BAKED_MS.load(Ordering::Relaxed));
+        let (total_ms, total_bytes, is_bake) = if bake && left > 0 {
+            (left, 2 << 30, true)
+        } else if first && early_ms > 0 {
+            (early_ms, 64 << 20, false)
+        } else {
+            return None;
+        };
+        let heap = self
+            .heaps
+            .iter()
+            .filter(|&&h| h != 0)
+            .map(|&h| crate::descriptor::heap(h as This))
+            .find(|h| !h.samplers())?;
+        let _host = heap.host()?;
+        let n = EARLY_TEXTURE_PASSES[usize::from(is_bake)].fetch_add(1, Ordering::Relaxed) + 1;
+        if is_bake && n.is_power_of_two() {
+            let [slots, due, ..] = HEAP_TEXTURES_QUEUE.each_ref().map(|c| c.load(Ordering::Relaxed));
+            tracing::info!(
+                frame,
+                bakes = n,
+                queued_at_the_last_pass = slots,
+                due_at_the_last_pass = due,
+                uploaded_so_far = HEAP_TEXTURES.load(Ordering::Relaxed),
+                "a draw of the title's decoration bake: textures picked by index are uploaded first (VICTORY_BAKE_TEXTURES_MS=0: not)"
+            );
+        }
+        self.early_flushed = true;
+        Some(EarlyPass {
+            bake: is_bake,
+            started: std::time::Instant::now(),
+            total_ms,
+            total_bytes,
+            uploaded_bytes: 0,
+        })
+    }
+
+    /// Runs one TDR-bounded chunk of an active [`EarlyPass`]. Returns `true`
+    /// when the per-chunk op/byte cap was reached and more due textures remain
+    /// within the pass budget (caller cuts `list` into a new submission chunk
+    /// and invokes this again).
+    pub(crate) fn step_early_textures(
+        &self,
+        list: &HostList,
+        pass: &mut EarlyPass,
+        chunk_ops: u32,
+    ) -> bool {
+        let elapsed_ms = pass.started.elapsed().as_millis() as u64;
+        let left_ms = pass.total_ms.saturating_sub(elapsed_ms);
+        let left_bytes = pass.total_bytes.saturating_sub(pass.uploaded_bytes);
+        if left_ms == 0 || left_bytes == 0 {
+            return false;
+        }
+        let Some(heap) = self
+            .heaps
+            .iter()
+            .filter(|&&h| h != 0)
+            .map(|&h| crate::descriptor::heap(h as This))
+            .find(|h| !h.samplers())
+        else {
+            return false;
+        };
+        let Some(host) = heap.host() else {
+            return false;
+        };
+        let chunk_bytes = if chunk_ops > 0 { CHUNK_TEXTURE_BYTES } else { u64::MAX };
+        PASS_BUDGET.set(Some((left_ms, left_bytes)));
+        let (done_bytes, hit_cap) =
+            self.heap_textures_chunked(list, heap, host, chunk_ops, chunk_bytes);
+        PASS_BUDGET.set(None);
+        pass.uploaded_bytes = pass.uploaded_bytes.saturating_add(done_bytes);
+        hit_cap
+            && pass.uploaded_bytes < pass.total_bytes
+            && (pass.started.elapsed().as_millis() as u64) < pass.total_ms
+    }
+
+    pub(crate) fn finish_early_textures(pass: EarlyPass) {
+        if pass.bake {
+            EARLY_BAKED_MS.fetch_add(pass.started.elapsed().as_millis() as u64, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn clear_early_flushed(&mut self) {
+        self.early_flushed = false;
+    }
+
     /// Runs the pass that uploads textures picked by index
-    /// ([`State::heap_textures`]) where nothing has asked for it yet
+    /// ([`State::heap_textures_chunked`]) where nothing has asked for it yet
     /// ([`early_budgets`]): once a frame for a few milliseconds, at the
     /// frame's first draw with a view heap set, and with a larger budget
     /// of its own before every draw whose pixel shader is one of the
@@ -1629,16 +1776,12 @@ impl State {
         }
         let bake = bake_ms > 0
             && p.stages.iter().any(|s| BAKE_PIXEL_SHADERS.contains(&s.shader.hash.as_str()));
-        static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
-        // The milliseconds this frame's bake draws have taken so far: a
-        // frame has several, and together they get `bake_ms`.
-        static BAKED_MS: AtomicU64 = AtomicU64::new(0);
         let frame = crate::frame::current();
-        let first = FRAME.swap(frame, Ordering::Relaxed) != frame;
+        let first = EARLY_FRAME.swap(frame, Ordering::Relaxed) != frame;
         if first {
-            BAKED_MS.store(0, Ordering::Relaxed);
+            EARLY_BAKED_MS.store(0, Ordering::Relaxed);
         }
-        let left = bake_ms.saturating_sub(BAKED_MS.load(Ordering::Relaxed));
+        let left = bake_ms.saturating_sub(EARLY_BAKED_MS.load(Ordering::Relaxed));
         let budget = if bake && left > 0 {
             // What a bake may read must be there now: up to 2 GiB.
             (left, 2 << 30)
@@ -1673,11 +1816,13 @@ impl State {
             );
         }
         let began = std::time::Instant::now();
+        let chunk_ops = crate::list::list_chunk_ops();
+        let chunk_bytes = if chunk_ops > 0 { CHUNK_TEXTURE_BYTES } else { u64::MAX };
         PASS_BUDGET.set(Some(budget));
-        self.heap_textures(list, heap, host);
+        self.heap_textures_chunked(list, heap, host, chunk_ops, chunk_bytes);
         PASS_BUDGET.set(None);
         if bake {
-            BAKED_MS.fetch_add(began.elapsed().as_millis() as u64, Ordering::Relaxed);
+            EARLY_BAKED_MS.fetch_add(began.elapsed().as_millis() as u64, Ordering::Relaxed);
         }
     }
 
@@ -1770,15 +1915,17 @@ impl State {
     /// in place of others, and contents changed with no descriptor write,
     /// are missed (hook the page-mapping events for those).
     /// `VICTORY_HEAP_TEXTURES=0` turns it off.
-    fn heap_textures(
+    fn heap_textures_chunked(
         &self,
         list: &HostList,
         heap: &crate::descriptor::Heap,
         host: &crate::descriptor::host::HostHeap,
-    ) {
+        chunk_ops: u32,
+        chunk_bytes: u64,
+    ) -> (u64, bool) {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_TEXTURES").is_none_or(|v| v != "0")) {
-            return;
+            return (0, false);
         }
         /// Bytes of texture memory staged per frame.
         // `VICTORY_TEXTURE_STAGE_MB` raises it: a backlog of tens of thousands of
@@ -1876,12 +2023,21 @@ impl State {
             None => (span, per_frame),
         };
         let began = std::time::Instant::now();
+        let ops_start = list.op_count();
         // Bytes of textures uploaded in this pass so far: used to gate
         // giant textures under a budget (one alone is allowed when nothing
         // else has been done yet, to avoid starvation).
         let mut done_bytes: u64 = 0;
+        let mut hit_chunk_cap = false;
         for (index, write) in due {
             if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
+                break;
+            }
+            if chunk_ops > 0
+                && (done_bytes > 0 || list.op_count() > ops_start)
+                && (list.op_count() >= chunk_ops || done_bytes >= chunk_bytes)
+            {
+                hit_chunk_cap = true;
                 break;
             }
             // A placed texture whose memory is not mapped (not streamed in
@@ -2051,7 +2207,7 @@ impl State {
                 let text: String = format!("{view:?}").chars().take(300).collect();
                 tracing::error!(why, slot = index, "the host device went while textures picked by index were made ready; last: {text}");
                 crate::host::log_removal_context();
-                return;
+                return (done_bytes, false);
             }
             let (bytes, whole) = crate::texture::staged(resource).unwrap_or((0, true));
             // Not all of it there: looked at again next frame, and from
@@ -2098,6 +2254,7 @@ impl State {
                 None => host.texture_slot_done(index, write, again),
             }
         }
+        (done_bytes, hit_chunk_cap)
     }
 
     /// For the frame listing, after a dropped dispatch's line: its group
@@ -3524,5 +3681,38 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
     {
         // SAFETY: an open list on a device that supports depth bounds.
         unsafe { l1.OMSetDepthBounds(min, max) };
+    }
+}
+
+#[cfg(test)]
+mod state_tests {
+    use super::*;
+
+    #[test]
+    fn replay_clears_fresh_tables_and_has_active_targets_tracks_unbind() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let list = host.new_list().expect("host list");
+        let mut state = State::default();
+        // Simulate a cached dynamic CBV table from an earlier host list chunk.
+        state.fresh_tables.insert((0x2000, 3, 0xdead_beef), 42);
+        assert_eq!(state.fresh_tables.len(), 1);
+        let dummy_slot = [0u32; 32];
+        let dummy_rtv = dummy_slot.as_ptr() as u64;
+        state.set_targets(&list, &[dummy_rtv], 0);
+        assert!(state.has_active_targets());
+        state.set_targets(&list, &[], 0);
+        assert!(!state.has_active_targets());
+        state.set_targets(&list, &[], dummy_rtv);
+        assert!(state.has_active_targets());
+        state.set_targets(&list, &[], 0);
+        assert!(!state.has_active_targets());
+
+        // Replaying onto a new chunk must clear `fresh_tables` so the new chunk
+        // never reuses CBVs backed by the earlier chunk's recycled scratch buffer.
+        state.replay(&list);
+        assert!(state.fresh_tables.is_empty());
+        list.close();
     }
 }

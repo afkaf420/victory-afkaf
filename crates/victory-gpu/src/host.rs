@@ -5376,9 +5376,12 @@ impl Host {
                     let _ = fault_va;
                     if done > 0 {
                         text.push_str(&in_flight(history, &markers, done as usize));
-                    } else if let Some(r) = run {
+                    }
+                    if let Some(r) = run {
                         let pipelines = r.pipelines.lock().unwrap_or_else(|e| e.into_inner());
-                        text.push_str(&format!(", its pipelines {pipelines:?}"));
+                        if done == 0 || !pipelines.is_empty() {
+                            text.push_str(&format!(", its pipelines {pipelines:?}"));
+                        }
                     }
                 }
                 plain = p.pNext;

@@ -271,12 +271,14 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
         for (index, (of_written, _)) in through.parts.iter().enumerate() {
             list.list
                 .CopyTextureRegion(&rows(of_written), 0, 0, 0, &part(from, index), None);
+            list.record_op();
         }
         list.list
             .ResourceBarrier(&[crate::host::transition(&through.buffer, written, read)]);
         for (index, (_, of_read)) in through.parts.iter().enumerate() {
             list.list
                 .CopyTextureRegion(&part(to, index), 0, 0, 0, &rows(of_read), None);
+            list.record_op();
         }
         list.list
             .ResourceBarrier(&[crate::host::transition(&through.buffer, read, common)]);
@@ -678,6 +680,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         };
         // SAFETY: an open list; both locations name live resources.
         unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
+        list.record_op();
     }
     // When the list is submitted, its copy takes what the staging buffer
     // holds by then: noted before the check below, which sets `dirty`
@@ -828,6 +831,7 @@ pub(crate) fn card_writes(
             };
             // SAFETY: an open list; both locations name live resources.
             unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
+            list.record_op();
         }
     }
     // A new level without its zeros gets no tiles from this list: the
