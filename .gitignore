@@ -70,6 +70,11 @@
 *.7z
 *.rar
 
+# Runtime logs and crash dumps
+*.log
+*.dmp
+/diag_logs/
+
 # Editor / OS noise
 .vs/
 .idea/
