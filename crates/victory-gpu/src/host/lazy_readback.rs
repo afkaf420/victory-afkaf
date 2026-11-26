@@ -1,11 +1,11 @@
-//! PC-Native VRAM Promotion — Move 2 (`VICTORY_LAZY_READBACK`, default mode `2`).
+//! PC-Native VRAM Promotion — Move 2 (`VICTORY_LAZY_READBACK`, default mode `1`).
 //!
 //! Eliminates eager PCIe readbacks (`Card::before`, `CARD_COMPARE`,
-//! `relay_card_back`) for GPU-written `WriteCombinedGpuRw` (`0x2404`) and
-//! `CachedGpuRw` (`0x2004`) buffers (or `0x2404`-only in mode `1`) by leaving
-//! their latest bytes resident in VRAM and marking the corresponding 64 KiB
-//! title-memory blocks (across `1..=64` virtual alias views) `PAGE_NOACCESS`
-//! ONCE on first promotion:
+//! `relay_card_back`) for GPU-written `WriteCombinedGpuRw` (`0x2404`) buffers
+//! (and opt-in `CachedGpuRw` `0x2004` in mode `2`) by leaving their latest
+//! bytes resident in VRAM and marking the corresponding 64 KiB title-memory
+//! blocks (across `1..=64` virtual alias views) `PAGE_NOACCESS` ONCE on first
+//! promotion:
 //!
 //! - Subsequent GPU writes to an already-`GpuResident` block perform an O(1)
 //!   fence update only (`0 VirtualProtect`, `0 Card::before`, `0 PCIe readback`).
@@ -66,11 +66,16 @@ impl Mode {
     }
 }
 
+/// Resolves `VICTORY_LAZY_READBACK`: defaults to `Mode::WriteCombined` (`1`,
+/// `0x2404` only). `0x2004` (`CachedGpuRw`) stays opt-in (`=2`/`all`/`cached`)
+/// because the title's CPU-cached C++ asset/object heap shares 64 KiB blocks
+/// with asynchronous CPU pointer writes that require byte-level `CARD_COMPARE`
+/// rather than blind 64 KiB whole-block restoration.
 fn resolve_mode(env: Option<&str>) -> Mode {
     match env.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
         Some("0" | "off" | "false") => Mode::Off,
-        Some("1" | "wc") => Mode::WriteCombined,
-        _ => Mode::WriteCombinedAndCached,
+        Some("2" | "all" | "cached") => Mode::WriteCombinedAndCached,
+        _ => Mode::WriteCombined,
     }
 }
 
@@ -95,7 +100,7 @@ fn active_mode() -> Mode {
     })
 }
 
-/// Active `VICTORY_LAZY_READBACK` mode (`0` = off, `1` = WC only, `2` = WC + Cached default).
+/// Active `VICTORY_LAZY_READBACK` mode (`0` = off, `1` = WC default, `2` = WC + Cached opt-in).
 #[inline]
 pub(crate) fn mode() -> u8 {
     active_mode().code()
@@ -833,15 +838,17 @@ fn any_alias_overlaps_placed_texture(aliases: &AliasSet) -> bool {
 }
 
 /// Core Phase-1 single-block validator shared by [`plan_gpu_resident`] and unit
-/// tests. Returns `Ok((aliases, tex_gen))` if `block` is eligible for
-/// `GpuResident` promotion/update, or `Err(rej_idx)` with the exact `REJ` bucket
-/// (`0=span, 1=class, 2=alias_many, 3=alias_self, 4=alias_tex, 5=cpuhot, 6=uncommittable`).
+/// tests. Returns `Ok((aliases, tex_gen, already_owned_resident))` if `block`
+/// is eligible for `GpuResident` promotion/update, or `Err(rej_idx)` with the
+/// exact `REJ` bucket (`0=span, 1=class, 2=alias_many, 3=alias_self,
+/// 4=alias_tex, 5=cpuhot, 6=uncommittable`).
 fn plan_block_for_resident(
     block: usize,
+    shadow_id: u64,
     span_start: usize,
     span_end: usize,
     m: Mode,
-) -> Result<(AliasSet, u64), usize> {
+) -> Result<(AliasSet, u64, bool), usize> {
     let b_lo = block * BLOCK;
     let b_hi = b_lo.saturating_add(BLOCK);
     if b_lo < span_start || b_hi > span_end {
@@ -882,6 +889,7 @@ fn plan_block_for_resident(
     let mut need_commit_check = [0usize; MAX_ALIASES];
     let mut n_check = 0usize;
     let mut tex_fresh = false;
+    let mut already_owned_resident = false;
     let state_res: Result<(), usize> = {
         let mut s = lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut existing_primary: Option<usize> = None;
@@ -898,6 +906,9 @@ fn plan_block_for_resident(
                     } else {
                         existing_primary = Some(p);
                         tex_fresh = info.tex_gen == cur_tex_gen && info.aliases == aliases;
+                        already_owned_resident = info.shadow_id == shadow_id
+                            && info.owner_block == block
+                            && info.aliases == aliases;
                     }
                 }
                 Some(BlockState::CpuHot(_)) | Some(BlockState::Fetching { .. }) => {
@@ -949,7 +960,7 @@ fn plan_block_for_resident(
         }
         return Err(6);
     }
-    Ok((aliases, cur_tex_gen))
+    Ok((aliases, cur_tex_gen, already_owned_resident && n_check == 0))
 }
 
 /// A 64 KiB block validated in Phase 1 ([`plan_gpu_resident`], inside
@@ -988,6 +999,7 @@ pub(crate) fn plan_gpu_resident(
     let (span_start_u64, span_len_u64) = shadow.span();
     let span_start = span_start_u64 as usize;
     let span_end = span_start.saturating_add(span_len_u64 as usize);
+    let shadow_id = shadow.id();
 
     let mut pending: Vec<PendingClaim> = Vec::new();
     let mut remaining: Vec<(usize, usize)> = Vec::new();
@@ -1015,10 +1027,21 @@ pub(crate) fn plan_gpu_resident(
             let b_hi = b_lo.saturating_add(BLOCK);
             let sub_lo = from.max(b_lo);
             let sub_hi = to.min(b_hi);
-            match plan_block_for_resident(block, span_start, span_end, m) {
-                Ok((aliases, tex_gen)) => {
+            match plan_block_for_resident(block, shadow_id, span_start, span_end, m) {
+                Ok((aliases, tex_gen, already_owned_resident)) => {
                     let gpu_offset = (b_lo - span_start) as u64;
                     if pending.last().is_none_or(|c| c.block != block) {
+                        // On any fresh promotion (not already `GpuResident` owned
+                        // by this `shadow`), refresh all 16× 4 KiB pages of the
+                        // 64 KiB block BEFORE `card_dirty()` uploads dirty bytes
+                        // to `Shadow::buffer` so untouched tail pages can never be
+                        // clobbered by a later whole-block `ensure_cpu_resident`
+                        // restore. Runs outside `STATE` lock; `Shadow::update`
+                        // skips `shadow.pending` ranges and cleanly materializes
+                        // any foreign `Shadow_A` lazy owner before handoff.
+                        if !already_owned_resident {
+                            shadow.update(b_lo, BLOCK);
+                        }
                         pending.push(PendingClaim {
                             block,
                             shadow: shadow.clone(),
@@ -2047,11 +2070,12 @@ mod tests {
 
     #[test]
     fn mode_parsing_defaults_and_overrides() {
-        assert_eq!(resolve_mode(None), Mode::WriteCombinedAndCached);
-        assert_eq!(resolve_mode(Some("")), Mode::WriteCombinedAndCached);
+        assert_eq!(resolve_mode(None), Mode::WriteCombined);
+        assert_eq!(resolve_mode(Some("")), Mode::WriteCombined);
         assert_eq!(resolve_mode(Some("1")), Mode::WriteCombined);
         assert_eq!(resolve_mode(Some("wc")), Mode::WriteCombined);
         assert_eq!(resolve_mode(Some("2")), Mode::WriteCombinedAndCached);
+        assert_eq!(resolve_mode(Some("all")), Mode::WriteCombinedAndCached);
         assert_eq!(resolve_mode(Some("cached")), Mode::WriteCombinedAndCached);
         assert_eq!(resolve_mode(Some("0")), Mode::Off);
         assert_eq!(resolve_mode(Some("off")), Mode::Off);
@@ -2796,7 +2820,7 @@ mod tests {
 
         let blk1 = va1 / BLOCK;
         // 1. Before any placed texture overlaps `va2`, planning `va1` succeeds.
-        assert!(plan_block_for_resident(blk1, va1, va1 + BLOCK, Mode::WriteCombined).is_ok());
+        assert!(plan_block_for_resident(blk1, 405, va1, va1 + BLOCK, Mode::WriteCombined).is_ok());
 
         // 2. Registering an active placed texture overlapping alias `va2` causes
         //    `plan_block_for_resident(va1)` to reject with `Err(4)` (`alias_tex`).
@@ -2807,7 +2831,7 @@ mod tests {
             );
             assert!(crate::descriptor::host::overlaps_placed_texture(va2, BLOCK));
             assert_eq!(
-                plan_block_for_resident(blk1, va1, va1 + BLOCK, Mode::WriteCombined),
+                plan_block_for_resident(blk1, 405, va1, va1 + BLOCK, Mode::WriteCombined),
                 Err(4),
                 "alias overlapping an active placed texture must reject as alias_tex (REJ[4])"
             );
@@ -2835,7 +2859,7 @@ mod tests {
                 (va2 + 0x4000) as u64,
             );
             assert_eq!(
-                plan_block_for_resident(blk1, va1, va1 + BLOCK, Mode::WriteCombined),
+                plan_block_for_resident(blk1, 405, va1, va1 + BLOCK, Mode::WriteCombined),
                 Err(4),
                 "late placed texture over already-resident alias must reject as alias_tex"
             );
@@ -2875,13 +2899,14 @@ mod tests {
         // Register as `0x2004` (`PAGE_GRAPHICS_READWRITE | PAGE_READWRITE`, `CachedGpuRw`).
         crate::watch::note_console_memory(base, BLOCK, 0x27, 0x2004);
         assert_eq!(
-            plan_block_for_resident(blk, base, base + BLOCK, Mode::WriteCombined),
+            plan_block_for_resident(blk, 406, base, base + BLOCK, Mode::WriteCombined),
             Err(1),
-            "mode 1 (WC-only) must reject 0x2004 CachedGpuRw as class"
+            "mode 1 (default WC-only) must reject 0x2004 CachedGpuRw as class"
         );
         assert!(
-            plan_block_for_resident(blk, base, base + BLOCK, Mode::WriteCombinedAndCached).is_ok(),
-            "mode 2 (default) must accept 0x2004 CachedGpuRw"
+            plan_block_for_resident(blk, 406, base, base + BLOCK, Mode::WriteCombinedAndCached)
+                .is_ok(),
+            "mode 2 (opt-in) must accept 0x2004 CachedGpuRw"
         );
 
         // 1. Promote `MEM_WRITE_WATCH` `0x2004` block -> `PAGE_NOACCESS`.
@@ -2966,11 +2991,103 @@ mod tests {
         assert_eq!(fetches.load(Ordering::SeqCst), 2);
         assert!(is_cpu_hot(blk));
         assert_eq!(
-            plan_block_for_resident(blk, base, base + BLOCK, Mode::WriteCombinedAndCached),
+            plan_block_for_resident(blk, 406, base, base + BLOCK, Mode::WriteCombinedAndCached),
             Err(5),
             "demoted CpuHot 0x2004 block must reject as cpuhot (REJ[5]) with zero future VEH faults"
         );
 
         crate::watch::clear_console_memory(base, BLOCK);
+    }
+
+    #[test]
+    fn partial_block_fresh_promotion_refreshes_full_64k_tail_before_commit() {
+        let pages = WatchPages::new(1);
+        let base = pages.va();
+        let blk = base / BLOCK;
+        let res_id = base ^ 0x5A5A_1234;
+        crate::watch::note_console_memory(base, BLOCK, 0x23, 0x2404);
+        crate::shadow::register(res_id, base as u64, BLOCK as u64);
+        struct Cleanup(usize, usize);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                crate::shadow::unregister(self.0, self.1 as u64);
+                crate::watch::clear_console_memory(self.1, BLOCK);
+            }
+        }
+        let _cleanup = Cleanup(res_id, base);
+        let Some(shadow) = crate::shadow::find(base as u64, BLOCK as u64) else {
+            return; // headless machine without D3D12
+        };
+        assert!(shadow.carded() && !shadow.in_place() && !shadow.is_rebar_streaming());
+        let staging_ptr = shadow.cpu_data();
+        assert!(!staging_ptr.is_null());
+
+        // 1. Seed `[0, 4K) = 0x11` (GPU target) and `[4K, 64K) = 0xA5` (untouched CPU tail).
+        // SAFETY: committed 64 KiB `WatchPages` allocation.
+        unsafe {
+            std::ptr::write_bytes(pages.ptr, 0x11, 4096);
+            std::ptr::write_bytes(pages.ptr.add(4096), 0xA5, BLOCK - 4096);
+        }
+        assert_eq!(shadow.update(base, 4096), 4096);
+        // SAFETY: staging buffer holds `BLOCK` mapped bytes.
+        let staging = unsafe { std::slice::from_raw_parts(staging_ptr, BLOCK) };
+        assert!(staging[..4096].iter().all(|&b| b == 0x11));
+        assert!(staging[4096..].iter().all(|&b| b == 0), "tail must be uncopied before plan");
+        shadow.writing(base, 4096);
+
+        let (claims, rem) = plan_gpu_resident(&shadow, &[(base, base + 4096)]);
+        assert!(rem.is_empty() && claims.len() == 1);
+        assert!(
+            staging[4096..].iter().all(|&b| b == 0xA5),
+            "plan_gpu_resident must copy untouched 60 KiB tail into Shadow::staging before card_dirty"
+        );
+        let dirty = crate::shadow::card_dirty(0);
+        let our_dirty = dirty
+            .iter()
+            .find(|(s, _)| s.id() == shadow.id())
+            .map(|(_, r)| r.clone())
+            .unwrap_or_default();
+        assert_eq!(our_dirty, vec![(0, BLOCK)], "full 64 KiB must be queued in card_dirty");
+
+        // Simulate VRAM upload from `staging` + GPU 4 KiB write `0x7E`, commit, then `ensure_cpu_resident`.
+        let mut sim_vram = Box::new([0u8; BLOCK]);
+        sim_vram.copy_from_slice(staging);
+        sim_vram[..4096].fill(0x7E);
+        test_fetchers()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(blk, Arc::new(move |_, _, _| Some(sim_vram.clone())));
+        crate::host::native_vram::commit_lazy_claims(claims, 1);
+        assert!(is_gpu_resident(blk));
+        let (_, _, owned) =
+            plan_block_for_resident(blk, shadow.id(), base, base + BLOCK, Mode::WriteCombined)
+                .unwrap();
+        assert!(owned);
+
+        ensure_cpu_resident(base, BLOCK);
+        assert!(!is_gpu_resident(blk));
+        // SAFETY: restored `PAGE_READWRITE` 64 KiB allocation.
+        let ram = unsafe { std::slice::from_raw_parts(pages.ptr, BLOCK) };
+        assert!(ram[..4096].iter().all(|&b| b == 0x7E));
+        assert!(ram[4096..].iter().all(|&b| b == 0xA5));
+
+        // 2. Re-promotion after `copied[0] > 0` and CPU mutates ONLY tail page `+0x5000`.
+        shadow.copy_back_done(&[(base, base + 4096)]);
+        assert_eq!(shadow.update(base, BLOCK), BLOCK);
+        assert_eq!(shadow.update(base, BLOCK), 0);
+        // SAFETY: committed 64 KiB allocation.
+        unsafe { std::ptr::write_bytes(pages.ptr.add(0x5000), 0xCC, 4096) };
+        // Partial refresh of `[0, 4K)` sees the 64 KiB block dirty, copies `[0, 4K)` only,
+        // and leaves `+0x5000` STALE (`0xA5`) in `Shadow::staging`.
+        assert_eq!(shadow.update(base, 4096), 4096);
+        assert!(staging[0x5000..0x6000].iter().all(|&b| b == 0xA5));
+        shadow.writing(base, 4096);
+        let (claims2, rem2) = plan_gpu_resident(&shadow, &[(base, base + 4096)]);
+        assert!(rem2.is_empty() && claims2.len() == 1);
+        assert!(
+            staging[0x5000..0x6000].iter().all(|&b| b == 0xCC),
+            "fresh re-promotion must copy mutated tail page +0x5000 into Shadow::staging"
+        );
+        shadow.copy_back_done(&[(base, base + 4096)]);
     }
 }
